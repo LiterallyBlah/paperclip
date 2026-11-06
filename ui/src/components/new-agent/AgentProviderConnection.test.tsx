@@ -45,7 +45,7 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 async function mount(
-  adapterType: "claude_local" | "codex_local" | "grok_local" = "claude_local",
+  adapterType: "claude_local" | "codex_local" | "grok_local" | "muse_local" = "claude_local",
   savedLogin = false,
   canLogin = true,
   codexSubscriptions = false,
@@ -58,7 +58,7 @@ async function mount(
   advancedConnection?: Parameters<typeof AgentProviderConnection>[0]["advancedConnection"],
 ) {
   const key =
-    adapterType === "claude_local" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
+    adapterType === "claude_local" ? "ANTHROPIC_API_KEY" : adapterType === "muse_local" ? "META_API_KEY" : "OPENAI_API_KEY";
   mocks.auth.mockResolvedValue({
     status: codexSubscriptions ? "unknown" : "present",
   });
@@ -552,14 +552,14 @@ describe("AgentProviderConnection reuse", () => {
     click("Connect");
     await vi.waitFor(() => expect(test).toHaveBeenCalledWith({ env: {} }));
   });
-  it.each(["claude_local", "codex_local"] as const)("uses a managed subscription through the upstream chooser for %s", async (adapterType) => {
-    const provider = adapterType === "claude_local" ? "anthropic" : "openai";
+  it.each(["claude_local", "codex_local", "muse_local"] as const)("uses a managed subscription through the upstream chooser for %s", async (adapterType) => {
+    const provider = adapterType === "claude_local" ? "anthropic" : adapterType === "muse_local" ? "muse" : "openai";
     managedApi.list.mockResolvedValue({ currentUserId: "user-1", connections: [{
       id: "account", grantId: "grant", companyId: "c1", provider,
       method: "subscription", name: "My subscription", ownership: "personal",
       ownerUserId: "user-1", isDefault: true, status: "connected",
     }] } as never);
-    const { connected } = await mount(adapterType, false, true, false, false);
+    const { connected } = await mount(adapterType, false, true, false, adapterType === "muse_local");
     openProvider();
     expect(host.querySelector('select[aria-label="Saved subscription"]')?.textContent).toContain("My subscription (Your default)");
     click("Use saved subscription");
