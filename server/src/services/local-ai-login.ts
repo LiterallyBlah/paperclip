@@ -59,7 +59,7 @@ export function localAiLoginService(db: Db) {
   }
   function ensureBrowserLogin(id: string, provider: string) {
     if (provider === "xai" || browserLogins.has(id)) return;
-    browserLogins.set(id, startLocalBrowserLogin(provider as "anthropic" | "openai", loginHome(id)));
+    browserLogins.set(id, startLocalBrowserLogin(provider as "anthropic" | "openai" | "muse", loginHome(id)));
   }
   async function reapExpired() {
     // Bounded batches use the existing expires-at index. Replaying is safe.
@@ -83,12 +83,12 @@ export function localAiLoginService(db: Db) {
   }
 
   async function start(companyId: string, userId: string, intent: AiConnectionLoginIntent, restart = false): Promise<LocalAiLoginAttempt> {
-    if (intent.provider !== "openai" && intent.provider !== "xai" && intent.provider !== "anthropic")
+    if (intent.provider !== "openai" && intent.provider !== "xai" && intent.provider !== "anthropic" && intent.provider !== "muse")
       throw unprocessable("This provider does not use a separate local login home.");
     await reapExpired();
     const attempt = await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`ai-local-login:${companyId}:${userId}:${intent.provider}`}, 0))`);
-      const adapterType = intent.provider === "openai" ? "codex_local" : intent.provider === "anthropic" ? "claude_local" : "grok_local";
+      const adapterType = intent.provider === "openai" ? "codex_local" : intent.provider === "anthropic" ? "claude_local" : intent.provider === "xai" ? "grok_local" : "muse_local";
       const [existing] = await tx.select().from(adapterAuthSessions).where(and(
         eq(adapterAuthSessions.companyId, companyId), eq(adapterAuthSessions.startedByUserId, userId),
         eq(adapterAuthSessions.adapterType, adapterType),

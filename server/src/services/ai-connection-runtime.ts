@@ -20,6 +20,7 @@ import { WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE } from "@paperclipai/adapter-utils/
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
+import { decideMuseAuthMerge } from "@paperclipai/adapter-muse-local/server";
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status === 422 &&
@@ -41,6 +42,9 @@ export const AI_AUTH_ENV_KEYS = [
   "OPENROUTER_API_KEY",
   "XAI_API_KEY",
   "GROK_API_KEY",
+  "META_API_KEY",
+  "MUSE_API_KEY",
+  "MUSE_AUTH_PATH",
   "CODEX_HOME",
   "GROK_HOME",
   "CLAUDE_CONFIG_DIR",
@@ -186,6 +190,7 @@ function managedAiHomeEnvironment(home: string): Record<string, string> {
     GROK_HOME: providerHome,
     CLAUDE_CONFIG_DIR: providerHome,
     HERMES_HOME: providerHome,
+    MUSE_AUTH_PATH: path.join(home, "config", "muse", "auth.json"),
   };
 }
 
@@ -202,7 +207,7 @@ export function managedAiSessionFingerprintConfig(
   }
   const managed = config.managedAiConnection as Record<string, unknown> | undefined;
   if (managed?.sessionIdentity) {
-    for (const key of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY", "GROK_API_KEY", "OPENCODE_AUTH_JSON", "OPENCODE_CONFIG_CONTENT"]) {
+    for (const key of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY", "GROK_API_KEY", "META_API_KEY", "OPENCODE_AUTH_JSON", "OPENCODE_CONFIG_CONTENT"]) {
       if (env[key]) env[key] = "<managed-ai-credential>";
     }
   }
@@ -316,15 +321,22 @@ export async function prepareManagedAiRuntime(
       AI_CONNECTION_CAPABILITIES[input.binding.provider].methods[
         selection.attribution.method
       ]!;
-    const authFile = path.join(providerHome, "auth.json");
+    const authFile =
+      input.binding.provider === "muse" && selection.attribution.method === "subscription"
+        ? path.join(home, "config", "muse", "auth.json")
+        : path.join(providerHome, "auth.json");
     if (harness === "codex_local")
       await writeFile(
         path.join(providerHome, "config.toml"),
         'cli_auth_credentials_store = "file"\n',
         { mode: 0o600 },
       );
-    if (!routing && subscriptionFile) await writeFile(authFile, value, { mode: 0o600 });
-    else if (!routing) env[capability.envKey] = value;
+    if (!routing && subscriptionFile) {
+      if (input.binding.provider === "muse") {
+        await mkdir(path.dirname(authFile), { recursive: true, mode: 0o700 });
+      }
+      await writeFile(authFile, value, { mode: 0o600 });
+    } else if (!routing) env[capability.envKey] = value;
     if (
       !routing && input.binding.provider === "openai" &&
       selection.attribution.method === "api_key"
@@ -339,6 +351,12 @@ export async function prepareManagedAiRuntime(
         provider: { openrouter: { options: { apiKey: value } } },
       });
       env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
+    }
+    if (input.binding.provider === "muse" && selection.attribution.method === "subscription") {
+      env.MUSE_AUTH_PATH = authFile;
+      env.MUSE_NO_AUTO_UPDATE = "1";
+    } else if (input.binding.provider === "muse") {
+      env.MUSE_NO_AUTO_UPDATE = "1";
     }
     if (!routing && input.binding.provider === "google") {
       // Gemini headless CLI requires an explicit auth choice even with an API key.
@@ -440,9 +458,13 @@ export async function prepareManagedAiRuntime(
                   ? await decideCodexAuthMerge(authFile, destination, {
                       errorLabel: "AI account refresh",
                     })
-                  : await decideGrokAuthMerge(authFile, destination, {
-                      errorLabel: "AI account refresh",
-                    });
+                  : input.binding.provider === "muse"
+                    ? await decideMuseAuthMerge(authFile, destination, {
+                        errorLabel: "AI account refresh",
+                      })
+                    : await decideGrokAuthMerge(authFile, destination, {
+                        errorLabel: "AI account refresh",
+                      });
               if (decision !== 10) return;
               await secretService(tx).rotate(
                 ref.secretId,

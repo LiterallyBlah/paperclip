@@ -33,6 +33,7 @@ export const AI_PROVIDERS = [
   "openrouter",
   "xai",
   "google",
+  "muse",
 ] as const;
 export const aiProviderSchema = z.enum(AI_PROVIDERS);
 export const aiAuthMethodSchema = z.enum(["subscription", "api_key"]);
@@ -110,6 +111,13 @@ export const AI_CONNECTION_CAPABILITIES: Record<
       api_key: { adapters: ["grok_local"], envKey: "XAI_API_KEY" },
     },
   },
+  muse: {
+    name: "Muse Code",
+    methods: {
+      subscription: { adapters: ["muse_local"], envKey: "MUSE_AUTH_PATH" },
+      api_key: { adapters: ["muse_local"], envKey: "META_API_KEY" },
+    },
+  },
 };
 export function isAiConnectionCompatible(
   requirement: AiConnectionMetadata | AiConnectionBinding,
@@ -123,7 +131,7 @@ export function isAiConnectionCompatible(
   // A fixed binding contains identity only. The service checks authoritative
   // connection metadata before resolving credentials or running the harness.
   if ("mode" in requirement && requirement.mode !== "responsible_user" && requirement.method === "api_key")
-    return ["claude_local", "codex_local", "opencode_local", "hermes_local", "gemini_local", "grok_local"].includes(adapterType);
+    return ["claude_local", "codex_local", "opencode_local", "hermes_local", "gemini_local", "grok_local", "muse_local"].includes(adapterType);
   const methods = AI_CONNECTION_CAPABILITIES[requirement.provider].methods;
   const candidates = "mode" in requirement && requirement.mode === "responsible_user"
     ? Object.values(methods)
@@ -220,7 +228,7 @@ export type CreateAiConnection = z.infer<typeof createAiConnectionSchema>;
 
 export const aiConnectionLoginIntentSchema = z
   .object({
-    provider: z.enum(["anthropic", "openai", "xai"]),
+    provider: z.enum(["anthropic", "openai", "xai", "muse"]),
     method: z.literal("subscription"),
     name: z.string().trim().min(1).max(160),
     ownership: z.enum(["personal", "shared"]),
@@ -254,6 +262,6 @@ export interface LocalAiLoginAttempt {
 export function aiSubscriptionNeedsIsolatedLogin(config: Record<string, unknown> | undefined): boolean {
   const metadata = aiConnectionMetadataSchema.safeParse(config?.ai);
   return metadata.success && metadata.data.method === "subscription" &&
-    (metadata.data.provider === "openai" || metadata.data.provider === "xai") &&
+    (metadata.data.provider === "openai" || metadata.data.provider === "xai" || metadata.data.provider === "muse") &&
     config?.aiIsolatedSubscription !== true;
 }
