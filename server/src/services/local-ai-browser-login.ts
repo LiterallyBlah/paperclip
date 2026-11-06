@@ -6,6 +6,7 @@ import { runSetupTokenLogin } from "@paperclipai/adapter-claude-local/server";
 import { runDeviceLogin } from "@paperclipai/adapter-codex-local/server";
 import { ensureCommandResolvable, resolveCommandForLogs } from "@paperclipai/adapter-utils/server-utils";
 import { resolveCodexCommand } from "../vendor/paperclip-runner/index.js";
+import { readVerifiedLocalAiCredential } from "./local-ai-credentials.js";
 
 export type LocalBrowserLoginState = {
   authorizationUrl?: string;
@@ -90,7 +91,10 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "muse"
         CLAUDE_CONFIG_DIR: provider === "anthropic" ? home : process.env.CLAUDE_CONFIG_DIR,
         CODEX_HOME: provider === "openai" ? home : process.env.CODEX_HOME,
         ...(provider === "muse" ? {
-          META_API_KEY: "", MUSE_API_KEY: "", MUSE_AUTH_PATH: path.join(home, "auth.json"),
+          // MUSE_AUTH_PATH is launcher-only; the native CLI uses XDG paths.
+          HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"),
+          XDG_DATA_HOME: path.join(home, ".local", "share"),
+          META_API_KEY: "", MUSE_API_KEY: "", MUSE_AUTH_PATH: path.join(home, ".config", "muse", "auth.json"),
           MUSE_NO_AUTO_UPDATE: "1", NO_COLOR: "1",
         } : {}),
         BROWSER: "true",
@@ -143,8 +147,14 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "muse"
     let line = "";
     let phase: "idle" | "url" | "label" | "code" | "done" = "idle";
     let candidateUrl: string | undefined;
-    let signedIn = false;
     let invalid = false;
+    const nativeFailures = {
+      access_denied: "Meta did not approve this sign-in. Start sign-in again and approve the device code.",
+      expired: "The Meta approval code expired. Start sign-in again.",
+      mint_failed: "Meta could not issue a Muse credential for this account. Check that the account has an active Muse Code subscription.",
+      flow_failed: "Meta could not complete browser sign-in. Start sign-in again.",
+      store_failed: "Muse could not save the approved account on this host. Paperclip\'s private credential storage needs fixing.",
+    } as const;
     const fail = () => {
       invalid = true;
       state.authorizationUrl = undefined;
@@ -155,6 +165,8 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "muse"
     const onLine = (raw: string) => {
       const text = raw.replace(/\x1b\[[0-9;]*m/g, "").trim();
       if (!text || invalid) return;
+      const failure = /(?:^|[^a-z_])(access_denied|expired|mint_failed|flow_failed|store_failed)(?:$|[^a-z_])/.exec(text.toLowerCase());
+      if (failure) state.error = nativeFailures[failure[1] as keyof typeof nativeFailures];
       if (phase === "idle" && text === "Open this page to sign in:") { phase = "url"; return; }
       if (phase === "url") {
         // Exact origin/path, no credentials, ports, redirects or arbitrary
@@ -174,7 +186,7 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "muse"
         state.code = text;
         phase = "done";
       }
-      if (phase === "done" && /(?:^|\.\.\. )Signed in\.$/.test(text)) signedIn = true;
+      // Completion is established from the private credential, not CLI prose.
     };
     const abort = () => { driver.stop(); };
     controller.signal.addEventListener("abort", abort, { once: true });
@@ -196,10 +208,28 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "muse"
         driver.write("\x04");
         line = "";
       }
-    }).then(({ exitCode }) => {
+    }).then(async ({ exitCode }) => {
       if (line) onLine(line);
-      state.outcome = !invalid && !controller.signal.aborted && exitCode === 0 && phase === "done" && signedIn ? "success" : "failure";
-    }).catch(() => { state.outcome = "failure"; })
+      if (invalid || controller.signal.aborted || exitCode !== 0 || phase !== "done") {
+        state.outcome = "failure";
+        state.error ??= controller.signal.aborted
+          ? "Muse browser sign-in was cancelled or timed out. Start sign-in again."
+          : `Muse browser sign-in stopped before an account was saved (exit ${exitCode ?? "interrupted"}). Start sign-in again.`;
+        return;
+      }
+      try {
+        // Native Muse prints "Logged in. Credential saved...", not the
+        // launcher's "Signed in.". Neither message is proof of usable auth.
+        await readVerifiedLocalAiCredential("muse", home);
+        state.outcome = controller.signal.aborted ? "failure" : "success";
+      } catch {
+        state.error ??= "Muse did not save a verified OAuth subscription in this sign-in's private directory. Start sign-in again.";
+        state.outcome = "failure";
+      }
+    }).catch(() => {
+      state.error ??= "Muse browser sign-in could not run on this host. Start sign-in again.";
+      state.outcome = "failure";
+    })
       .finally(() => {
         clearTimeout(timer);
         controller.signal.removeEventListener("abort", abort);
