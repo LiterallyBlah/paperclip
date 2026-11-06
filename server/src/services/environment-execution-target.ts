@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
-import { adapterSupportsRemoteManagedEnvironments } from "@paperclipai/shared";
+import { isEnvironmentDriverSupportedForAdapter } from "@paperclipai/shared";
 import {
   adapterExecutionTargetToRemoteSpec,
   type AdapterExecutionTarget,
@@ -258,7 +258,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
     // Keep this gate in lockstep with the shared capability metadata that the
     // environment selector and capabilities API expose; a drift here lets the
     // UI offer environments the runtime then refuses.
-    if (!adapterSupportsRemoteManagedEnvironments(input.adapterType)) {
+    if (!isEnvironmentDriverSupportedForAdapter(input.adapterType, input.environment.driver)) {
       return null;
     }
 
@@ -632,7 +632,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
   }
 
   if (
-    !adapterSupportsRemoteManagedEnvironments(input.adapterType) ||
+    !isEnvironmentDriverSupportedForAdapter(input.adapterType, input.environment.driver) ||
     input.environment.driver !== "ssh"
   ) {
     return null;

@@ -53,6 +53,8 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { hermesExecutionTarget, hermesRemoteEnv, materializeHermesInstructions } from "./remote.js";
+import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -339,6 +341,9 @@ export async function execute(
 ): Promise<AdapterExecutionResult> {
   const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
 
+  const target = hermesExecutionTarget(ctx, config);
+  const remote = target?.kind === "remote";
+
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = resolveHermesCommand(config);
   const model = cfgString(config.model) || DEFAULT_MODEL;
@@ -359,7 +364,7 @@ export async function execute(
   // library calls that did not opt into Paperclip runtime skills.
   if (Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills")) {
     try {
-      const selectedSkills = await reconcileHermesPaperclipSkills(config);
+      const selectedSkills = await reconcileHermesPaperclipSkills(config, undefined, target);
       if (selectedSkills.length > 0) {
         await ctx.onLog(
           "stdout",
@@ -386,7 +391,7 @@ export async function execute(
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   const explicitProvider = cfgString(config.provider);
 
-  if (!explicitProvider) {
+  if (!explicitProvider && !remote) {
     try {
       detectedConfig = await detectModel();
     } catch {
@@ -409,17 +414,21 @@ export async function execute(
   // when present, reapply that bundle through Hermes's native system overlay.
   const instructionsFilePath = cfgString(config.instructionsFilePath);
   let agentInstructions = "";
+  let remoteInstructions: Awaited<ReturnType<typeof materializeHermesInstructions>> | undefined;
   if (instructionsFilePath) {
     try {
       agentInstructions = await fs.readFile(instructionsFilePath, "utf-8");
       const loadedInstructionsLength = agentInstructions.length;
-      const instructionsFileDir = path.dirname(instructionsFilePath);
-      agentInstructions += `\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${instructionsFileDir}/.`;
+      if (remote && target) remoteInstructions = await materializeHermesInstructions(target, instructionsFilePath, ctx.runId);
+      const effectivePath = remoteInstructions?.path ?? instructionsFilePath;
+      const instructionsFileDir = path.dirname(effectivePath);
+      agentInstructions += `\nThe above agent instructions were loaded from ${effectivePath}. Resolve any relative file references from ${instructionsFileDir}/.`;
       await ctx.onLog(
         "stdout",
         `[hermes] Loaded agent instructions from ${instructionsFilePath} (${loadedInstructionsLength} chars)\n`,
       );
     } catch (err) {
+      if (remote) throw err; // Never silently omit a managed remote bundle.
       const reason = err instanceof Error ? err.message : String(err);
       // Non-fatal: log to stdout with an explicit "Warning:" prefix so the
       // Paperclip UI doesn't render this as a red error (stderr output is
@@ -481,7 +490,7 @@ export async function execute(
   // ── Build environment ──────────────────────────────────────────────────
   const userEnv = config.env as Record<string, string> | undefined;
   const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
+    ...(remote ? hermesRemoteEnv(config) : process.env as Record<string, string>),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent, ctx.agentIdentity),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
@@ -524,7 +533,7 @@ export async function execute(
   const cwd =
     cfgString(config.cwd) || workspaceCwd || cfgString(ctx.config?.workspaceDir) || ".";
   try {
-    await ensureAbsoluteDirectory(cwd);
+    if (!remote) await ensureAbsoluteDirectory(cwd);
   } catch {
     // Non-fatal
   }
@@ -565,14 +574,16 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
-  const result = await runChildProcess(ctx.runId, hermesCmd, args, {
+  const result = await (remote
+    ? runAdapterExecutionTargetProcess(ctx.runId, target, hermesCmd, args, { cwd, env, timeoutSec, graceSec, onLog: wrappedOnLog, onSpawn: ctx.onSpawn })
+    : runChildProcess(ctx.runId, hermesCmd, args, {
     cwd,
     env,
     timeoutSec,
     graceSec,
     onLog: wrappedOnLog,
     onSpawn: ctx.onSpawn,
-  });
+  })).finally(() => remoteInstructions?.cleanup());
 
   // ── Parse output ───────────────────────────────────────────────────────
   const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");

@@ -94,6 +94,8 @@ interface RunningProcess {
 }
 
 interface SpawnTarget {
+  stdin?: string;
+  keepStdinOpen?: boolean;
   command: string;
   args: string[];
   cwd?: string;
@@ -3629,6 +3631,9 @@ async function resolveSpawnTarget(
   options: {
     remoteExecution?: RemoteExecutionSpec | null;
     remoteEnv?: Record<string, string> | null;
+    stdin?: string;
+    timeoutSec?: number;
+    graceSec?: number;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
   } = {},
 ): Promise<SpawnTarget> {
@@ -3642,6 +3647,9 @@ async function resolveSpawnTarget(
       spec: remote,
       command,
       args,
+      stdin: options.stdin,
+      timeoutSec: options.timeoutSec,
+      graceSec: options.graceSec,
       env: Object.fromEntries(
         Object.entries(options.remoteEnv ?? {}).filter(
           (entry): entry is [string, string] => typeof entry[1] === "string",
@@ -3651,6 +3659,8 @@ async function resolveSpawnTarget(
     return {
       command: sshResolved,
       args: spawnTarget.args,
+      stdin: spawnTarget.stdin,
+      keepStdinOpen: spawnTarget.keepStdinOpen,
       cwd: process.cwd(),
       cleanup: spawnTarget.cleanup,
     };
@@ -4743,6 +4753,9 @@ export async function runChildProcess(
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution ? opts.env : null,
+      stdin: opts.stdin,
+      timeoutSec: opts.timeoutSec,
+      graceSec: opts.graceSec,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
@@ -4750,12 +4763,13 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
+        const input = target.stdin ?? opts.stdin;
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
           detached: process.platform !== "win32",
           shell: false,
-          stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+          stdio: [input != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
@@ -4909,11 +4923,12 @@ export async function runChildProcess(
         });
 
         const stdin = child.stdin;
-        if (opts.stdin != null && stdin) {
+        if (input != null && stdin) {
+          stdin.on("error", () => {});
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
-            stdin.end();
+            stdin.write(input);
+            if (!target.keepStdinOpen) stdin.end();
           });
         }
 

@@ -1,4 +1,6 @@
 import fs from "node:fs/promises";
+import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
+import { hermesExecutionTarget, hermesRemoteEnv, materializeHermesSkill, removeHermesManagedSkill } from "./remote.js";
 import os from "node:os";
 import path from "node:path";
 import type {
@@ -141,7 +143,10 @@ async function buildHermesSkillSnapshot(config: Record<string, unknown>): Promis
   const availableByKey = new Map(paperclipEntries.map((e) => [e.key, e]));
 
   // 2. Scan Hermes's own skills from ~/.hermes/skills/
-  const hermesSkillEntries = await scanHermesSkills(hermesSkillsHome);
+  const target = hermesExecutionTarget({}, config);
+  // Skill UI contexts do not carry an acquired environment; never scan the
+  // controller home as evidence of skills installed on a remote target.
+  const hermesSkillEntries = target?.kind === "remote" ? [] : await scanHermesSkills(hermesSkillsHome);
   const hermesKeys = new Set(hermesSkillEntries.map((e) => e.key));
 
   // 3. Merge: Paperclip skills first (ephemeral), then Hermes skills
@@ -216,6 +221,7 @@ export async function listHermesSkills(
 export async function reconcileHermesPaperclipSkills(
   config: Record<string, unknown>,
   requestedDesiredSkills?: string[],
+  target?: AdapterExecutionTarget | null,
 ): Promise<string[]> {
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkills = requestedDesiredSkills
@@ -225,6 +231,18 @@ export async function reconcileHermesPaperclipSkills(
       ]))
     : resolveLegacyPaperclipDesiredSkillNames(config, availableEntries);
   const desiredSet = new Set(desiredSkills);
+  target ??= hermesExecutionTarget({}, config);
+  if (target?.kind === "remote") {
+    for (const entry of availableEntries) {
+      if (!desiredSet.has(entry.key)) {
+        await removeHermesManagedSkill(target, hermesRemoteEnv(config), entry.runtimeName);
+        continue;
+      }
+      if (isPaperclipSkillSourceMissing(entry)) throw new Error(`Required Hermes skill source is missing: ${entry.key}`);
+      await materializeHermesSkill(target, hermesRemoteEnv(config), entry.source, entry.runtimeName);
+    }
+    return desiredSkills;
+  }
   const skillsHome = path.join(resolveHermesHome(config), "skills");
   await fs.mkdir(skillsHome, { recursive: true });
   const installed = await readInstalledSkillTargets(skillsHome);

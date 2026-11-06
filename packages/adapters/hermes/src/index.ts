@@ -122,6 +122,23 @@ templates. Use a Hermes CLI that supports this environment hook. An explicit
 overlay in \`env\` is preserved; the hook takes precedence over Hermes's configured
 profile personality/system prompt.
 
+## Native SSH execution
+
+Select a saved SSH execution environment; Hermes supports local and SSH drivers,
+not sandbox drivers. SSH requires python3 or node on the destination for the
+private stdin launch protocol (Hermes itself requires Python). Run environment,
+query, and stdin are sent over stdin, not SSH argv. The transport supervises the
+remote process group and terminates it on timeout or channel loss. Processes
+that deliberately detach into a new session are outside that stop guarantee.
+
+The SSH working directory is authoritative: no controller workspace is copied
+into it. Set explicit remote HOME, HERMES_HOME and PATH in env. Server environment
+secrets and server HOME/temp paths are not inherited. Provider auth stays in the
+remote Hermes profile. Managed instruction directories and selected skills are
+materialised using the shared SSH transfer. Existing non-Paperclip-owned skills
+are never overwritten; move conflicting installations before enabling management.
+Non-managed environment tests probe CLI/profile only and report auth unverified.
+
 ## Hermes-Originated Paperclip Tasks
 
 This adapter package also ships a Hermes-facing Paperclip task bridge skill:

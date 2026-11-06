@@ -102,6 +102,15 @@ describe("resolveEnvironmentExecutionTarget", () => {
     delete process.env.PAPERCLIP_RUNTIME_API_URL;
   });
 
+  it("resolves native Hermes SSH and rejects unimplemented Hermes sandbox execution", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver: "ssh", config: {
+      host: "127.0.0.1", port: 22, username: "hermes", remoteWorkspacePath: "/approved/oracle", privateKey: "fixture-key", knownHosts: "fixture-host-key", strictHostKeyChecking: true,
+    } });
+    const input = { db: {} as never, companyId: "company-1", adapterType: "hermes_local", environment: { id: "env-1", driver: "ssh", config: {} }, leaseMetadata: {} };
+    expect(await resolveEnvironmentExecutionTarget(input)).toMatchObject({ kind: "remote", transport: "ssh", remoteCwd: "/approved/oracle", spec: { username: "hermes", strictHostKeyChecking: true } });
+    expect(await resolveEnvironmentExecutionTarget({ ...input, environment: { ...input.environment, driver: "sandbox" } })).toBeNull();
+  });
+
   it("uses a bounded default cwd for sandbox targets when lease metadata omits remoteCwd", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "sandbox",

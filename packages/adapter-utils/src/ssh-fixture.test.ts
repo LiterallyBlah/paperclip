@@ -490,13 +490,9 @@ describe("ssh env-lab fixture", () => {
     // Fall back to .bashrc when no .bash_profile exists, so a host that adds
     // nvm in .bashrc still resolves node under a non-login SSH command.
     expect(remoteScript).toContain(".bashrc");
-    // The last ssh argument wraps the script as `sh -c '...'`, so the inner
-    // quotes are escaped. Assert the command still runs: cd, env, and the argv.
-    expect(remoteScript).toContain("cd ");
-    expect(remoteScript).toContain("/srv/paperclip/workspace");
-    expect(remoteScript).toContain("exec env ");
-    expect(remoteScript).toContain("node");
-    expect(remoteScript).toContain("--version");
+    expect(remoteScript).not.toContain("/srv/paperclip/workspace");
+    expect(remoteScript).not.toContain("FOO=bar");
+    expect(JSON.parse(target.stdin)).toMatchObject({ command: "node", args: ["--version"], env: { FOO: "bar" }, cwd: "/srv/paperclip/workspace" });
     await target.cleanup();
   });
 

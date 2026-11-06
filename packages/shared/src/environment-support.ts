@@ -73,6 +73,7 @@ const REMOTE_MANAGED_ADAPTERS = new Set<AgentAdapterType>([
   "grok_local",
   "kimi_local",
   "muse_local",
+  "hermes_local",
   "opencode_local",
   "pi_local",
 ]);
@@ -82,6 +83,7 @@ export function adapterSupportsRemoteManagedEnvironments(adapterType: string): b
 }
 
 export function supportedEnvironmentDriversForAdapter(adapterType: string): EnvironmentDriver[] {
+  if (adapterType === "hermes_local") return ["local", "ssh"];
   return adapterSupportsRemoteManagedEnvironments(adapterType)
     ? ["local", "ssh", "sandbox"]
     : ["local"];
@@ -91,7 +93,7 @@ export function supportedSandboxProvidersForAdapter(
   adapterType: string,
   additionalProviders: readonly string[] = [],
 ): SandboxEnvironmentProvider[] {
-  return adapterSupportsRemoteManagedEnvironments(adapterType)
+  return adapterType !== "hermes_local" && adapterSupportsRemoteManagedEnvironments(adapterType)
     ? Array.from(new Set(additionalProviders)) as SandboxEnvironmentProvider[]
     : [];
 }

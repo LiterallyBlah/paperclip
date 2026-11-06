@@ -18,6 +18,8 @@ import { promisify } from "node:util";
 import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 import { resolveHermesCommand } from "./execute.js";
+import { hermesExecutionTarget, hermesRemoteEnv, remoteHermesShell } from "./remote.js";
+import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 
 const execFileAsync = promisify(execFile);
 
@@ -331,6 +333,33 @@ export async function testEnvironment(
   const config = (ctx.config ?? {}) as Record<string, unknown>;
   const command = resolveHermesCommand(config);
   const checks: AdapterEnvironmentCheck[] = [];
+
+  const target = hermesExecutionTarget(ctx, config);
+  if (target?.kind === "remote") {
+    const env = hermesRemoteEnv(config);
+    try {
+      const version = await runAdapterExecutionTargetProcess("hermes-env-test", target, command, ["--version"], {
+        cwd: target.remoteCwd, env, timeoutSec: 10, graceSec: 2, onLog: async () => {},
+      });
+      if (version.exitCode !== 0 || version.timedOut) throw new Error("Remote CLI probe failed");
+      checks.push({ level: "info", code: "hermes_remote_cli", message: "Hermes CLI is available on the selected SSH target." });
+      await remoteHermesShell(target, 'test -d "${HERMES_HOME:-$HOME/.hermes}" && python3 --version', env);
+      checks.push({ level: "info", code: "hermes_remote_profile", message: "Remote Hermes profile directory and Python are available. Provider authentication remains owned by that profile." });
+      if (config.managedAiRouting) {
+        const args = ["chat", "-Q", "-q", "Respond with hello. Do not use tools.", "--max-turns", "1"];
+        if (asString(config.model)) args.push("-m", asString(config.model)!);
+        if (asString(config.provider)) args.push("--provider", asString(config.provider)!);
+        const hello = await runAdapterExecutionTargetProcess("hermes-env-hello", target, command, args, { cwd: target.remoteCwd, env, timeoutSec: 45, graceSec: 2, onLog: async () => {} });
+        if (hello.exitCode !== 0 || hello.timedOut || !/\bhello\b/i.test(hello.stdout)) throw new Error("Remote connection probe failed");
+        checks.push({ level: "info", code: "hermes_hello_probe_passed", message: "Hermes responded through the selected connection." });
+      } else {
+        checks.push({ level: "warn", code: "hermes_remote_auth_unverified", message: "CLI/profile checks passed; provider credentials were not read or tested with a model call." });
+      }
+    } catch {
+      checks.push({ level: "error", code: "hermes_remote_probe_failed", message: "Hermes CLI, profile, or selected connection probe failed on the SSH target." });
+    }
+    return { adapterType: ADAPTER_TYPE, status: checks.some(c => c.level === "error") ? "fail" : checks.some(c => c.level === "warn") ? "warn" : "pass", checks, testedAt: new Date().toISOString() };
+  }
 
   // Managed connections must prove the selected destination with the isolated
   // runtime environment. Host credentials and ~/.hermes are not evidence.

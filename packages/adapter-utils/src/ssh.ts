@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { constants as fsConstants, createReadStream, createWriteStream, promises as fs } from "node:fs";
 import net from "node:net";
+import { sshLaunchCommand, sshLaunchFrame } from "./ssh-launch.js";
 import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
@@ -225,6 +226,7 @@ async function spawnText(
   args: string[],
   options: {
     stdin?: string;
+    keepStdinOpen?: boolean;
     timeout?: number;
     maxBuffer?: number;
   } = {},
@@ -322,7 +324,9 @@ async function spawnText(
     });
 
     if (options.stdin != null && child.stdin) {
-      child.stdin.end(options.stdin);
+      child.stdin.on("error", () => {});
+      if (options.keepStdinOpen) child.stdin.write(options.stdin);
+      else child.stdin.end(options.stdin);
     }
   });
 }
@@ -1275,6 +1279,7 @@ export function buildKnownHostsEntry(input: {
   return `[${input.host}]:${input.port} ${input.publicKey.trim()}`;
 }
 
+
 export async function runSshCommand(
   config: SshConnectionConfig,
   remoteCommand: string,
@@ -1298,45 +1303,13 @@ export async function runSshCommand(
       }
     }
 
-    // Mirror buildSshSpawnTarget: source the login profiles first, then run
-    // `env KEY=VAL cmd` so user-supplied identity overrides win over anything a
-    // profile re-exports. The SSH target is an operator-configured host, not a
-    // Paperclip sandbox image, so it can expose `node` or an agent CLI only
-    // through a login profile; a non-login SSH command would miss that PATH.
-    // Source `/etc/profile` first so a host that exposes the PATH through
-    // `/etc/profile.d` scripts still resolves node and the agent CLI.
-    // The script no longer sources `nvm.sh`; a profile that adds nvm still runs.
-    // .bash_profile typically sources .bashrc itself; only source .bashrc
-    // directly when no .bash_profile exists, so a host that adds nvm in
-    // .bashrc still resolves node without a double-run of the setup.
-    const envArgs = envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`);
-    const remoteScript = [
-      'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-      envArgs.length > 0
-        ? `exec env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
-        : `exec sh -c ${shellQuote(remoteCommand)}`,
-    ].join(" && ");
-
-    sshArgs.push(
-      "-p",
-      String(config.port),
-      `${config.username}@${config.host}`,
-      `sh -c ${shellQuote(remoteScript)}`,
-    );
-
-    return options.stdin != null
-      ? await spawnText("ssh", sshArgs, {
-          stdin: options.stdin,
-          timeout: options.timeoutMs ?? 15_000,
-          maxBuffer: options.maxBuffer ?? 1024 * 128,
-        })
-      : await execFileText("ssh", sshArgs, {
-          timeout: options.timeoutMs ?? 15_000,
-          maxBuffer: options.maxBuffer ?? 1024 * 128,
-        });
+    sshArgs.push("-p", String(config.port), `${config.username}@${config.host}`, sshLaunchCommand());
+    return await spawnText("ssh", sshArgs, {
+      stdin: sshLaunchFrame({ command: "sh", args: ["-c", remoteCommand], env: Object.fromEntries(envEntries), stdin: options.stdin, timeoutSec: (options.timeoutMs ?? 15_000) / 1000 }),
+      keepStdinOpen: true,
+      timeout: options.timeoutMs ?? 15_000,
+      maxBuffer: options.maxBuffer ?? 1024 * 128,
+    });
   } finally {
     await cleanup();
   }
@@ -1347,54 +1320,25 @@ export async function buildSshSpawnTarget(input: {
   command: string;
   args: string[];
   env: Record<string, string>;
+  stdin?: string;
+  timeoutSec?: number;
+  graceSec?: number;
 }): Promise<{
   command: string;
   args: string[];
+  stdin: string;
+  keepStdinOpen: true;
   cleanup: () => Promise<void>;
 }> {
   for (const key of Object.keys(input.env)) {
-    if (!isValidShellEnvKey(key)) {
-      throw new Error(`Invalid SSH environment variable key: ${key}`);
-    }
+    if (!isValidShellEnvKey(key)) throw new Error(`Invalid SSH environment variable key: ${key}`);
   }
   const auth = await createSshAuthArgs(input.spec);
-  const sshArgs = [...auth.args];
-  const envArgs = Object.entries(input.env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
-  const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
-  // Source the login profiles first, then run `env KEY=VAL cmd` so
-  // user-supplied identity overrides win over anything a profile re-exports.
-  // The SSH target is an operator-configured host, not a Paperclip sandbox
-  // image, so it can expose `node` or an agent CLI only through a login
-  // profile; a non-login SSH command would miss that PATH. Source
-  // `/etc/profile` first so a host that exposes the PATH through
-  // `/etc/profile.d` scripts still resolves node and the agent CLI. The script
-  // no longer sources `nvm.sh`; a profile that adds nvm still runs.
-  // .bash_profile typically sources .bashrc itself; only source .bashrc
-  // directly when no .bash_profile exists, so a host that adds nvm in
-  // .bashrc still resolves node without a double-run of the setup.
-  const remoteScript = [
-    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-    `cd ${shellQuote(input.spec.remoteCwd)}`,
-    envArgs.length > 0
-      ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
-      : `exec ${remoteCommandParts}`,
-  ].join(" && ");
-
-  sshArgs.push(
-    "-p",
-    String(input.spec.port),
-    `${input.spec.username}@${input.spec.host}`,
-    `sh -c ${shellQuote(remoteScript)}`,
-  );
-
   return {
     command: "ssh",
-    args: sshArgs,
+    args: [...auth.args, "-p", String(input.spec.port), `${input.spec.username}@${input.spec.host}`, sshLaunchCommand()],
+    stdin: sshLaunchFrame({ command: input.command, args: input.args, env: input.env, cwd: input.spec.remoteCwd, stdin: input.stdin, timeoutSec: input.timeoutSec, graceSec: input.graceSec }),
+    keepStdinOpen: true,
     cleanup: auth.cleanup,
   };
 }

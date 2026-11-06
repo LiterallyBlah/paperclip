@@ -7,6 +7,11 @@ import {
 } from "./environment-support.js";
 
 describe("isSandboxProviderSupportedForAdapter", () => {
+  it("declares native Hermes SSH without advertising sandbox execution", () => {
+    expect(adapterSupportsRemoteManagedEnvironments("hermes_local")).toBe(true);
+    expect(supportedEnvironmentDriversForAdapter("hermes_local")).toEqual(["local", "ssh"]);
+    expect(isSandboxProviderSupportedForAdapter("hermes_local", "fake-plugin", ["fake-plugin"])).toBe(false);
+  });
   it("treats Paperclip Runner as a remote-managed adapter", () => {
     expect(adapterSupportsRemoteManagedEnvironments("paperclip_runner")).toBe(true);
     expect(supportedEnvironmentDriversForAdapter("paperclip_runner")).toEqual([
