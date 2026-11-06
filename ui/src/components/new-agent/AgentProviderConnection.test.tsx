@@ -340,6 +340,27 @@ describe("AgentProviderConnection reuse", () => {
     expect(managedApi.connectLocal).toHaveBeenCalledWith("c1", { ...intent, localSessionId: "local-attempt" });
     expect(mocks.loginPanel).not.toHaveBeenCalled();
   });
+  it("shows Muse browser approval instead of the Codex terminal fallback and connects only after approval", async () => {
+    const authorizationUrl = "https://auth.meta.com/oauth/device/?user_code=ABCD-1234";
+    managedApi.checkLocalLogin.mockResolvedValue({ status: "sign_in_required", authorizationUrl, code: "ABCD-1234" } as never);
+    const onComplete = vi.fn();
+    const intent = { provider: "muse" as const, method: "subscription" as const, name: "Muse Code", ownership: "shared" as const, agentIds: [], allAgents: true };
+    await mount("muse_local", false, false, false, false, false, { intent, onComplete }, true, "authenticated");
+    await vi.waitFor(() => expect(host.querySelector(`a[href="${authorizationUrl}"]`)).not.toBeNull());
+    expect(host.textContent).not.toMatch(/Codex CLI|Run this in a terminal|muse login/);
+    const connect = [...host.querySelectorAll("button")].find(button => button.textContent?.includes("Connect"))!;
+    expect(connect.disabled).toBe(true);
+    expect(managedApi.startLocalLogin).toHaveBeenCalledWith("c1", intent);
+    expect(managedApi.create).not.toHaveBeenCalled();
+    managedApi.checkLocalLogin.mockResolvedValue({ status: "ready" });
+    flushSync(() => window.dispatchEvent(new Event("focus")));
+    await vi.waitFor(() => expect(host.textContent).toContain("Muse Code is signed in"));
+    expect(connect.disabled).toBe(false);
+    click("Connect");
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith({ connectionId: "local-account", grantId: "local-grant", method: "subscription" }));
+    expect(managedApi.connectLocal).toHaveBeenCalledWith("c1", { ...intent, localSessionId: "local-attempt" });
+    expect(managedApi.create).not.toHaveBeenCalled();
+  });
   it("leaves a completed local account saved when its host is cancelled", async () => {
     managedApi.checkLocalLogin.mockResolvedValue({ status: "ready" });
     let finish!: (result: { connectionId: string; grantId: string }) => void;

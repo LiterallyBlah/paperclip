@@ -50,6 +50,7 @@ export const CONNECT_SOURCE_NAMES: Record<string, string> = {
   claude_local: "Claude",
   codex_local: "OpenAI",
   grok_local: "Grok",
+  muse_local: "Muse Code",
 };
 
 /** The provider name for a source, falling back to the type when unlisted. */
@@ -474,10 +475,10 @@ export function LocalProviderLoginInstructions({ adapterType, login }: {
   const [showCommand, setShowCommand] = useState(false);
   const [browserCode, setBrowserCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const provider = adapterType === "claude_local" ? "Claude Code" : adapterType === "grok_local" ? "Grok CLI" : "Codex CLI";
-  const isolated = login?.isolated ?? (adapterType === "codex_local" || adapterType === "grok_local");
+  const provider = adapterType === "claude_local" ? "Claude Code" : adapterType === "grok_local" ? "Grok CLI" : adapterType === "muse_local" ? "Muse Code" : "Codex CLI";
+  const isolated = login?.isolated ?? (adapterType === "codex_local" || adapterType === "grok_local" || adapterType === "muse_local");
   const command = login?.command;
-  const browserLogin = adapterType === "claude_local" || adapterType === "codex_local";
+  const browserLogin = adapterType === "claude_local" || adapterType === "codex_local" || adapterType === "muse_local";
   async function submitBrowserCode() {
     if (!browserCode.trim() || !login?.submitCode || submitting) return;
     setSubmitting(true);
