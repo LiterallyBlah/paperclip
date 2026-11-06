@@ -10,6 +10,7 @@ import {
   OnboardingCardField,
   OnboardingLoginCodeRow,
   onboardingCardInputClass,
+  LocalProviderLoginInstructions,
 } from "./AdapterLoginChrome";
 
 /**
@@ -52,6 +53,30 @@ async function render(node: React.ReactNode): Promise<HTMLElement> {
   await act(async () => root.render(node));
   return container;
 }
+
+describe("Muse local browser login", () => {
+  it("renders the Meta approval link and code without a terminal command", async () => {
+    const authorizationUrl = "https://auth.meta.com/oauth/device/?user_code=ABCD-1234";
+    const container = await render(<LocalProviderLoginInstructions adapterType="muse_local" login={{ isolated: true, preparing: false, status: "sign_in_required", authorizationUrl, code: "ABCD-1234", error: null, retry: vi.fn() }} />);
+    expect(container.querySelector(`a[href="${authorizationUrl}"]`)).not.toBeNull();
+    expect(container.textContent).toContain("Muse Code");
+    expect(container.textContent).not.toMatch(/Codex CLI|terminal|muse login/);
+  });
+  it("keeps the browser preparation state instead of displaying an empty command", async () => {
+    const container = await render(<LocalProviderLoginInstructions adapterType="muse_local" login={{ isolated: true, preparing: false, status: "sign_in_required", error: null, retry: vi.fn() }} />);
+    expect(container.textContent).toContain("Preparing browser sign-in");
+    expect(container.textContent).not.toMatch(/Codex CLI|terminal/);
+  });
+  it("shows a failed Muse login with a working restart action", async () => {
+    const retry = vi.fn();
+    const container = await render(<LocalProviderLoginInstructions adapterType="muse_local" login={{ isolated: true, preparing: false, status: "sign_in_required", error: "Muse approval expired", retry }} />);
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe("Muse approval expired");
+    const restart = [...container.querySelectorAll("button")].find(button => button.textContent === "Start sign-in again")!;
+    await act(() => restart.click());
+    expect(retry).toHaveBeenCalledOnce();
+    expect(container.textContent).not.toMatch(/Codex CLI|Run this in a terminal/);
+  });
+});
 
 describe("the connect step's cards", () => {
   let container: HTMLDivElement;
