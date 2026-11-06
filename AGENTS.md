@@ -2,6 +2,11 @@
 
 Guidance for human and AI contributors working in this repository.
 
+## Maintained downstream
+
+Before updating or deploying this fork, read [DOWNSTREAM.md](DOWNSTREAM.md).
+Merge upstream into the maintained branch; do not overwrite it with a stock release.
+
 ## 1. Purpose
 
 Paperclip is a control plane for AI-agent companies.
