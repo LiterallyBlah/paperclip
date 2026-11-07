@@ -38,7 +38,7 @@ export function AgentProviderConnection({
   companyId,
   adapterType,
   environmentId,
-  canLogin,
+  canLogin: environmentCanLogin,
   localEnvironment = false,
   onConnected,
   onDraftChanged,
@@ -69,6 +69,8 @@ export function AgentProviderConnection({
     onComplete: (result: { connectionId: string; grantId: string; method: "subscription" | "api_key" }) => void;
   };
 }) {
+  // Muse has local browser login only; its adapter has no sandbox login capability.
+  const canLogin = environmentCanLogin && adapterType !== "muse_local";
   const health = useQuery({ queryKey: queryKeys.health, queryFn: healthApi.get, enabled: localEnvironment });
   const canUseLocalLogin = localEnvironment && (health.data?.localAiLoginSupported ?? health.data?.deploymentMode === "local_trusted");
   const epoch = useRef(0);

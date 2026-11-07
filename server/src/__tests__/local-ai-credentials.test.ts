@@ -14,7 +14,7 @@ describe("explicit local subscription import", () => {
     expect(mocks.credentialFile).toHaveBeenCalledWith("/isolated/muse/.config/muse/auth.json");
     expect(mocks.readFile).not.toHaveBeenCalled();
   });
-  it.each([{}, [], { providers: { meta: { mechanism: "api_key", api_key: "metered-fixture" } } }, { providers: { meta: { mechanism: "oauth", access_token: "" } } }, { providers: { meta: { mechanism: "oauth", access_token: "not-subscribed", subs_active: false } } }])("rejects an invalid or API-key Muse credential as a subscription", async credential => {
+  it.each([{}, [], { providers: { meta: { mechanism: "api_key", api_key: "metered-fixture" } } }, { providers: { meta: { mechanism: "oauth", access_token: "" } } }, { providers: { meta: { mechanism: "oauth", access_token: "not-subscribed", subs_active: false } } }, { providers: { meta: { mechanism: "oauth", access_token: "missing-subscription-state" } } }])("rejects an invalid or API-key Muse credential as a subscription", async credential => {
     mocks.credentialFile.mockResolvedValue(JSON.stringify(credential));
     await expect(readVerifiedLocalAiCredential("muse", "/isolated/muse")).rejects.toThrow("Could not verify the local subscription");
   });

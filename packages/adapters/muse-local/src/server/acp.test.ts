@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  testMuseAcpEnvironment,
   buildMuseAcpConfig,
   nodeVersionMeetsMuseAcpMinimum,
   resolveMuseExecutionEngine,
@@ -248,5 +249,15 @@ describe("MuseAcpBridge session config methods", () => {
         error: "Model context window exceeded",
       },
     });
+  });
+});
+
+
+describe("Muse ACP readiness", () => {
+  it("includes the actual path when cwd is a file", async () => {
+    const cwd = new URL("./acp.test.ts", import.meta.url).pathname;
+    const result = await testMuseAcpEnvironment({ companyId: "fixture", adapterType: "muse_local", config: { cwd }, executionTarget: { kind: "remote" } } as any);
+    expect(result.checks.find(check => check.code === "muse_acp_cwd_invalid")?.message)
+      .toBe(`Working directory is not a directory: ${cwd}`);
   });
 });

@@ -591,11 +591,11 @@ describe("AgentProviderConnection reuse", () => {
       select.value = "";
       select.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    expect(host.textContent).toContain("New subscription login");
+    expect(host.textContent?.includes("New subscription login")).toBe(adapterType !== "muse_local");
     await client.invalidateQueries();
     await vi.waitFor(() => expect(client.isFetching()).toBe(0));
     expect(host.querySelector("select")!.value).toBe("");
-    expect(host.textContent).toContain("New subscription login");
+    expect(host.textContent?.includes("New subscription login")).toBe(adapterType !== "muse_local");
   });
   it("never offers a saved Codex home in Claude's subscription chooser", async () => {
     await mount("claude_local", false, true, true);
@@ -605,4 +605,12 @@ describe("AgentProviderConnection reuse", () => {
     expect(host.textContent).not.toContain("ChatGPT account");
   });
 
+});
+
+it("omits Muse sandbox login even when the sandbox supports login PTYs", async () => {
+  const intent = { provider: "muse" as const, method: "subscription" as const, name: "Muse", ownership: "personal" as const, agentIds: [], allAgents: true };
+  await mount("muse_local", false, true, false, false, false, { intent, onComplete: vi.fn() });
+  expect(host.textContent).not.toContain("New subscription login");
+  expect(mocks.loginPanel).not.toHaveBeenCalled();
+  expect(host.textContent).toContain("This environment does not support browser sign-in");
 });

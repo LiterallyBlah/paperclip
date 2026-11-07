@@ -1,3 +1,4 @@
+import { hasActiveMuseSubscription } from "./credentials.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -306,7 +307,7 @@ export async function testMuseAcpEnvironment(
   const cwd = asString(config.cwd, process.cwd());
   try {
     const stat = await fs.stat(cwd);
-    if (!stat.isDirectory()) throw new Error("Working directory is not a directory: ${cwd}");
+    if (!stat.isDirectory()) throw new Error(`Working directory is not a directory: ${cwd}`);
     checks.push({
       code: "muse_acp_cwd_valid",
       level: "info",
@@ -336,7 +337,7 @@ export async function testMuseAcpEnvironment(
 
   let hasAuthJson = false;
   for (const candidate of authJsonCandidates) {
-    if (await pathExists(candidate)) {
+    if (await hasActiveMuseSubscription(candidate)) {
       hasAuthJson = true;
       break;
     }

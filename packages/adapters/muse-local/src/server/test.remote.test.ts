@@ -1,3 +1,7 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { testMuseAcpEnvironment } from "./acp.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
 
@@ -117,4 +121,24 @@ describe("muse_local testEnvironment remote probe isolation", () => {
     expect(probeOptions?.env?.DATABASE_URL).toBeUndefined();
     expect(probeOptions?.env?.CUSTOM_VAR).toBe("custom-val");
   });
+  it.each([true, false, undefined])("checks subscription state %s in both readiness lanes", async (subsActive) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "muse-readiness-"));
+    const authPath = path.join(root, "auth.json");
+    await fs.writeFile(authPath, JSON.stringify({ providers: { meta: { mechanism: "oauth", access_token: "synthetic-only", subs_active: subsActive } } }));
+    try {
+      const ctx = {
+        companyId: "fixture", adapterType: "muse_local",
+        config: { engine: "cli", cwd: root, env: { MUSE_AUTH_PATH: authPath } },
+        executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: root },
+      } as AdapterEnvironmentTestContext;
+      const cli = await testEnvironment(ctx);
+      expect(cli.checks.some(check => check.code === "muse_auth_configured")).toBe(subsActive === true);
+      expect(runProcessMock.mock.calls.some(call => call[3].includes("exec"))).toBe(subsActive === true);
+      const acp = await testMuseAcpEnvironment(ctx);
+      expect(acp.checks.some(check => check.code === "muse_acp_credentials_detected")).toBe(subsActive === true);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
 });

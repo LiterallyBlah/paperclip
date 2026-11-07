@@ -1,3 +1,4 @@
+import { hasActiveMuseSubscription } from "./credentials.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -119,7 +120,8 @@ export async function testEnvironment(
 
     if (targetIsRemote) {
       // For remote targets, only accept credentials explicitly configured for the adapter/run
-      hasAuth = Boolean(env.MUSE_AUTH_PATH || env.META_API_KEY || env.MUSE_API_KEY);
+      hasAuth = Boolean(env.META_API_KEY || env.MUSE_API_KEY) ||
+        Boolean(env.MUSE_AUTH_PATH && await hasActiveMuseSubscription(env.MUSE_AUTH_PATH));
       if (env.MUSE_AUTH_PATH && (await fs.access(env.MUSE_AUTH_PATH).then(() => true).catch(() => false))) {
         authContent = await fs.readFile(env.MUSE_AUTH_PATH, "utf8").catch(() => null);
       }
@@ -136,7 +138,7 @@ export async function testEnvironment(
 
       for (const src of [targetAuth, ...sourceCandidates]) {
         if (src && (await fs.access(src).then(() => true).catch(() => false))) {
-          hasAuth = true;
+          hasAuth = await hasActiveMuseSubscription(src);
           selectedAuthSrc = src;
           authContent = await fs.readFile(src, "utf8").catch(() => null);
           break;

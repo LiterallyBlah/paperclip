@@ -29,10 +29,13 @@ provider (`muse_local`). Everything else is configuration.
       migration that re-adds the checks without `muse` runs before the
       renumbered Muse migration and fails on existing `muse` rows.
       This branch carries that union in `0361_mighty_dracula.sql`.
-5. Regenerate `packages/shared/src/app-definitions.generated.ts` with the
-   repo's catalog tooling (see `doc/connections/CONNECTOR-PLAYBOOK.md`) so
-   `muse.json` is imported, and bump the `APP_STORE_DEFINITIONS` length in
-   `packages/shared/src/app-definitions.test.ts` by one.
+   c. Keep the union and Muse migrations byte-distinct (a trailing SQL
+      comment is enough). The migrator identifies receipts by content hash;
+      identical SQL files leave a migration pending after startup.
+5. Keep `packages/shared/src/app-definitions/muse.json` imported by
+   `packages/shared/src/app-definitions.generated.ts`. Preserve that downstream
+   entry when regenerating the catalog, and update the catalog count assertion
+   in `packages/shared/src/app-definitions.test.ts` if membership changes.
 6. Run the touched-package tests and typecheck, then open a fork PR whose
    diff is only the Muse patch. Never open anything against upstream.
 
