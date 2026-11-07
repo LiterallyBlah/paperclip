@@ -149,6 +149,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !targetIsRemote ? path.join(process.env.HOME || os.homedir(), ".config/muse/auth.json") : null,
     ].filter(Boolean) as string[];
 
+  const managedAuthPath = env.MUSE_AUTH_PATH;
   for (const src of sourceCandidates) {
     if (src && src !== targetAuth && (await fs.access(src).then(() => true).catch(() => false))) {
       try {
@@ -163,10 +164,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   }
 
+  if (config.managedAiConnection && managedAuthPath && stagedAuthSource !== managedAuthPath) {
+    throw new Error("Managed Muse credential file is missing; refusing to fall back to an ambient host login");
+  }
+
   // Session resolution
   const runtimeSessionParams = parseObject(runtime?.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime?.sessionId ?? "");
-  const canResumeSession = runtimeSessionId.length > 0;
+  const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
+  const canResumeSession =
+    runtimeSessionId.length > 0 &&
+    (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(cwd));
   const resumeSessionId = canResumeSession ? runtimeSessionId : null;
 
   // Skills resolution and staging
@@ -478,7 +486,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           provider: "muse",
           biller: "meta",
           model,
-          billingType: "subscription",
+          billingType: stagedAuthSource ? "subscription" : env.META_API_KEY || env.MUSE_API_KEY ? "api" : "subscription",
           costUsd: null,
           resultJson: {
             stdout: proc.stdout,

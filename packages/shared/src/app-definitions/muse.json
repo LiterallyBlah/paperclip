@@ -6,7 +6,7 @@
     "categories": [
         "ai"
     ],
-    "featured": true,
+    "featured": false,
     "branding": {
         "logoUrl": "/brands/apps/meta.svg",
         "darkLogoUrl": "/brands/apps/meta-dark.svg"

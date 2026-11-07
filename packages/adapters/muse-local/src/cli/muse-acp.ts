@@ -70,8 +70,12 @@ export function parseArgs(argv: string[]): { options: CliOptions; showVersion: b
       command = argv[++i];
     } else if (arg === "--disable-sandbox") {
       disableSandbox = true;
+    } else if (arg === "--enable-sandbox") {
+      disableSandbox = false;
     } else if (arg === "--trust-workspace") {
       trustWorkspace = true;
+    } else if (arg === "--no-trust-workspace") {
+      trustWorkspace = false;
     } else {
       extraArgs.push(arg);
     }
@@ -138,14 +142,8 @@ export class MuseAcpBridge {
   private currentTurnResolver: { resolve: (val: any) => void; reject: (err: Error) => void } | null = null;
   private activeSessionId: string | null = null;
   private itemKinds = new Map<string, string>(); // itemId -> kind
-  private initializedPromise: Promise<void>;
-  private resolveInitialized!: () => void;
 
-  constructor(private options: CliOptions) {
-    this.initializedPromise = new Promise((resolve) => {
-      this.resolveInitialized = resolve;
-    });
-  }
+  constructor(private options: CliOptions) {}
 
   public async start(): Promise<void> {
     const museBin = resolveMuseExecutable(this.options.command);
@@ -190,10 +188,10 @@ export class MuseAcpBridge {
     this.childRl = readline.createInterface({ input: this.child.stdout });
     this.childRl.on("line", (line) => this.handleMspLine(line));
 
-    // Initial handshake with muse serve
+    // Initial handshake with muse serve. Await the initialize result so a
+    // JSON-RPC error fails start() instead of hanging.
     const initId = this.nextMspId++;
-    this.sendMsp("initialize", { clientInfo: { name: "paperclip", version: "1.0.0" } }, initId);
-    await this.initializedPromise;
+    await this.sendMsp("initialize", { clientInfo: { name: "paperclip", version: "1.0.0" } }, initId);
     // MSP requires an `initialized` notification after the initialize
     // result before any session method; without it the host rejects
     // session/start with `Not initialized`.
@@ -228,10 +226,6 @@ export class MuseAcpBridge {
         } else {
           resolve(msg.result);
         }
-        // Handle handshake completion
-        if (msg.id === 1 && msg.result) {
-          this.resolveInitialized();
-        }
         return;
       }
 
@@ -240,7 +234,7 @@ export class MuseAcpBridge {
         this.handleMspNotification(msg.method, msg.params);
       }
     } catch (err) {
-      console.error("[muse-acp] Error parsing MSP line:", err, line);
+      console.error(`[muse-acp] Error parsing MSP line (${line.length} chars):`, err);
     }
   }
 
@@ -570,6 +564,8 @@ Options:
   --reasoning-effort <effort>    Reasoning effort: none|minimal|low|medium|high|xhigh|max|ultra
   --command <path>               Path to muse executable (default: muse or ~/.local/bin/muse)
   --disable-sandbox              Disable OS sandboxing (default: true)
+  --enable-sandbox               Keep OS sandboxing enabled
+  --no-trust-workspace           Do not trust the workspace root
   --trust-workspace              Trust workspace root (default: true)
   -v, --version                  Print version and exit
   -h, --help                     Print help and exit

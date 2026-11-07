@@ -47,7 +47,7 @@
   {
     "dir": "packages/adapters/muse-local",
     "name": "@paperclipai/adapter-muse-local",
-    "publishFromCi": true
+    "publishFromCi": false
   },
   {
     "dir": "packages/adapters/kimi-local",

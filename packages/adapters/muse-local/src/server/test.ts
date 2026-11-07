@@ -213,7 +213,7 @@ export async function testEnvironment(
 
       try {
         const model = asString(ctx.config?.model, "muse-wonder-1.0");
-        const probeArgs = ["exec", "--model", model, "--yolo", "Respond with hello"];
+        const probeArgs = ["exec", "--model", model, "--disable-write", "--disable-shell", "Respond with hello"];
         const probeProcess = await runAdapterExecutionTargetProcess(
           probeRunId,
           target,

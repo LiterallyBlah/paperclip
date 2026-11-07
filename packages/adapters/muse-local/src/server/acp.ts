@@ -305,7 +305,8 @@ export async function testMuseAcpEnvironment(
 
   const cwd = asString(config.cwd, process.cwd());
   try {
-    await fs.mkdir(cwd, { recursive: true });
+    const stat = await fs.stat(cwd);
+    if (!stat.isDirectory()) throw new Error("Working directory is not a directory: ${cwd}");
     checks.push({
       code: "muse_acp_cwd_valid",
       level: "info",
