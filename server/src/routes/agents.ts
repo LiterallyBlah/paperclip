@@ -1186,7 +1186,7 @@ export function agentRoutes(
               let parsed: unknown;
               try { parsed = JSON.parse(authBytes.toString("utf8")); } catch { throw new Error("Provider credential is not ready"); }
               if (!parsed || typeof parsed !== "object") throw new Error("Provider credential is not ready");
-              await aiConnectionService(db).save(context.companyId, context.startedByUserId, managedSession.aiConnection!, authBytes.toString("utf8"), context.sessionId);
+              await aiConnectionService(db).save(context.companyId, context.startedByUserId, managedSession.aiConnection!, authBytes.toString("utf8"), { id: context.sessionId });
             });
             return;
           }
