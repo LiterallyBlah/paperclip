@@ -3,10 +3,12 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 
 const written: string[] = [];
+const spawnArgs: string[][] = [];
 let childStdout: PassThrough;
 
 vi.mock("node:child_process", () => ({
-  spawn: vi.fn(() => {
+  spawn: vi.fn((_cmd: string, args: string[]) => {
+    spawnArgs.push(args);
     const child = new EventEmitter() as EventEmitter & {
       stdin: Writable;
       stdout: PassThrough;
@@ -44,11 +46,12 @@ async function waitFor(predicate: () => boolean) {
 describe("MuseAcpBridge MSP handshake", () => {
   beforeEach(() => {
     written.length = 0;
+    spawnArgs.length = 0;
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     vi.spyOn(console, "error").mockImplementation(() => {});
   });
 
-  it("sends the initialized notification after initialize and before session/start", async () => {
+  async function startBridge(options: Record<string, unknown> = {}) {
     const bridge = new MuseAcpBridge({
       provider: "echo",
       model: "muse-wonder-1.0",
@@ -56,12 +59,23 @@ describe("MuseAcpBridge MSP handshake", () => {
       disableSandbox: true,
       trustWorkspace: true,
       extraArgs: [],
-    });
-
+      ...options,
+    } as never);
     const started = bridge.start();
     await waitFor(() => sentMessages().some((msg) => msg.method === "initialize"));
     childStdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
     await started;
+    return bridge;
+  }
+
+  function respondTo(method: string, result: unknown) {
+    const msg = sentMessages().find((m) => m.method === method);
+    childStdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\n");
+    return msg;
+  }
+
+  it("sends the initialized notification after initialize and before session/start", async () => {
+    const bridge = await startBridge();
 
     const afterInit = sentMessages();
     const initialized = afterInit.find((msg) => msg.method === "initialized");
@@ -75,18 +89,65 @@ describe("MuseAcpBridge MSP handshake", () => {
       params: { cwd: process.cwd() },
     });
     await waitFor(() => sentMessages().some((msg) => msg.method === "session/start"));
-    const startMsg = sentMessages().find((msg) => msg.method === "session/start");
-    childStdout.write(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: startMsg.id,
-        result: { session: { sessionId: "session-1" } },
-      }) + "\n",
-    );
+    respondTo("session/start", { session: { sessionId: "session-1" } });
     await sessionNew;
 
     const methods = sentMessages().map((msg) => msg.method);
     expect(methods.indexOf("initialize")).toBeLessThan(methods.indexOf("initialized"));
     expect(methods.indexOf("initialized")).toBeLessThan(methods.indexOf("session/start"));
+  });
+
+  it("includes a commandId in session/resume", async () => {
+    const bridge = await startBridge();
+    const load = bridge.handleAcpRequest({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "session/load",
+      params: { sessionId: "session-9" },
+    });
+    await waitFor(() => sentMessages().some((msg) => msg.method === "session/resume"));
+    const resume = respondTo("session/resume", {});
+    await load;
+    expect(resume.params.sessionId).toBe("session-9");
+    expect(typeof resume.params.commandId).toBe("string");
+    expect(resume.params.commandId.length).toBeGreaterThan(0);
+  });
+
+  it("includes a commandId in turn/cancel", async () => {
+    const bridge = await startBridge();
+    const sessionNew = bridge.handleAcpRequest({
+      jsonrpc: "2.0",
+      id: 8,
+      method: "session/new",
+      params: { cwd: process.cwd() },
+    });
+    await waitFor(() => sentMessages().some((msg) => msg.method === "session/start"));
+    respondTo("session/start", { session: { sessionId: "session-3" } });
+    await sessionNew;
+
+    const cancel = bridge.handleAcpRequest({
+      jsonrpc: "2.0",
+      id: 9,
+      method: "session/cancel",
+      params: {},
+    });
+    await waitFor(() => sentMessages().some((msg) => msg.method === "turn/cancel"));
+    const cancelMsg = respondTo("turn/cancel", {});
+    await cancel;
+    expect(cancelMsg.params.sessionId).toBe("session-3");
+    expect(typeof cancelMsg.params.commandId).toBe("string");
+    expect(cancelMsg.params.commandId.length).toBeGreaterThan(0);
+  });
+
+  it("never passes --reasoning-effort to muse serve and gates --model to meta/local", async () => {
+    await startBridge({ provider: "echo", reasoningEffort: "high" });
+    expect(spawnArgs[0]).not.toContain("--reasoning-effort");
+    expect(spawnArgs[0]).not.toContain("--model");
+
+    written.length = 0;
+    spawnArgs.length = 0;
+    await startBridge({ provider: "meta", reasoningEffort: "high" });
+    expect(spawnArgs[0]).not.toContain("--reasoning-effort");
+    expect(spawnArgs[0]).toContain("--model");
   });
 });

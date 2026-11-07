@@ -149,15 +149,11 @@ export class MuseAcpBridge {
 
   public async start(): Promise<void> {
     const museBin = resolveMuseExecutable(this.options.command);
-    const args = [
-      "serve",
-      "--provider",
-      this.options.provider,
-      "--model",
-      this.options.model,
-    ];
-    if (this.options.reasoningEffort && this.options.reasoningEffort !== "auto") {
-      args.push("--reasoning-effort", this.options.reasoningEffort);
+    const args = ["serve", "--provider", this.options.provider];
+    // `muse serve` has no --reasoning-effort flag (effort travels in
+    // turn/start params) and rejects --model for non-meta/local providers.
+    if (this.options.provider === "meta" || this.options.provider === "local") {
+      args.push("--model", this.options.model);
     }
     if (this.options.disableSandbox) {
       args.push("--disable-sandbox");
@@ -431,7 +427,7 @@ export class MuseAcpBridge {
           const sessionId = params.sessionId;
           await this.sendMsp(
             "session/resume",
-            { sessionId },
+            { commandId: uuidv7(), sessionId },
             this.nextMspId++
           );
           this.activeSessionId = sessionId;
@@ -516,7 +512,7 @@ export class MuseAcpBridge {
           if (this.activeSessionId) {
             await this.sendMsp(
               "turn/cancel",
-              { sessionId: this.activeSessionId },
+              { commandId: uuidv7(), sessionId: this.activeSessionId },
               this.nextMspId++
             ).catch(() => {});
           }
