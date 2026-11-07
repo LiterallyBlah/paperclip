@@ -198,6 +198,10 @@ export class MuseAcpBridge {
     const initId = this.nextMspId++;
     this.sendMsp("initialize", { clientInfo: { name: "paperclip", version: "1.0.0" } }, initId);
     await this.initializedPromise;
+    // MSP requires an `initialized` notification after the initialize
+    // result before any session method; without it the host rejects
+    // session/start with `Not initialized`.
+    this.sendMsp("initialized", {});
   }
 
   private sendMsp(method: string, params: any, id?: number): Promise<any> {
