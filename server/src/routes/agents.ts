@@ -1178,20 +1178,7 @@ export function agentRoutes(
           }
         },
       },
-      muse_local: {
-        async promote(authBytes, context) {
-          const managedSession = await adapterLoginStore.get(context.sessionId);
-          if (managedSession?.aiConnection) {
-            await adapterLoginStore.withCompanyAdapterPromotionLock(context.companyId, context.startedByUserId, context.adapterType, async () => {
-              let parsed: unknown;
-              try { parsed = JSON.parse(authBytes.toString("utf8")); } catch { throw new Error("Provider credential is not ready"); }
-              if (!parsed || typeof parsed !== "object") throw new Error("Provider credential is not ready");
-              await aiConnectionService(db).save(context.companyId, context.startedByUserId, managedSession.aiConnection!, authBytes.toString("utf8"), { id: context.sessionId });
-            });
-            return;
-          }
-        },
-      },
+
     } satisfies Partial<Record<AgentAdapterType, CredentialPromotion>>,
     recordActivity: (event) => {
       // The event carries no URL, no code, no credential, no account identifier,

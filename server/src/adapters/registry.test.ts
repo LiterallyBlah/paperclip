@@ -36,16 +36,8 @@ describe("built-in adapter login capabilities", () => {
     expect(() => assertValidAdapterLoginCapability(capability, "codex_local")).not.toThrow();
   });
 
-  it("registers the Muse device-login capability", () => {
-    const capability = requireServerAdapter("muse_local").loginCapability;
-    expect(capability).toBeDefined();
-    if (!capability) return;
-    expect(capability.panelMode).toBe("displayed_code");
-    expect(capability.timeoutPolicy).toBe("caller_bounded");
-    expect(capability.completionClaim).toBeUndefined();
-    expect(typeof capability.getCommand).toBe("function");
-    expect(typeof capability.parsePrompt).toBe("function");
-    expect(() => assertValidAdapterLoginCapability(capability, "muse_local")).not.toThrow();
+  it("does not register a Muse sandbox device-login capability", () => {
+    expect(requireServerAdapter("muse_local").loginCapability).toBeUndefined();
   });
 
   it("registers the Grok device-login capability", () => {

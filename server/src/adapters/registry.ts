@@ -105,8 +105,6 @@ import {
   syncMuseSkills,
   testEnvironment as museTestEnvironment,
   sessionCodec as museSessionCodec,
-  MUSE_DEVICE_LOGIN_COMMAND,
-  parseMuseDeviceLoginPrompt,
 } from "@paperclipai/adapter-muse-local/server";
 import {
   agentConfigurationDoc as museAgentConfigurationDoc,
@@ -887,16 +885,6 @@ const kimiLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: kimiAgentConfigurationDoc,
 };
 
-const museLoginCapability: AdapterLoginCapability = {
-  panelMode: "displayed_code",
-  timeoutPolicy: "caller_bounded",
-  getCommand: () => MUSE_DEVICE_LOGIN_COMMAND,
-  parsePrompt: (output) => {
-    const prompt = parseMuseDeviceLoginPrompt(output);
-    return prompt ? { url: prompt.url, code: prompt.code } : null;
-  },
-};
-
 const museLocalAdapter: ServerAdapterModule = {
   type: "muse_local",
   runtimeToolDelivery: "environment",
@@ -925,7 +913,6 @@ const museLocalAdapter: ServerAdapterModule = {
     installCommand: null,
   }),
   agentConfigurationDoc: museAgentConfigurationDoc,
-  loginCapability: museLoginCapability,
 };
 
 const hermesGatewayAdapter: ServerAdapterModule = {
