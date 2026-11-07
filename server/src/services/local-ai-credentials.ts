@@ -43,6 +43,17 @@ export async function readVerifiedLocalAiCredential(provider: AiProvider, loginH
       await fetchCodexQuota(auth.accessToken, auth.accountId);
       return JSON.stringify({ tokens: { access_token: auth.accessToken, refresh_token: auth.refreshToken, id_token: auth.idToken, account_id: auth.accountId }, last_refresh: auth.lastRefresh });
     }
+    if (provider === "muse") {
+      const raw = await readLocalAiCredentialFile(path.join(loginHome, ".config", "muse", "auth.json"));
+      const parsed = JSON.parse(raw) as { providers?: { meta?: Record<string, unknown> } };
+      const meta = parsed?.providers?.meta;
+      // Only browser OAuth is a subscription. Do not relabel stored metered
+      // API credentials as a subscription merely because auth.json exists.
+      if (meta?.mechanism !== "oauth" || typeof meta.access_token !== "string" || !meta.access_token.trim() || meta.subs_active !== true) {
+        throw new Error("Missing OAuth subscription login");
+      }
+      return raw;
+    }
     const raw = await fs.readFile(path.join(loginHome!, "auth.json"), "utf8");
     const payload = parseGrokAuthPayload(JSON.parse(raw));
     if (!payload || !hasUsableGrokAuthValue(payload.value)) throw new Error("Missing login");

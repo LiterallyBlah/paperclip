@@ -38,6 +38,7 @@ export function aiProviderForAdapter(
       copilot_runtime: "github",
       gemini_local: "google",
       hermes_local: "openrouter",
+      muse_local: "muse",
     } as Record<string, AiProvider>
   )[adapterType];
 }
@@ -239,7 +240,7 @@ export function AiConnectionField({
             initialMethod={reconnecting?.method ?? method}
             fixedMethod={Boolean(reconnecting)}
             connectionId={reconnecting?.id}
-            name={reconnecting?.name ?? `My ${provider === "anthropic" ? "Claude" : provider === "openai" ? "OpenAI" : provider === "xai" ? "Grok" : provider === "google" ? "Gemini" : provider === "github" ? "GitHub Copilot" : "OpenRouter"} ${method === "subscription" ? "subscription" : "API"}`}
+            name={reconnecting?.name ?? `My ${provider === "anthropic" ? "Claude" : provider === "openai" ? "OpenAI" : provider === "xai" ? "Grok" : provider === "google" ? "Gemini" : provider === "github" ? "GitHub Copilot" : provider === "muse" ? "Muse" : "OpenRouter"} ${method === "subscription" ? "subscription" : "API"}`}
             ownership="personal"
             agentIds={agentId ? [agentId] : []}
             allAgents={allAgents}

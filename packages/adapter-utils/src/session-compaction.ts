@@ -45,6 +45,7 @@ export const LEGACY_SESSIONED_ADAPTER_TYPES = new Set([
   "grok_local",
   "hermes_local",
   "kimi_local",
+  "muse_local",
   "opencode_local",
   "pi_local",
 ]);
@@ -84,6 +85,11 @@ export const ADAPTER_SESSION_MANAGEMENT: Record<string, AdapterSessionManagement
     supportsSessionResume: true,
     nativeContextManagement: "unknown",
     defaultSessionCompaction: DEFAULT_SESSION_COMPACTION_POLICY,
+  },
+  muse_local: {
+    supportsSessionResume: true,
+    nativeContextManagement: "confirmed",
+    defaultSessionCompaction: ADAPTER_MANAGED_SESSION_POLICY,
   },
   opencode_local: {
     supportsSessionResume: true,

@@ -36,6 +36,10 @@ describe("built-in adapter login capabilities", () => {
     expect(() => assertValidAdapterLoginCapability(capability, "codex_local")).not.toThrow();
   });
 
+  it("does not register a Muse sandbox device-login capability", () => {
+    expect(requireServerAdapter("muse_local").loginCapability).toBeUndefined();
+  });
+
   it("registers the Grok device-login capability", () => {
     const capability = requireServerAdapter("grok_local").loginCapability;
     expect(capability).toBeDefined();
@@ -74,6 +78,7 @@ describe("built-in runtime connection tool delivery", () => {
     ["hermes_gateway", "invocation_context"],
     ["hermes_local", "environment"],
     ["kimi_local", "environment"],
+    ["muse_local", "environment"],
     ["openclaw_gateway", "invocation_context"],
     ["opencode_local", "environment"],
     ["paperclip_runner", "environment"],

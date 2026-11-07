@@ -61,7 +61,7 @@ function SubscriptionConnectionStep({ companyId, provider, initialMethod, fixedM
     });
   } catch (error) { environmentError = error instanceof Error ? error.message : "Could not resolve the sign-in environment."; }
   const loginEnvironments = (envs.data ?? []).filter((env) =>
-    env.status === "active" && (env.driver === "local" || (env.driver === "sandbox" &&
+    env.status === "active" && (env.driver === "local" || (provider !== "muse" && env.driver === "sandbox" &&
     typeof env.config.provider === "string" &&
     caps.data?.sandboxProviders?.[env.config.provider]?.supportsLoginPty === true)),
   );
@@ -73,7 +73,7 @@ function SubscriptionConnectionStep({ companyId, provider, initialMethod, fixedM
   }
   const environment = envs.data?.find((env) => env.id === environmentId);
   const sandboxProvider = typeof environment?.config.provider === "string" ? environment.config.provider : "";
-  const canLogin = environment?.driver === "sandbox" && caps.data?.sandboxProviders?.[sandboxProvider]?.supportsLoginPty === true;
+  const canLogin = provider !== "muse" && environment?.driver === "sandbox" && caps.data?.sandboxProviders?.[sandboxProvider]?.supportsLoginPty === true;
   const loading = [envs, caps, settings, experimental, general].some((query) => query.isPending);
   const error = environmentError ?? [envs, caps, settings, experimental, general].find((query) => query.error)?.error?.message;
   const intent: AiConnectionLoginIntent = { provider: provider as AiConnectionLoginIntent["provider"], method: "subscription", name, ownership, agentIds, allAgents, connectionId };
@@ -88,7 +88,7 @@ function SubscriptionConnectionStep({ companyId, provider, initialMethod, fixedM
     {loading ? <p role="status" className="text-sm text-muted-foreground">Preparing sign-in…</p> : <AgentProviderConnection
       key={environmentId ?? "local"}
       companyId={companyId}
-      adapterType={provider === "anthropic" ? "claude_local" : provider === "xai" ? "grok_local" : "codex_local"}
+      adapterType={provider === "anthropic" ? "claude_local" : provider === "xai" ? "grok_local" : provider === "muse" ? "muse_local" : "codex_local"}
       environmentId={environmentId}
       canLogin={canLogin}
       localEnvironment={environment?.driver === "local"}

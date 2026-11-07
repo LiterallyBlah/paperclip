@@ -7,6 +7,17 @@ vi.mock("../services/local-ai-credential-file.js", () => ({ readLocalAiCredentia
 vi.mock("node:fs/promises", () => ({ default: { readFile: mocks.readFile } }));
 afterEach(() => { vi.resetAllMocks(); vi.unstubAllGlobals(); });
 describe("explicit local subscription import", () => {
+  it("accepts Muse only from an isolated OAuth subscription file", async () => {
+    const credential = JSON.stringify({ providers: { meta: { mechanism: "oauth", access_token: "fixture-oauth", refresh_token: "fixture-refresh", api_key: "muse-subscription-key-fixture", expires_at: 2000000000, subs_active: true } } });
+    mocks.credentialFile.mockResolvedValue(credential);
+    await expect(readVerifiedLocalAiCredential("muse", "/isolated/muse")).resolves.toBe(credential);
+    expect(mocks.credentialFile).toHaveBeenCalledWith("/isolated/muse/.config/muse/auth.json");
+    expect(mocks.readFile).not.toHaveBeenCalled();
+  });
+  it.each([{}, [], { providers: { meta: { mechanism: "api_key", api_key: "metered-fixture" } } }, { providers: { meta: { mechanism: "oauth", access_token: "" } } }, { providers: { meta: { mechanism: "oauth", access_token: "not-subscribed", subs_active: false } } }, { providers: { meta: { mechanism: "oauth", access_token: "missing-subscription-state" } } }])("rejects an invalid or API-key Muse credential as a subscription", async credential => {
+    mocks.credentialFile.mockResolvedValue(JSON.stringify(credential));
+    await expect(readVerifiedLocalAiCredential("muse", "/isolated/muse")).rejects.toThrow("Could not verify the local subscription");
+  });
   it("verifies Claude only from the selected isolated home, never the host account", async () => {
     mocks.credentialFile.mockResolvedValue(JSON.stringify({ claudeAiOauth: { accessToken: "isolated-claude" } }));
     await expect(readVerifiedLocalAiCredential("anthropic", "/isolated/claude")).resolves.toBe("isolated-claude");
@@ -69,7 +80,7 @@ describe("explicit local subscription import", () => {
     await expect(readVerifiedLocalAiCredential("openai", "/isolated/login")).rejects.toThrow("Finish browser sign-in");
     expect(mocks.codexQuota).not.toHaveBeenCalled();
   });
-  it.each(["anthropic", "openai", "xai"] as const)("never clones the ambient rotating %s login", async (provider) => {
+  it.each(["anthropic", "openai", "xai", "muse"] as const)("never clones the ambient rotating %s login", async (provider) => {
     await expect(readVerifiedLocalAiCredential(provider)).rejects.toThrow(provider === "xai"
       ? "Start local sign-in"
       : "Start browser sign-in");

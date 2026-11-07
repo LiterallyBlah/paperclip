@@ -74,6 +74,38 @@ beforeAll(async () => {
 afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
 describe("managed AI connections", () => {
+  it("persists a personal Muse subscription and clears configured and inherited API-key overrides", async () => {
+    const owner = "muse-subscription-owner";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const credential = JSON.stringify({ providers: { meta: { mechanism: "oauth", access_token: "fixture-muse-access", refresh_token: "fixture-muse-refresh", expires_at: 2000000000 } } });
+    const saved = await service.save(companyId, owner, { provider: "muse", method: "subscription", ownership: "personal", name: "Muse subscription", loginSessionId: "fixture", agentIds: [], allAgents: true }, credential);
+    const selected = { provider: "muse", method: "subscription", mode: "delegated", connectionId: saved.connectionId, grantId: saved.grantId } as const;
+    vi.stubEnv("META_API_KEY", "ambient-metered-key");
+    vi.stubEnv("MUSE_API_KEY", "ambient-metered-alias");
+    let managed: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
+    try {
+      managed = await prepareManagedAiRuntime(db, { companyId, agentId: "", responsibleUserId: owner, adapterType: "muse_local", binding: selected, allowUninstalledPersonal: true, config: { env: { META_API_KEY: "configured-metered-key", MUSE_API_KEY: "configured-metered-alias" } } });
+      const env = managed.config.env as Record<string, string>;
+      expect(env.META_API_KEY).toBe("");
+      expect(env.MUSE_API_KEY).toBe("");
+      expect(env.MUSE_AUTH_PATH.startsWith(managed.home!)).toBe(true);
+      expect(await readFile(env.MUSE_AUTH_PATH, "utf8")).toBe(credential);
+      expect(managed.attribution.method).toBe("subscription");
+      const defaults = await db.select().from(aiProviderDefaults).where(and(eq(aiProviderDefaults.companyId, companyId), eq(aiProviderDefaults.userId, owner), eq(aiProviderDefaults.provider, "muse")));
+      expect(defaults).toHaveLength(1);
+      const migration = await readFile(new URL("../../../packages/db/src/migrations/0375_muse_subscription_provider.sql", import.meta.url), "utf8");
+      await db.transaction(async tx => {
+        for (const statement of migration.split("--> statement-breakpoint")) {
+          if (statement.trim()) await tx.execute(sql.raw(statement));
+        }
+      });
+      expect(await db.select().from(aiProviderDefaults).where(and(eq(aiProviderDefaults.companyId, companyId), eq(aiProviderDefaults.userId, owner), eq(aiProviderDefaults.provider, "muse")))).toHaveLength(1);
+    } finally {
+      await managed?.cleanup();
+      delete process.env.META_API_KEY;
+      delete process.env.MUSE_API_KEY;
+    }
+  });
   it.each([
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: false },
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: true },
@@ -1178,6 +1210,27 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     });
     expect(selectedCopilot.grant.id).toBe(copilot.grantId);
   });
+  it("preserves Muse account defaults when the provider constraint migrations are reapplied (0361 then 0375)", async () => {
+    const owner = "muse-migration-owner";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const credential = JSON.stringify({ providers: { meta: { mechanism: "oauth", access_token: "fixture-muse-access", refresh_token: "fixture-muse-refresh", expires_at: 2000000000 } } });
+    const saved = await service.save(companyId, owner, { provider: "muse", method: "subscription", ownership: "personal", name: "Muse migration", loginSessionId: "fixture", agentIds: [], allAgents: true }, credential);
+    await service.setDefault(companyId, owner, saved.grantId);
+    for (const file of ["0361_mighty_dracula.sql", "0375_muse_subscription_provider.sql"]) {
+      const migration = await readFile(new URL(`../../../packages/db/src/migrations/${file}`, import.meta.url), "utf8");
+      await db.transaction(async (tx) => {
+        for (const statement of migration.split("--> statement-breakpoint")) {
+          if (statement.trim()) await tx.execute(sql.raw(statement));
+        }
+      });
+    }
+    expect(await db.select().from(aiProviderDefaults).where(and(eq(aiProviderDefaults.companyId, companyId), eq(aiProviderDefaults.userId, owner), eq(aiProviderDefaults.provider, "muse")))).toHaveLength(1);
+    const selected = await service.select({
+      companyId, agentId, userId: owner, adapterType: "muse_local",
+      binding: { provider: "muse", method: "subscription", mode: "responsible_user" },
+    });
+    expect(selected.grant.id).toBe(saved.grantId);
+  });
 
   it.each([false, true])("reports the authoritative connection-manager capability for custom grants (manager: %s)", async (manager) => {
     const userId = `custom-manager-${manager}`;
@@ -2175,6 +2228,12 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const request = vi.fn().mockResolvedValue(new Response("secret-provider-body", { status: 401 }));
     await expect(validateAiApiKey("anthropic", "fixture", request)).rejects.toThrow("rejected");
     expect(request.mock.calls[0][1].redirect).toBe("error");
+  });
+  it("validates muse API keys against Meta endpoint and rejects invalid keys", async () => {
+    const request = vi.fn().mockResolvedValue(new Response("unauthorized", { status: 401 }));
+    await expect(validateAiApiKey("muse", "invalid-meta-key", request)).rejects.toThrow("rejected");
+    expect(request.mock.calls[0][0]).toBe("https://api.meta.ai/v1/models");
+    expect(request.mock.calls[0][1].headers).toEqual({ Authorization: "Bearer invalid-meta-key" });
   });
   it("uses the authenticated responsible user for agent-originated configuration and tests", async () => {
     const req = { actor: { type: "agent", agentId, onBehalfOfUserId: "alice" } } as express.Request;

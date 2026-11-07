@@ -45,7 +45,7 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 async function mount(
-  adapterType: "claude_local" | "codex_local" | "grok_local" = "claude_local",
+  adapterType: "claude_local" | "codex_local" | "grok_local" | "muse_local" = "claude_local",
   savedLogin = false,
   canLogin = true,
   codexSubscriptions = false,
@@ -58,7 +58,7 @@ async function mount(
   advancedConnection?: Parameters<typeof AgentProviderConnection>[0]["advancedConnection"],
 ) {
   const key =
-    adapterType === "claude_local" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
+    adapterType === "claude_local" ? "ANTHROPIC_API_KEY" : adapterType === "muse_local" ? "META_API_KEY" : "OPENAI_API_KEY";
   mocks.auth.mockResolvedValue({
     status: codexSubscriptions ? "unknown" : "present",
   });
@@ -340,6 +340,27 @@ describe("AgentProviderConnection reuse", () => {
     expect(managedApi.connectLocal).toHaveBeenCalledWith("c1", { ...intent, localSessionId: "local-attempt" });
     expect(mocks.loginPanel).not.toHaveBeenCalled();
   });
+  it("shows Muse browser approval instead of the Codex terminal fallback and connects only after approval", async () => {
+    const authorizationUrl = "https://auth.meta.com/oauth/device/?user_code=ABCD-1234";
+    managedApi.checkLocalLogin.mockResolvedValue({ status: "sign_in_required", authorizationUrl, code: "ABCD-1234" } as never);
+    const onComplete = vi.fn();
+    const intent = { provider: "muse" as const, method: "subscription" as const, name: "Muse Code", ownership: "shared" as const, agentIds: [], allAgents: true };
+    await mount("muse_local", false, false, false, false, false, { intent, onComplete }, true, "authenticated");
+    await vi.waitFor(() => expect(host.querySelector(`a[href="${authorizationUrl}"]`)).not.toBeNull());
+    expect(host.textContent).not.toMatch(/Codex CLI|Run this in a terminal|muse login/);
+    const connect = [...host.querySelectorAll("button")].find(button => button.textContent?.includes("Connect"))!;
+    expect(connect.disabled).toBe(true);
+    expect(managedApi.startLocalLogin).toHaveBeenCalledWith("c1", intent);
+    expect(managedApi.create).not.toHaveBeenCalled();
+    managedApi.checkLocalLogin.mockResolvedValue({ status: "ready" });
+    flushSync(() => window.dispatchEvent(new Event("focus")));
+    await vi.waitFor(() => expect(host.textContent).toContain("Muse Code is signed in"));
+    expect(connect.disabled).toBe(false);
+    click("Connect");
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith({ connectionId: "local-account", grantId: "local-grant", method: "subscription" }));
+    expect(managedApi.connectLocal).toHaveBeenCalledWith("c1", { ...intent, localSessionId: "local-attempt" });
+    expect(managedApi.create).not.toHaveBeenCalled();
+  });
   it("leaves a completed local account saved when its host is cancelled", async () => {
     managedApi.checkLocalLogin.mockResolvedValue({ status: "ready" });
     let finish!: (result: { connectionId: string; grantId: string }) => void;
@@ -552,14 +573,14 @@ describe("AgentProviderConnection reuse", () => {
     click("Connect");
     await vi.waitFor(() => expect(test).toHaveBeenCalledWith({ env: {} }));
   });
-  it.each(["claude_local", "codex_local"] as const)("uses a managed subscription through the upstream chooser for %s", async (adapterType) => {
-    const provider = adapterType === "claude_local" ? "anthropic" : "openai";
+  it.each(["claude_local", "codex_local", "muse_local"] as const)("uses a managed subscription through the upstream chooser for %s", async (adapterType) => {
+    const provider = adapterType === "claude_local" ? "anthropic" : adapterType === "muse_local" ? "muse" : "openai";
     managedApi.list.mockResolvedValue({ currentUserId: "user-1", connections: [{
       id: "account", grantId: "grant", companyId: "c1", provider,
       method: "subscription", name: "My subscription", ownership: "personal",
       ownerUserId: "user-1", isDefault: true, status: "connected",
     }] } as never);
-    const { connected } = await mount(adapterType, false, true, false, false);
+    const { connected } = await mount(adapterType, false, true, false, adapterType === "muse_local");
     openProvider();
     expect(host.querySelector('select[aria-label="Saved subscription"]')?.textContent).toContain("My subscription (Your default)");
     click("Use saved subscription");
@@ -570,11 +591,11 @@ describe("AgentProviderConnection reuse", () => {
       select.value = "";
       select.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    expect(host.textContent).toContain("New subscription login");
+    expect(host.textContent?.includes("New subscription login")).toBe(adapterType !== "muse_local");
     await client.invalidateQueries();
     await vi.waitFor(() => expect(client.isFetching()).toBe(0));
     expect(host.querySelector("select")!.value).toBe("");
-    expect(host.textContent).toContain("New subscription login");
+    expect(host.textContent?.includes("New subscription login")).toBe(adapterType !== "muse_local");
   });
   it("never offers a saved Codex home in Claude's subscription chooser", async () => {
     await mount("claude_local", false, true, true);
@@ -584,4 +605,12 @@ describe("AgentProviderConnection reuse", () => {
     expect(host.textContent).not.toContain("ChatGPT account");
   });
 
+});
+
+it("omits Muse sandbox login even when the sandbox supports login PTYs", async () => {
+  const intent = { provider: "muse" as const, method: "subscription" as const, name: "Muse", ownership: "personal" as const, agentIds: [], allAgents: true };
+  await mount("muse_local", false, true, false, false, false, { intent, onComplete: vi.fn() });
+  expect(host.textContent).not.toContain("New subscription login");
+  expect(mocks.loginPanel).not.toHaveBeenCalled();
+  expect(host.textContent).toContain("This environment does not support browser sign-in");
 });

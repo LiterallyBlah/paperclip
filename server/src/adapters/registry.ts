@@ -100,6 +100,18 @@ import {
   models as kimiModels,
 } from "@paperclipai/adapter-kimi-local";
 import {
+  execute as museExecute,
+  listMuseSkills,
+  syncMuseSkills,
+  testEnvironment as museTestEnvironment,
+  sessionCodec as museSessionCodec,
+} from "@paperclipai/adapter-muse-local/server";
+import {
+  agentConfigurationDoc as museAgentConfigurationDoc,
+  models as museModels,
+} from "@paperclipai/adapter-muse-local";
+
+import {
   createHermesGatewayServerAdapter,
   createHermesLocalServerAdapter,
 } from "@paperclipai/hermes-paperclip-adapter";
@@ -873,6 +885,36 @@ const kimiLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: kimiAgentConfigurationDoc,
 };
 
+const museLocalAdapter: ServerAdapterModule = {
+  type: "muse_local",
+  runtimeToolDelivery: "environment",
+  execute: museExecute,
+  testEnvironment: museTestEnvironment,
+  acp: {
+    agentId: "muse",
+    skillsMode: "ephemeral",
+    prerequisites: {
+      nodeRange: ">=20.0.0",
+    },
+  },
+  listSkills: listMuseSkills,
+  syncSkills: syncMuseSkills,
+  sessionCodec: museSessionCodec,
+  sessionManagement: getAdapterSessionManagement("muse_local") ?? undefined,
+  supportsToolRefreshOnResume: true,
+  models: museModels,
+  supportsLocalAgentJwt: true,
+  supportsInstructionsBundle: true,
+  instructionsPathKey: "instructionsFilePath",
+  requiresMaterializedRuntimeSkills: true,
+  getRuntimeCommandSpec: (config) => ({
+    command: readConfiguredCommand(config, "muse"),
+    detectCommand: readConfiguredCommand(config, "muse"),
+    installCommand: null,
+  }),
+  agentConfigurationDoc: museAgentConfigurationDoc,
+};
+
 const hermesGatewayAdapter: ServerAdapterModule = {
   ...createHermesGatewayServerAdapter(),
   runtimeToolDelivery: "invocation_context",
@@ -960,6 +1002,7 @@ function registerBuiltInAdapters() {
     geminiLocalAdapter,
     grokLocalAdapter,
     kimiLocalAdapter,
+    museLocalAdapter,
     hermesGatewayAdapter,
     hermesLocalAdapter,
     openclawGatewayAdapter,
