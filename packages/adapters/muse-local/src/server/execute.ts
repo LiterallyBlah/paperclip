@@ -38,6 +38,7 @@ import {
   resolveMuseExecutionEngineForRun,
   createMuseAcpExecutor,
 } from "./acp.js";
+import { decideMuseAuthMerge, USE_SOURCE_EXIT } from "./muse-auth-merge-decision.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -135,6 +136,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const stagedSkillDirs: string[] = [];
   const createdParentDirs: string[] = [];
+  let stagedAuthSource: string | null = null;
+  let stagedAuthTarget: string | null = null;
+  let stagedAuthRemote = false;
 
   try {
     const targetAuth = path.join(runTmpDir, "muse", "auth.json");
@@ -151,6 +155,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const data = await fs.readFile(src, "utf8");
         await fs.mkdir(path.join(runTmpDir, "muse"), { recursive: true, mode: 0o700 });
         await fs.writeFile(targetAuth, data, { mode: 0o600 });
+        stagedAuthSource = src;
+        stagedAuthTarget = targetAuth;
+        stagedAuthRemote = targetIsRemote;
         break;
       } catch {}
     }
@@ -486,6 +493,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
     );
   } finally {
+    // Copy a refreshed credential back to its source file through the same
+    // merge predicate the managed runtime uses, before the run dir is removed.
+    if (stagedAuthSource && stagedAuthTarget && !stagedAuthRemote) {
+      try {
+        const decision = await decideMuseAuthMerge(stagedAuthTarget, stagedAuthSource, {
+          errorLabel: "muse auth copy-back",
+        });
+        if (decision === USE_SOURCE_EXIT) {
+          const refreshed = await fs.readFile(stagedAuthTarget, "utf8");
+          await fs.writeFile(stagedAuthSource, refreshed, { mode: 0o600 });
+        }
+      } catch {}
+    }
     for (const target of stagedSkillDirs) {
       await fs.rm(target, { recursive: true, force: true }).catch(() => undefined);
     }

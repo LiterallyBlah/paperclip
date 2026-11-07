@@ -139,4 +139,57 @@ describe("muse-auth-merge-decision predicate", () => {
     const dest = authJson({ accountId: IDENTITY_A, token: "old-token", expiresAt: FUTURE_1 });
     expect(await runSubprocess(source, dest)).toBe(UNREADABLE_EXPIRY);
   });
+  function museNativeJson(input: {
+    email?: string;
+    accessToken?: string;
+    apiKey?: string;
+    mechanism?: string;
+  }): string {
+    return JSON.stringify({
+      providers: {
+        meta: {
+          mechanism: input.mechanism ?? "oauth",
+          access_token: input.accessToken ?? "access-1",
+          api_key: input.apiKey ?? "minted-key-1",
+          subs_active: true,
+          user_email: input.email ?? "owner@example.com",
+          user_full_name: "Owner",
+          obtained_via: "device",
+          api_base_url: "https://api.meta.ai",
+        },
+      },
+    }, null, 2);
+  }
+
+  it("parses the real providers.meta shape with user_email identity", async () => {
+    const dir = await makeTempDir();
+    const file = path.join(dir, "auth.json");
+    await writeFile(file, museNativeJson({}), { mode: 0o600 });
+    const parsed = parseAuthFile(file);
+    expect(parsed.kind).toBe("usable");
+    expect(parsed.identity).toBe("owner@example.com");
+  });
+
+  it("returns USE_SOURCE (10) when a real Muse credential changed for the same identity", async () => {
+    const source = museNativeJson({ accessToken: "access-2", apiKey: "minted-key-2" });
+    const dest = museNativeJson({ accessToken: "access-1", apiKey: "minted-key-1" });
+    expect(await runSubprocess(source, dest)).toBe(USE_SOURCE);
+  });
+
+  it("returns KEEP_DESTINATION (20) when real Muse credentials are identical", async () => {
+    const same = museNativeJson({});
+    expect(await runSubprocess(same, same)).toBe(KEEP_DESTINATION);
+  });
+
+  it("returns KEEP_DESTINATION (20) when real Muse identities differ", async () => {
+    const source = museNativeJson({ email: "other@example.com", accessToken: "access-2" });
+    const dest = museNativeJson({ email: "owner@example.com" });
+    expect(await runSubprocess(source, dest)).toBe(KEEP_DESTINATION);
+  });
+
+  it("returns KEEP_DESTINATION (20) when the real Muse credential is not oauth", async () => {
+    const source = museNativeJson({ mechanism: "api_key", accessToken: "access-2" });
+    const dest = museNativeJson({});
+    expect(await runSubprocess(source, dest)).toBe(KEEP_DESTINATION);
+  });
 });

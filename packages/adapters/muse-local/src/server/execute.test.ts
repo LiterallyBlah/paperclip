@@ -204,6 +204,56 @@ describe("muse_local execute", () => {
     expect(capturedXdgConfig).not.toBe(customConfig);
     expect(capturedStagedAuthContent).toContain("custom-auth-token");
   });
+  it("copies a refreshed Muse credential back to its source file after the run", async () => {
+    const root = await makeTempRoot();
+    const customConfig = await makeTempRoot();
+    const museDir = path.join(customConfig, "muse");
+    await fs.mkdir(museDir, { recursive: true });
+    const native = (accessToken: string) =>
+      JSON.stringify({
+        providers: {
+          meta: {
+            mechanism: "oauth",
+            access_token: accessToken,
+            api_key: "minted-key",
+            subs_active: true,
+            user_email: "owner@example.com",
+          },
+        },
+      });
+    const sourceAuth = path.join(museDir, "auth.json");
+    await fs.writeFile(sourceAuth, native("access-before"), "utf8");
+
+    runProcessMock.mockImplementationOnce(
+      async (
+        _runId: string,
+        _target: unknown,
+        _command: string,
+        _args: string[],
+        options?: any,
+      ) => {
+        const stagedAuth = path.join(options.env.XDG_CONFIG_HOME, "muse", "auth.json");
+        await fs.writeFile(stagedAuth, native("access-refreshed"), "utf8");
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: JSON.stringify({ payload_type: "run.terminal.completed", payload: { text: "Task completed." } }),
+          stderr: "",
+        };
+      },
+    );
+
+    const ctx = makeContext(root, {
+      config: {
+        cwd: root,
+        env: { XDG_CONFIG_HOME: customConfig },
+      },
+    });
+
+    await execute(ctx);
+    expect(await fs.readFile(sourceAuth, "utf8")).toContain("access-refreshed");
+  });
 
   it("reports workspace restore failure when remote workspace restore fails", async () => {
     const root = await makeTempRoot();

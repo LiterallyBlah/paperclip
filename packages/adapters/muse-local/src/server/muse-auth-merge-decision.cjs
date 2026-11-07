@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 
 const ISO_8601_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 const EPOCH_SECONDS_MAX = 1e12;
@@ -19,6 +20,40 @@ const MAX_PLAUSIBLE_EXPIRY_MS = 400 * 24 * 60 * 60 * 1000;
 function parseAuthValue(raw) {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     return { kind: "unusable" };
+  }
+
+  // Real Muse credentials nest under providers.meta and carry no
+  // expiry/refresh fields. Identity is user_email; the subscription proof
+  // is mechanism "oauth" with an access token.
+  const meta =
+    raw.providers && typeof raw.providers === "object" && !Array.isArray(raw.providers)
+      ? raw.providers.meta
+      : null;
+  if (meta && typeof meta === "object" && !Array.isArray(meta)) {
+    const token = typeof meta.access_token === "string" ? meta.access_token.trim() : "";
+    if (meta.mechanism !== "oauth" || !token) {
+      return { kind: "unusable" };
+    }
+    const identity =
+      typeof meta.user_email === "string" && meta.user_email.trim().length > 0
+        ? meta.user_email.trim()
+        : null;
+    const freshnessRaw =
+      meta.last_refresh ?? meta.lastRefresh ?? meta.updated_at ?? meta.updatedAt ?? meta.expires_at ?? meta.expiresAt;
+    const isExpiry =
+      (meta.expires_at !== undefined || meta.expiresAt !== undefined) &&
+      meta.last_refresh === undefined &&
+      meta.lastRefresh === undefined &&
+      meta.updated_at === undefined &&
+      meta.updatedAt === undefined;
+    return {
+      kind: "usable",
+      identity,
+      freshnessRaw,
+      isExpiry,
+      museNative: true,
+      contentHash: crypto.createHash("sha256").update(JSON.stringify(raw)).digest("hex"),
+    };
   }
 
   // Check token material
@@ -146,6 +181,19 @@ function decide(source, destination, nowMs) {
   const destinationFreshness = readFreshness(destination.freshnessRaw);
 
   if (!sourceFreshness.present || !destinationFreshness.present) {
+    // Real Muse credentials have no freshness field. Same identity plus
+    // changed content means the run refreshed the credential: use source.
+    if (
+      !sourceFreshness.present &&
+      !destinationFreshness.present &&
+      source.museNative &&
+      destination.museNative &&
+      source.contentHash &&
+      destination.contentHash &&
+      source.contentHash !== destination.contentHash
+    ) {
+      return USE_SOURCE;
+    }
     return KEEP_DESTINATION;
   }
   if (sourceFreshness.unreadable || destinationFreshness.unreadable) {
