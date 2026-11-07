@@ -102,10 +102,6 @@ describe("managed AI connections", () => {
       expect(await db.select().from(aiProviderDefaults).where(and(eq(aiProviderDefaults.companyId, companyId), eq(aiProviderDefaults.userId, owner), eq(aiProviderDefaults.provider, "muse")))).toHaveLength(1);
     } finally {
       await managed?.cleanup();
-      // This fixture shares a database with a historical Google migration
-      // replay test; do not leave newer-provider rows in that older fixture.
-      await db.delete(aiProviderDefaults).where(and(eq(aiProviderDefaults.companyId, companyId), eq(aiProviderDefaults.userId, owner)));
-      await db.delete(aiConnectionDefaults).where(and(eq(aiConnectionDefaults.companyId, companyId), eq(aiConnectionDefaults.userId, owner)));
       delete process.env.META_API_KEY;
       delete process.env.MUSE_API_KEY;
     }
@@ -1213,6 +1209,27 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
       binding: { provider: "github", method: "api_key", mode: "responsible_user" },
     });
     expect(selectedCopilot.grant.id).toBe(copilot.grantId);
+  });
+  it("preserves Muse account defaults when the provider constraint migrations are reapplied (0361 then 0375)", async () => {
+    const owner = "muse-migration-owner";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const credential = JSON.stringify({ providers: { meta: { mechanism: "oauth", access_token: "fixture-muse-access", refresh_token: "fixture-muse-refresh", expires_at: 2000000000 } } });
+    const saved = await service.save(companyId, owner, { provider: "muse", method: "subscription", ownership: "personal", name: "Muse migration", loginSessionId: "fixture", agentIds: [], allAgents: true }, credential);
+    await service.setDefault(companyId, owner, saved.grantId);
+    for (const file of ["0361_mighty_dracula.sql", "0375_muse_subscription_provider.sql"]) {
+      const migration = await readFile(new URL(`../../../packages/db/src/migrations/${file}`, import.meta.url), "utf8");
+      await db.transaction(async (tx) => {
+        for (const statement of migration.split("--> statement-breakpoint")) {
+          if (statement.trim()) await tx.execute(sql.raw(statement));
+        }
+      });
+    }
+    expect(await db.select().from(aiProviderDefaults).where(and(eq(aiProviderDefaults.companyId, companyId), eq(aiProviderDefaults.userId, owner), eq(aiProviderDefaults.provider, "muse")))).toHaveLength(1);
+    const selected = await service.select({
+      companyId, agentId, userId: owner, adapterType: "muse_local",
+      binding: { provider: "muse", method: "subscription", mode: "responsible_user" },
+    });
+    expect(selected.grant.id).toBe(saved.grantId);
   });
 
   it.each([false, true])("reports the authoritative connection-manager capability for custom grants (manager: %s)", async (manager) => {
