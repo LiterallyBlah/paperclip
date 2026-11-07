@@ -93,7 +93,7 @@ describe("managed AI connections", () => {
       expect(managed.attribution.method).toBe("subscription");
       const defaults = await db.select().from(aiProviderDefaults).where(and(eq(aiProviderDefaults.companyId, companyId), eq(aiProviderDefaults.userId, owner), eq(aiProviderDefaults.provider, "muse")));
       expect(defaults).toHaveLength(1);
-      const migration = await readFile(new URL("../../../packages/db/src/migrations/0334_muse_subscription_provider.sql", import.meta.url), "utf8");
+      const migration = await readFile(new URL("../../../packages/db/src/migrations/0375_muse_subscription_provider.sql", import.meta.url), "utf8");
       await db.transaction(async tx => {
         for (const statement of migration.split("--> statement-breakpoint")) {
           if (statement.trim()) await tx.execute(sql.raw(statement));
