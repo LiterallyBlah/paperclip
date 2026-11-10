@@ -191,6 +191,7 @@ import type { createHeartbeatRunPreparation } from "./run-preparation.js";
 import type { HeartbeatRetryDependencies } from "./retries.js";
 import type { HeartbeatRecoveryDependencies, createHeartbeatRecovery } from "./recovery.js";
 import { executeIssuePostCommitActions, type IssuePostCommitAction, type issueService } from "../issues.js";
+import { readAddressedInteractionForWake } from "../addressed-interaction-wake.js";
 import type { issueTreeControlService } from "../issue-tree-control.js";
 import type { budgetService } from "../budgets.js";
 import { isBoardOwnedBudgetBlock } from "../budget-block-ownership.js";
@@ -1069,7 +1070,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           context,
           ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
           blockerStallVerified,
-        )
+        ) &&
+        !(await readAddressedInteractionForWake(db, {
+          companyId: run.companyId,
+          issueId,
+          agentId: run.agentId,
+          contextSnapshot: context,
+        }))
       ) {
         await cancelQueuedRunForBlockedDependencies(
           run,
@@ -3954,12 +3961,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const blockedInteractionWake =
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
-            allowsDependencyBlockedWake(
+            (allowsDependencyBlockedWake(
               enrichedContextSnapshot,
               ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
               await verifyBlockerStallWake(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
                 contextSnapshot: enrichedContextSnapshot, requestedByActorType: opts.requestedByActorType }),
-            );
+            ) ||
+              (await readAddressedInteractionForWake(tx as unknown as Db, {
+                companyId: issue.companyId,
+                issueId: issue.id,
+                agentId,
+                contextSnapshot: enrichedContextSnapshot,
+              })) !== null);
 
           if (blockedInteractionWake) {
             enrichedContextSnapshot.dependencyBlockedInteraction = true;

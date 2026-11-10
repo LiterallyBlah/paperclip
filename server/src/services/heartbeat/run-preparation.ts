@@ -1,4 +1,5 @@
 import { skillPackageStore, skillVersionMetadataColumns } from "../skill-package-store.js";
+import { buildAddressedInteractionWake } from "../addressed-interaction-wake.js";
 import { skillAccessService } from "../skill-access.js";
 import { buildReviewPathRecoveryDisposition } from "../recovery/review-path-recovery.js";
 import type { AuthorizationActor } from "../authorization.js";
@@ -2676,6 +2677,13 @@ export async function buildPaperclipWakePayload(input: {
     : [];
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    addressedInteraction: issueId
+      ? await buildAddressedInteractionWake(input.db, {
+          companyId: input.companyId,
+          issueId,
+          contextSnapshot: input.contextSnapshot,
+        })
+      : null,
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     chatCompletionUpdates: input.contextSnapshot.chatCompletionUpdates ?? null,
     attachmentOmissions,

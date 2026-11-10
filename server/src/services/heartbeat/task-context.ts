@@ -242,6 +242,7 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
   const taskMarkdownInput = {
     coordinatorWorkspace: Boolean(coordinatorWorkspace),
     conferenceRoomEnabled: experimentalInstanceSettings.enableConferenceRoomChat === true,
+    addressedInteraction: paperclipWakePayload?.addressedInteraction ?? null,
     conversationConfirmations: issueRef && isConversation(issueContext)
       ? await getConversationConfirmationContext({ db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id })
       : null,
