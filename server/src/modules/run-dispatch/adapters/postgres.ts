@@ -33,6 +33,7 @@ import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../..
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
 import { issueService } from "../../../services/issues.js";
+import { readAddressedInteractionForWake } from "../../../services/addressed-interaction-wake.js";
 import {
   issueTreeControlService,
   isVerifiedIssueTreeControlInteractionWake,
@@ -552,10 +553,14 @@ export function createPostgresRunDispatchAdapter(
     );
 
     const wakeCommentId = deriveCommentId(context);
-    const isInteractionWake = allowsIssueInteractionWake(
-      context,
-      ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-    );
+    const isInteractionWake =
+      allowsIssueInteractionWake(context, ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS) ||
+      (issue !== null && (await readAddressedInteractionForWake(dbOrTx, {
+        companyId: input.companyId,
+        issueId,
+        agentId: input.agentId,
+        contextSnapshot: context,
+      })) !== null);
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason =

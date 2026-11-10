@@ -16,6 +16,14 @@ describe("heartbeat task markdown rendering", () => {
     })).toBeNull();
   });
 
+  it("does not present an addressed question as an assignment", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue, addressedInteraction: { id: "card-1" } })!;
+    expect(markdown).toContain("question card card-1");
+    expect(markdown).toContain("it is not your assignment");
+    expect(markdown).not.toContain("Use this task context as the current assignment.");
+    expect(buildPaperclipTaskMarkdown({ issue })).toContain("Use this task context as the current assignment.");
+  });
+
   it("renders comment-only context in order without changing the input", () => {
     const input = {
       issue: null,

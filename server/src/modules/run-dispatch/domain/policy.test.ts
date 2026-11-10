@@ -427,6 +427,21 @@ describe("decideQueuedRunStaleness", () => {
     expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
   });
 
+  it("lets only an interaction wake pass another in-review participant", () => {
+    const facts: QueuedRunFacts = {
+      ...baseStalenessFacts(),
+      runAgentId: "addressee-1",
+      issueAssigneeAgentId: "assignee-1",
+      issueStatus: "in_review",
+      reviewParticipant: { isInReview: true, hasParticipant: true, participantIsAgent: true,
+        participantAgentId: "reviewer-1", currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "reviewer-1" } },
+    };
+    expect(decideQueuedRunStaleness({ ...facts, isInteractionWake: true }, NOW)).toEqual({ stale: false });
+    expect(decideQueuedRunStaleness({ ...facts, issueAssigneeAgentId: "addressee-1" }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_review_participant_changed" });
+  });
+
   it("allows resume intent to bypass a terminal status", () => {
     const facts: QueuedRunFacts = {
       ...baseStalenessFacts(),
