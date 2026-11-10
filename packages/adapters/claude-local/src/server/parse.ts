@@ -5,6 +5,7 @@ import {
   asBoolean,
   parseObject,
   parseJson,
+  MAX_CAPTURE_BYTES,
 } from "@paperclipai/adapter-utils/server-utils";
 
 // The login-prompt markers. The Claude CLI prints these words when it asks the
@@ -247,16 +248,19 @@ export function detectClaudeLoginRequired(input: {
   const resultText = asString(parsed?.result, "").trim();
 
   // The login-prompt markers match only Claude's own failure output: the parsed
-  // terminal fields and stderr of a failed result, or, when there is no
-  // terminal result, stderr and the non-JSON stdout lines. Stream-json events
+  // terminal fields (result, error, errors) and stderr of a failed result, or,
+  // when there is no terminal result, stderr and the non-JSON stdout lines. Stream-json events
   // carry assistant text and tool output, so they never count, and a successful
   // result never counts even if the process is later killed.
   const failedResult = parsed !== null && claudeResultIndicatesAuthFailure(parsed);
   const successResult = parsed !== null && !failedResult &&
     asString(parsed.subtype, "").trim().toLowerCase() === "success";
-  const plainStdout = input.stdout.split(/\r?\n/).filter((line) => !line.trim().startsWith("{"));
+  const stdoutLines = input.stdout.split(/\r?\n/);
+  // At the capture cap the first line may be the tail of a cut record.
+  if (input.stdout.length >= MAX_CAPTURE_BYTES) stdoutLines.shift();
+  const plainStdout = stdoutLines.filter((line) => !line.trim().startsWith("{"));
   const promptLines = (failedResult
-    ? [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stderr]
+    ? [collectClaudeTerminalText(parsed ?? {}), input.stderr]
     : successResult ? [] : [...plainStdout, input.stderr])
     .join("\n")
     .split(/\r?\n/)
@@ -272,8 +276,18 @@ export function detectClaudeLoginRequired(input: {
     claudeResultIndicatesAuthFailure(parsed) &&
     CLAUDE_AUTH_TOKEN_FAILURE_RE.test(collectClaudeTerminalText(parsed));
 
+  // The CLI marks its own authentication error on a complete stream event with
+  // top-level metadata, which tool output and assistant text cannot set. It
+  // counts when the result is missing, cut off, or a failure.
+  const cliAuthError = !successResult && stdoutLines.some((line) => {
+    if (!line.trim().startsWith("{")) return false;
+    const event = parseJson(line.trim());
+    return event?.type === "assistant" && event.is_api_error_message === true &&
+      event.error === "authentication_failed";
+  });
+
   return {
-    requiresLogin: loginPrompt || tokenFailure,
+    requiresLogin: loginPrompt || tokenFailure || cliAuthError,
     loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
   };
 }
