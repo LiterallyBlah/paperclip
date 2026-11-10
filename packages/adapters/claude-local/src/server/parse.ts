@@ -7,9 +7,8 @@ import {
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
 
-// The legacy login-prompt markers. The Claude CLI prints these words when it
-// asks the user to log in. The detector matches them against any probe output
-// line, which includes the raw stdout and stderr. This scope is pre-existing.
+// The login-prompt markers. The Claude CLI prints these words when it asks the
+// user to log in. See detectClaudeLoginRequired for the output they may match.
 const CLAUDE_LOGIN_PROMPT_RE =
   /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
@@ -247,10 +246,18 @@ export function detectClaudeLoginRequired(input: {
   const parsed = input.parsed ?? null;
   const resultText = asString(parsed?.result, "").trim();
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // The login-prompt markers match only Claude's own failure output: the parsed
+  // terminal fields and stderr of a failed result, or, when there is no
+  // terminal result, stderr and the non-JSON stdout lines. Stream-json events
+  // carry assistant text and tool output, so they never count, and a successful
+  // result never counts even if the process is later killed.
+  const failedResult = parsed !== null && claudeResultIndicatesAuthFailure(parsed);
+  const successResult = parsed !== null && !failedResult &&
+    asString(parsed.subtype, "").trim().toLowerCase() === "success";
+  const plainStdout = input.stdout.split(/\r?\n/).filter((line) => !line.trim().startsWith("{"));
+  const promptLines = (failedResult
+    ? [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stderr]
+    : successResult ? [] : [...plainStdout, input.stderr])
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
