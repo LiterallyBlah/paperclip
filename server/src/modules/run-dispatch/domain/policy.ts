@@ -118,7 +118,8 @@ export type QueuedRunStalenessErrorCode =
   | "issue_execution_lock_changed"
   | "issue_blocked"
   | "issue_review_participant_changed"
-  | "issue_continuation_waiting_on_review";
+  | "issue_continuation_waiting_on_review"
+  | "issue_interaction_not_pending";
 
 export type StalenessDecision =
   | { stale: false }
@@ -148,6 +149,10 @@ export type QueuedRunFacts = {
   /** A connection resolution or tool refresh can resume an agent waiting in review. */
   isConnectionContinuation?: boolean;
   isInteractionWake: boolean;
+  /** The card a non-owner is admitted to answer; written to the run by the claim. */
+  addressedQuestionInteractionId?: string | null;
+  /** This run inherited a question admission whose card can no longer be answered by it. */
+  addressedQuestionInvalidated?: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
@@ -566,6 +571,15 @@ export function decideQueuedRunStaleness(
         retryReason: facts.retryReason,
         nextAction: facts.continuationSummaryBody,
       },
+    };
+  }
+
+  if (facts.addressedQuestionInvalidated && !facts.isInteractionWake) {
+    return {
+      stale: true,
+      errorCode: "issue_interaction_not_pending",
+      reason: "Cancelled because the question this run was admitted to answer is no longer open to it",
+      details: { issueId: facts.issueId },
     };
   }
 

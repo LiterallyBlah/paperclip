@@ -2662,11 +2662,10 @@ export async function buildPaperclipWakePayload(input: {
     : [];
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
-    addressedInteraction: issueId && input.agentId
+    addressedInteraction: issueId
       ? await buildAddressedInteractionWake(input.db, {
           companyId: input.companyId,
           issueId,
-          agentId: input.agentId,
           contextSnapshot: input.contextSnapshot,
         })
       : null,
