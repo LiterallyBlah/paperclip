@@ -66,6 +66,8 @@ export async function readAddressedInteractionForWake(
     issueId: string;
     agentId: string;
     contextSnapshot: Record<string, unknown>;
+    /** Hold the card row for the caller's transaction; the caller must already hold the issue lock. */
+    lockCard?: boolean;
   },
 ): Promise<{ id: string; kind: string; issueAssigneeAgentId: string | null } | null> {
   const context = input.contextSnapshot;
@@ -81,7 +83,7 @@ export async function readAddressedInteractionForWake(
         retryOfRunId: context.retryOfRunId,
       })));
   if (!isAddressedWake) return null;
-  const row = await db
+  const query = db
     .select({
       id: issueThreadInteractions.id,
       kind: issueThreadInteractions.kind,
@@ -107,7 +109,8 @@ export async function readAddressedInteractionForWake(
         eq(issueThreadInteractions.addresseeAgentId, input.agentId),
       ),
     )
-    .limit(1)
+    .limit(1);
+  const row = await (input.lockCard ? query.for("update", { of: issueThreadInteractions }) : query)
     .then((rows) => rows[0] ?? null);
   if (!row || !ANSWER_ROUTES[row.kind]) return null;
   const payload = parseObject(row.payload);

@@ -2133,6 +2133,15 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       await expectNeverDispatched(runId, "issue_assignee_changed");
     });
 
+    it("fabricated-busy-retry: does not let the busy-retry flag replace a question's origin", async () => {
+      const f = await seedAddresseeFixture();
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId });
+      const { runId } = await queueRetry(f, interactionId, randomUUID(), { aiConnectionBusyDeferredWhileAssignee: false });
+      await heartbeat.resumeQueuedRuns();
+      await expectNeverDispatched(runId, "issue_interaction_not_pending");
+    });
+
     it("stops a retry whose admitted question was answered, even with busy-retry authority", async () => {
       const f = await seedAddresseeFixture();
       const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
@@ -2240,7 +2249,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(statuses).toEqual({ create: 201, read: 200, checkout: 409, answer: 200 });
 
       const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId!));
-      expect(card).toMatchObject({ status: "answered", resolvedByAgentId: f.addresseeAgentId });
+      expect(card).toMatchObject({ status: "answered", resolvedByAgentId: f.addresseeAgentId, resolvedByRunId: addresseeRunId });
       const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
       expect(issue.assigneeAgentId).toBe(ownerBefore.assigneeAgentId);
       expect(issue.status).toBe("in_progress");

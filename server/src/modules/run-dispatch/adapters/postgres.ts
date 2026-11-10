@@ -219,8 +219,15 @@ export function createPostgresRunDispatchAdapter(
       // Already-admitted ordinary work owes the budget/run gate, not another
       // continuation or chat-control issue lock. Its authority is captured on
       // the run and reservation; protected recovery retains its admission.
-      const hintedIssueId = input.enforceContinuationOwnership === false ? null
-        : readNonEmptyString(parseObject(hint.contextSnapshot).issueId);
+      // A question run owns no task lock but must not outlive its card, so it
+      // still serializes with a human answer on the issue row.
+      const issueIdToLock = (contextSnapshot: unknown) => {
+        const context = parseObject(contextSnapshot);
+        return input.enforceContinuationOwnership === false && !readNonEmptyString(context[ADDRESSED_QUESTION_CONTEXT_KEY])
+          ? null
+          : readNonEmptyString(context.issueId);
+      };
+      const hintedIssueId = issueIdToLock(hint.contextSnapshot);
 
       const locked = async (typedTx: Db, publications: ActivityPublication[]) => {
         // Recovery always takes coordinator before issue/run. Only the
@@ -247,9 +254,7 @@ export function createPostgresRunDispatchAdapter(
           .then((rows) => rows[0] ?? null);
         if (!run) return { kind: "missing" as const };
 
-        const lockedIssueId = input.enforceContinuationOwnership === false ? null
-          : readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-        if (lockedIssueId !== hintedIssueId) return { kind: "retry" as const };
+        if (issueIdToLock(run.contextSnapshot) !== hintedIssueId) return { kind: "retry" as const };
         return { kind: "value" as const, value: await operation(typedTx, run, publications) };
       };
       const result: { kind: "missing" | "retry" } | { kind: "value"; value: T } = mode === "accounting"
@@ -645,9 +650,12 @@ export function createPostgresRunDispatchAdapter(
       addressedQuestionInteractionId,
       addressedQuestionInvalidated: Boolean(
         issue &&
-          readNonEmptyString(context[ADDRESSED_QUESTION_CONTEXT_KEY]) &&
           !addressedQuestion &&
-          issue.assigneeAgentId !== input.agentId,
+          issue.assigneeAgentId !== input.agentId &&
+          (readNonEmptyString(context[ADDRESSED_QUESTION_CONTEXT_KEY]) ||
+            // A busy-retry flag cannot stand in for the origin a question run needs.
+            (context.source === "issue.interaction.created" &&
+              isNonAssigneeWorkspaceBusyRetry(retryReason, context))),
       ),
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
@@ -1193,6 +1201,7 @@ export function createPostgresRunDispatchAdapter(
       issueId,
       agentId: run.agentId,
       contextSnapshot: context,
+      lockCard: true,
     });
     if (current?.id === interactionId) return null;
     return cancelStaleRunInTx(tx, run, issueId, {
