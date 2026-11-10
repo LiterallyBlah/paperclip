@@ -22,6 +22,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
+import { appendWithCap, MAX_CAPTURE_BYTES } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "./execute.js";
 
 const event = (value: Record<string, unknown>) => JSON.stringify({ session_id: "claude-session-1", ...value });
@@ -91,6 +92,54 @@ describe("claude_local sign-in classification", () => {
   it("does not label sign-in for tool output in a run killed before any result", async () => {
     mockRun(proc({ lines: [toolResult("Please run claude login")], exitCode: 143, signal: "SIGTERM" }));
     expect((await execute(context() as never)).errorCode).not.toBe("claude_auth_required");
+  });
+
+  // Claude 2.1.286 with no credentials (record shapes from the review's real capture).
+  const noAuthEvent = event({ type: "assistant", error: "authentication_failed", is_api_error_message: true,
+    message: { content: [{ type: "text", text: "Not logged in · Please run /login" }] } });
+  const noAuthResult = event({ type: "result", subtype: "success", is_error: true, api_error_status: null,
+    result: "Not logged in · Please run /login" });
+
+  it("still labels sign-in when the CLI auth error arrives but the result is missing", async () => {
+    mockRun(proc({ exitCode: 1, lines: [noAuthEvent] }));
+    expect((await execute(context() as never)).errorCode).toBe("claude_auth_required");
+  });
+
+  it("still labels sign-in when the result record is cut off", async () => {
+    const full = proc({ exitCode: 1, lines: [noAuthEvent, noAuthResult] });
+    mockRun({ ...full, stdout: full.stdout.slice(0, -25) });
+    expect((await execute(context() as never)).errorCode).toBe("claude_auth_required");
+  });
+
+  it.each([
+    ["assistant text", event({ type: "assistant", message: { content: [{ type: "text",
+      text: '{"error":"authentication_failed","is_api_error_message":true}' }] } })],
+    ["tool output", toolResult('{"type":"assistant","error":"authentication_failed","is_api_error_message":true}')],
+  ])("does not take the CLI auth error marker from %s", async (_source, line) => {
+    mockRun(proc({ exitCode: 143, signal: "SIGTERM", lines: [line] }));
+    expect((await execute(context() as never)).errorCode).not.toBe("claude_auth_required");
+  });
+
+  it.each(["Not logged in · Please run /login", "Unauthorized"])(
+    "still labels sign-in for %s in the singular error field of a failed result", async (error) => {
+      mockRun(proc({ exitCode: 1, lines: [event({ type: "result", subtype: "error_during_execution", is_error: true, error })] }));
+      expect((await execute(context() as never)).errorCode).toBe("claude_auth_required");
+    });
+
+  it("does not label sign-in from the tail of a tool record cut by the capture cap", async () => {
+    // Capture keeps the last MAX_CAPTURE_BYTES characters, so a long tool record
+    // loses its opening brace and its tail reads like plain output.
+    let stdout = "";
+    for (const line of [event({ type: "system", subtype: "init", model: "claude-sonnet" }),
+      toolResult(`${"x".repeat(MAX_CAPTURE_BYTES)} unauthorized`)]) stdout = appendWithCap(stdout, `${line}\n`);
+    expect(stdout.trimStart().startsWith("{")).toBe(false);
+    mockRun({ ...proc({ exitCode: 143, signal: "SIGTERM", lines: [] }), stdout });
+    expect((await execute(context() as never)).errorCode).not.toBe("claude_auth_required");
+  });
+
+  it("still labels sign-in for a plain stdout login prompt with no result", async () => {
+    mockRun({ ...proc({ exitCode: 1, lines: [] }), stdout: "Not logged in · Please run /login" });
+    expect((await execute(context() as never)).errorCode).toBe("claude_auth_required");
   });
 
   it.each([
