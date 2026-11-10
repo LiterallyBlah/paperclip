@@ -427,6 +427,42 @@ describe("decideQueuedRunStaleness", () => {
     expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
   });
 
+  describe("verified pending-interaction addressee wake", () => {
+    const addresseeFacts = (): QueuedRunFacts => ({
+      ...baseStalenessFacts(),
+      runAgentId: "addressee-1",
+      issueAssigneeAgentId: "assignee-1",
+      issueExecutionRunId: "assignee-run",
+      wakeReason: "interaction_pending",
+      isPendingInteractionAddresseeWake: true,
+    });
+
+    it("excuses only the assignee-ownership check", () => {
+      expect(decideQueuedRunStaleness(addresseeFacts(), NOW)).toEqual({ stale: false });
+    });
+
+    it("is treated as absent when the adapter did not verify it", () => {
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), isPendingInteractionAddresseeWake: undefined }, NOW))
+        .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), isPendingInteractionAddresseeWake: false }, NOW))
+        .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+    });
+
+    it("keeps the review-participant, terminal-status and pending-response gates", () => {
+      expect(decideQueuedRunStaleness({
+        ...addresseeFacts(),
+        issueStatus: "in_review",
+        reviewParticipant: { isInReview: true, hasParticipant: true, participantIsAgent: true,
+          participantAgentId: "reviewer-1", currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: "reviewer-1" } },
+      }, NOW)).toMatchObject({ stale: true, errorCode: "issue_review_participant_changed" });
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), issueStatus: "done" }, NOW))
+        .toMatchObject({ stale: true, errorCode: "issue_terminal_status" });
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), pendingResponse: "approval" }, NOW))
+        .toMatchObject({ stale: true, errorCode: "issue_waiting_for_response" });
+    });
+  });
+
   it("allows resume intent to bypass a terminal status", () => {
     const facts: QueuedRunFacts = {
       ...baseStalenessFacts(),

@@ -2,7 +2,7 @@ import { hasConversationContinuationPolicy } from "../../../services/conversatio
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { validateReconstructedWorkspaceDispatch } from "../../../services/native-runtime/native-workspace-reconstruction.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
-import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -13,11 +13,12 @@ import {
   heartbeatRuns,
   issueRecoveryActions,
   issueComments,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   projects,
 } from "@paperclipai/db";
-import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
+import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON, isUuidLike } from "@paperclipai/shared";
 import { withAccountingTransaction } from "../../../services/accounting-transaction.js";
 import type { ActivityPublication } from "../../../services/activity-log.js";
 import { parseObject } from "../../../adapters/utils.js";
@@ -33,6 +34,7 @@ import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../..
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
 import { issueService } from "../../../services/issues.js";
+import { issueThreadInteractionAttentionAgentAllowed } from "../../../services/issue-thread-interaction-resolution.js";
 import {
   issueTreeControlService,
   isVerifiedIssueTreeControlInteractionWake,
@@ -605,6 +607,56 @@ export function createPostgresRunDispatchAdapter(
             .then((rows) => Boolean(rows[0]))
         : false;
 
+    // The interaction-creation route wakes a named agent addressee with
+    // interaction_pending and no comment. That addressee is not the assignee,
+    // so re-derive its narrow exemption from the current stored interaction
+    // under this lock; a resolved, dismissed, readdressed or foreign record
+    // grants nothing.
+    const pendingInteractionId = readNonEmptyString(context.interactionId);
+    const isPendingInteractionAddresseeWake =
+      issue && wakeReason === "interaction_pending" && pendingInteractionId && isUuidLike(pendingInteractionId)
+        ? await dbOrTx
+            .select({
+              kind: issueThreadInteractions.kind,
+              payload: issueThreadInteractions.payload,
+              createdByAgentId: issueThreadInteractions.createdByAgentId,
+              createdByUserId: issueThreadInteractions.createdByUserId,
+              sourceRunId: issueThreadInteractions.sourceRunId,
+              addresseeAgentId: issueThreadInteractions.addresseeAgentId,
+              addresseeUserId: issueThreadInteractions.addresseeUserId,
+              effectiveResolverPolicy: issueThreadInteractions.effectiveResolverPolicy,
+              resolverPolicyProvenance: issueThreadInteractions.resolverPolicyProvenance,
+            })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.id, pendingInteractionId),
+                eq(issueThreadInteractions.companyId, input.companyId),
+                eq(issueThreadInteractions.issueId, issue.id),
+                eq(issueThreadInteractions.status, "pending"),
+                isNull(issueThreadInteractions.dismissedAt),
+                eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+              ),
+            )
+            .limit(1)
+            .then(([interaction]) =>
+              Boolean(
+                interaction &&
+                  // Same audience rule the creation route used before waking.
+                  issueThreadInteractionAttentionAgentAllowed({
+                    agentId: input.agentId,
+                    interaction,
+                    governedAction:
+                      interaction.kind === "request_confirmation" &&
+                      typeof interaction.payload === "object" &&
+                      interaction.payload !== null &&
+                      "toolAction" in interaction.payload &&
+                      interaction.payload.toolAction !== undefined,
+                  }),
+              ),
+            )
+        : false;
+
     const retryReasonKind = classifyRetryReasonKind(retryReason);
     // Dependency edges can change after scheduled promotion without changing
     // the displayed status. Read them again under the queued/final issue lock.
@@ -632,6 +684,7 @@ export function createPostgresRunDispatchAdapter(
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
+      isPendingInteractionAddresseeWake,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
