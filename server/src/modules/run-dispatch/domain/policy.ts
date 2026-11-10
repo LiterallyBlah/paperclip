@@ -118,7 +118,8 @@ export type QueuedRunStalenessErrorCode =
   | "issue_execution_lock_changed"
   | "issue_blocked"
   | "issue_review_participant_changed"
-  | "issue_continuation_waiting_on_review";
+  | "issue_continuation_waiting_on_review"
+  | "issue_interaction_not_pending";
 
 export type StalenessDecision =
   | { stale: false }
@@ -150,11 +151,15 @@ export type QueuedRunFacts = {
   isInteractionWake: boolean;
   /**
    * Verified from the current stored interaction under the queued-run lock:
-   * an interaction_pending wake whose interaction is still pending on this
-   * issue and company, names this run's agent as addressee, and still admits
-   * that agent as a resolver. Excuses only the assignee-ownership check.
+   * an addressed question this run's agent may still answer (pending, not
+   * dismissed, answerable kind, resolver-eligible, valid retry origin).
+   * Excuses the assignee-ownership and review-participant checks.
    */
   isPendingInteractionAddresseeWake?: boolean;
+  /** The card a non-owner is admitted to answer; written to the run by the claim. */
+  addressedQuestionInteractionId?: string | null;
+  /** This run inherited a question admission whose card can no longer be answered by it. */
+  addressedQuestionInvalidated?: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
@@ -578,6 +583,15 @@ export function decideQueuedRunStaleness(
     };
   }
 
+  if (facts.addressedQuestionInvalidated && !facts.isInteractionWake) {
+    return {
+      stale: true,
+      errorCode: "issue_interaction_not_pending",
+      reason: "Cancelled because the question this run was admitted to answer is no longer open to it",
+      details: { issueId: facts.issueId },
+    };
+  }
+
   const ownership = decideIssueOwnership({
     runAgentId: facts.runAgentId,
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
@@ -679,7 +693,7 @@ export function decideQueuedRunStaleness(
   const participantOutcome = decideReviewParticipant({
     ...facts.reviewParticipant,
     runAgentId: facts.runAgentId,
-    bypass: facts.wakeCommentIdPresent,
+    bypass: facts.wakeCommentIdPresent || facts.isInteractionWake || facts.isPendingInteractionAddresseeWake === true,
   });
   if (participantOutcome === "participant_changed") {
     return {

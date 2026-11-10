@@ -91,7 +91,7 @@ they mention a chat provider.
 Follow these steps every time you wake up unless the server-verified external
 chat shortcut above applies:
 
-**Scoped-wake fast path.** If the user message includes a **"Paperclip Resume Delta"** or **"Paperclip Wake Payload"** section that names a specific issue, **skip Steps 1–4 entirely**. Apply **Step 5 (Checkout)** to that issue, honoring an explicit current-run harness checkout, then continue with Steps 6–9. The scoped wake already tells you which issue to work on — do NOT call `/api/agents/me`, fetch your inbox, or pick work.
+**Scoped-wake fast path.** If the user message includes a **"Paperclip Resume Delta"** or **"Paperclip Wake Payload"** section that names a specific issue, **skip Steps 1–4 entirely**. Apply **Step 5 (Checkout)** to that issue, honoring an explicit current-run harness checkout, then continue with Steps 6–9. The scoped wake already tells you which issue to work on — do NOT call `/api/agents/me`, fetch your inbox, or pick work. **Exception:** a wake with a **"Question addressed to you"** section is only for answering that card: use its answer route and stop. Do not check out the issue, change its status or do its work.
 
 **Step 1 — Identity.** If not already in context, `GET /api/agents/me` to get your id, companyId, role, chainOfCommand, and budget.
 

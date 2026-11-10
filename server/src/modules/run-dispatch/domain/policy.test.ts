@@ -448,19 +448,35 @@ describe("decideQueuedRunStaleness", () => {
         .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
     });
 
-    it("keeps the review-participant, terminal-status and pending-response gates", () => {
+    // Rewritten for the owner's choice: the question runs past another review stage, answer-only.
+    it("passes the review-participant gate but keeps the terminal-status and pending-response gates", () => {
       expect(decideQueuedRunStaleness({
         ...addresseeFacts(),
         issueStatus: "in_review",
         reviewParticipant: { isInReview: true, hasParticipant: true, participantIsAgent: true,
           participantAgentId: "reviewer-1", currentStageType: "review",
           currentParticipant: { type: "agent", agentId: "reviewer-1" } },
-      }, NOW)).toMatchObject({ stale: true, errorCode: "issue_review_participant_changed" });
+      }, NOW)).toEqual({ stale: false });
       expect(decideQueuedRunStaleness({ ...addresseeFacts(), issueStatus: "done" }, NOW))
         .toMatchObject({ stale: true, errorCode: "issue_terminal_status" });
       expect(decideQueuedRunStaleness({ ...addresseeFacts(), pendingResponse: "approval" }, NOW))
         .toMatchObject({ stale: true, errorCode: "issue_waiting_for_response" });
     });
+  });
+
+  it("lets only an interaction wake pass another in-review participant", () => {
+    const facts: QueuedRunFacts = {
+      ...baseStalenessFacts(),
+      runAgentId: "addressee-1",
+      issueAssigneeAgentId: "assignee-1",
+      issueStatus: "in_review",
+      reviewParticipant: { isInReview: true, hasParticipant: true, participantIsAgent: true,
+        participantAgentId: "reviewer-1", currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "reviewer-1" } },
+    };
+    expect(decideQueuedRunStaleness({ ...facts, isInteractionWake: true }, NOW)).toEqual({ stale: false });
+    expect(decideQueuedRunStaleness({ ...facts, issueAssigneeAgentId: "addressee-1" }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_review_participant_changed" });
   });
 
   it("allows resume intent to bypass a terminal status", () => {
