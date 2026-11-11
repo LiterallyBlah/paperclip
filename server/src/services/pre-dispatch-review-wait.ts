@@ -21,6 +21,8 @@ const staleDispatchReconciliationExemptions = {
   issue_execution_lock_changed: true,
   issue_terminal_status: true,
   issue_review_participant_changed: true,
+  // The run was admitted to answer a question that is no longer open to it; it never started.
+  issue_interaction_not_pending: true,
   // This code requires its own executionWait receipt in pre-dispatch-execution-wait.ts.
   execution_reconciliation_required: false,
 } satisfies Record<QueuedRunStalenessErrorCode, boolean>;
