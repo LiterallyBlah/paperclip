@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -458,5 +459,107 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
       .get(`/api/companies/${fixture.companyId}/search?q=Confidential%20root&scope=issues`);
     expect(search.status).toBe(200);
     expect(search.body.results.map((row: { id: string }) => row.id)).not.toContain(fixture.privateIssueId);
+  }, 20_000);
+
+  async function seedHiddenTerminalBlocker() {
+    const fixture = await seedFixture();
+    // Readable A is blocked by unreadable B (PRV-1). B's unassigned open child
+    // PRV-1A is the leaf, so it is A's terminal blocker; neither is readable.
+    const blockedIssue = await db.insert(issues).values({
+      companyId: fixture.companyId,
+      identifier: "PRV-4",
+      title: "Visible blocked work",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: fixture.assignedAgent.id,
+      createdByUserId: fixture.memberId,
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(issueRelations).values({
+      companyId: fixture.companyId,
+      issueId: fixture.privateIssueId,
+      relatedIssueId: blockedIssue.id,
+      type: "blocks",
+    });
+    return { ...fixture, blockedIssue };
+  }
+
+  function rowFor(body: Array<{ id: string }>, id: string) {
+    return body.find((row) => row.id === id) as Record<string, any> | undefined;
+  }
+
+  it("omits an unreadable terminal blocker's title from full, compact and detail blockerAttention", async () => {
+    const fixture = await seedHiddenTerminalBlocker();
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+
+    const full = await request(app).get(`/api/companies/${fixture.companyId}/issues?includeBlockedBy=true`);
+    expect(full.status, JSON.stringify(full.body)).toBe(200);
+    expect(full.body.map((row: { id: string }) => row.id)).not.toContain(fixture.privateIssueId);
+    const fullRow = rowFor(full.body, fixture.blockedIssue.id);
+    expect(fullRow?.blockerAttention).toBeDefined();
+    expect(fullRow?.blockerAttention.terminalBlockerIssueId).toBe(fixture.privateChild.id);
+    expect(fullRow?.blockerAttention.terminalBlocker).toBeNull();
+    expect(fullRow?.blockedBy).toEqual([{ id: fixture.privateIssueId, identifier: "PRV-1", locked: true }]);
+    expect(JSON.stringify(full.body)).not.toContain("Confidential root");
+    expect(JSON.stringify(full.body)).not.toContain("Confidential child");
+
+    const compact = await request(app).get(`/api/companies/${fixture.companyId}/issues?view=compact`);
+    expect(compact.status, JSON.stringify(compact.body)).toBe(200);
+    const compactRow = rowFor(compact.body, fixture.blockedIssue.id);
+    expect(compactRow?.blockerAttention).toBeDefined();
+    expect(compactRow?.blockerAttention.terminalBlockerIssueId).toBe(fixture.privateChild.id);
+    expect(compactRow?.blockerAttention.terminalBlocker).toBeNull();
+    expect(JSON.stringify(compact.body)).not.toContain("Confidential root");
+    expect(JSON.stringify(compact.body)).not.toContain("Confidential child");
+
+    const detail = await request(app).get(`/api/issues/${fixture.blockedIssue.id}`);
+    expect(detail.status, JSON.stringify(detail.body)).toBe(200);
+    expect(detail.body.blockerAttention.terminalBlocker).toBeNull();
+    expect(JSON.stringify(detail.body)).not.toContain("Confidential root");
+    expect(JSON.stringify(detail.body)).not.toContain("Confidential child");
+  }, 20_000);
+
+  it("keeps the terminal blocker title for a viewer who can read the blocker", async () => {
+    const fixture = await seedHiddenTerminalBlocker();
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.ownerId));
+    const expectedTerminal = { id: fixture.privateChild.id, identifier: "PRV-1A", title: "Confidential child" };
+
+    const full = await request(app).get(`/api/companies/${fixture.companyId}/issues?includeBlockedBy=true`);
+    expect(full.status, JSON.stringify(full.body)).toBe(200);
+    expect(rowFor(full.body, fixture.blockedIssue.id)?.blockerAttention.terminalBlocker).toEqual(expectedTerminal);
+
+    const compact = await request(app).get(`/api/companies/${fixture.companyId}/issues?view=compact`);
+    expect(compact.status, JSON.stringify(compact.body)).toBe(200);
+    expect(rowFor(compact.body, fixture.blockedIssue.id)?.blockerAttention.terminalBlocker).toEqual(expectedTerminal);
+
+    const detail = await request(app).get(`/api/issues/${fixture.blockedIssue.id}`);
+    expect(detail.status, JSON.stringify(detail.body)).toBe(200);
+    expect(detail.body.blockerAttention.terminalBlocker).toEqual(expectedTerminal);
+  }, 20_000);
+
+  it("keeps execution blocked by an open blocker the viewer and assignee cannot read", async () => {
+    const fixture = await seedHiddenTerminalBlocker();
+    const { issueService } = await import("../services/issues.js");
+    const svc = issueService(db);
+
+    // The viewer-facing projection hides B...
+    const memberApp = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+    const list = await request(memberApp).get(`/api/companies/${fixture.companyId}/issues`);
+    expect(list.status, JSON.stringify(list.body)).toBe(200);
+    expect(rowFor(list.body, fixture.blockedIssue.id)?.blockerAttention.terminalBlocker).toBeNull();
+
+    // ...but readiness and checkout still see the full dependency graph.
+    const readiness = await svc.getDependencyReadiness(fixture.blockedIssue.id);
+    expect(readiness.isDependencyReady).toBe(false);
+    expect(readiness.unresolvedBlockerIssueIds).toEqual([fixture.privateIssueId]);
+    await expect(
+      svc.checkout(fixture.blockedIssue.id, fixture.assignedAgent.id, ["blocked"], null),
+    ).rejects.toMatchObject({ status: 422, message: "Issue is blocked by unresolved blockers" });
+    const after = await db.select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues).where(eq(issues.id, fixture.blockedIssue.id)).then((rows) => rows[0]!);
+    expect(after).toEqual({ status: "blocked", checkoutRunId: null });
+
+    // Completing B is what releases A.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, fixture.privateIssueId));
+    expect((await svc.getDependencyReadiness(fixture.blockedIssue.id)).isDependencyReady).toBe(true);
   }, 20_000);
 });

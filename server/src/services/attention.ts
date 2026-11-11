@@ -977,8 +977,19 @@ type BlockedWorkEdge = {
  * Per-root visited sets make corrupt cycles harmless; the blocker analyzer's
  * existing traversal caps bound unusually large graphs.
  */
-/** Open work transitively blocked by each blocker, as issue-id sets. */
-async function blockedWorkMap(db: Db, companyId: string, blockerIssueIds: string[]) {
+/**
+ * Open work transitively blocked by each blocker, as issue-id sets.
+ * The result is a displayed count and feed weight, so the walk only follows
+ * issues the viewer can read (`readCondition`). Unreadable dependents neither
+ * add to the count nor lead the walk to work behind them. Dependency readiness
+ * and execution admission do not use this map.
+ */
+async function blockedWorkMap(
+  db: Db,
+  companyId: string,
+  blockerIssueIds: string[],
+  readCondition: SQL<boolean> = sql<boolean>`true`,
+) {
   const rootIds = [...new Set(blockerIssueIds)];
   const seenByRoot = new Map(rootIds.map((rootId) => [rootId, new Set<string>()]));
   if (rootIds.length === 0) return seenByRoot;
@@ -1000,6 +1011,7 @@ async function blockedWorkMap(db: Db, companyId: string, blockerIssueIds: string
           eq(issues.companyId, companyId),
           isNull(issues.hiddenAt),
           notInArray(issues.status, ["done", "cancelled"]),
+          readCondition,
         ));
       const childRowsPromise: Promise<BlockedWorkEdge[]> = includeChildren
         ? db
@@ -1013,6 +1025,7 @@ async function blockedWorkMap(db: Db, companyId: string, blockerIssueIds: string
             inArray(issues.parentId, chunk),
             isNull(issues.hiddenAt),
             notInArray(issues.status, ["done", "cancelled"]),
+            readCondition,
           ))
         : Promise.resolve([]);
       const [dependentRows, childRows] = await Promise.all([dependentRowsPromise, childRowsPromise]);
@@ -1703,7 +1716,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
 
       const terminalIds = [...terminalCandidates.keys()];
       const [blockedWork, terminalFacts] = await Promise.all([
-        blockedWorkMap(db, companyId, terminalIds),
+        blockedWorkMap(db, companyId, terminalIds, readCondition),
         terminalBlockerFactsMap(db, companyId, terminalIds),
       ]);
       for (const [terminalIssueId, candidate] of terminalCandidates) {

@@ -2828,5 +2828,79 @@ describeEmbeddedPostgres("attention service", () => {
         detail: { kind: "blocker", blockedTaskCount: 2 },
       });
     });
+
+    it("counts and ranks a visible blocker by readable blocked work only", async () => {
+      const { companyId } = await seedCompany("ATV");
+      const privateOwner = "private-owner";
+      const insertPrivate = async (identifier: string, title: string, status: string) => {
+        const id = randomUUID();
+        await insertIssue({
+          id,
+          companyId,
+          identifier,
+          title,
+          status,
+          visibility: "private",
+          privacyRootIssueId: id,
+          responsibleUserId: privateOwner,
+        });
+        return id;
+      };
+      // Readable B blocks readable A and unreadable C.
+      const blockerId = await insertIssue({ companyId, identifier: "ATV-1", title: "Visible blocker", status: "todo" });
+      const readableBlockedId = await insertIssue({ companyId, identifier: "ATV-2", title: "Visible blocked", status: "blocked" });
+      const hiddenBlockedId = await insertPrivate("ATV-3", "Hidden blocked", "blocked");
+      // Readable E blocks two readable tasks, so it outranks B only when B's
+      // count excludes unreadable work.
+      const otherBlockerId = await insertIssue({ companyId, identifier: "ATV-4", title: "Other blocker", status: "todo" });
+      const otherBlockedOne = await insertIssue({ companyId, identifier: "ATV-5", title: "Other blocked one", status: "blocked" });
+      const otherBlockedTwo = await insertIssue({ companyId, identifier: "ATV-6", title: "Other blocked two", status: "blocked" });
+      await db.insert(issueRelations).values([
+        { companyId, issueId: blockerId, relatedIssueId: readableBlockedId, type: "blocks" },
+        { companyId, issueId: blockerId, relatedIssueId: hiddenBlockedId, type: "blocks" },
+        { companyId, issueId: otherBlockerId, relatedIssueId: otherBlockedOne, type: "blocks" },
+        { companyId, issueId: otherBlockerId, relatedIssueId: otherBlockedTwo, type: "blocks" },
+      ]);
+      const actorFor = (userId: string) => ({
+        type: "board" as const,
+        source: "session" as const,
+        userId,
+        companyIds: [companyId],
+        isInstanceAdmin: false,
+      });
+      const blockerRows = async (userId: string) => {
+        const feed = await attentionService(db).list(companyId, { userId, actor: actorFor(userId) });
+        return feed.items.filter((item) => item.sourceKind === "blocker_attention");
+      };
+      const viewSummary = (rows: Awaited<ReturnType<typeof blockerRows>>) => rows.map((item) => ({
+        id: item.subject.id,
+        whyNow: item.whyNow,
+        count: item.detail?.kind === "blocker" ? item.detail.blockedTaskCount : null,
+      }));
+      const expectedViewer = [
+        { id: otherBlockerId, whyNow: "Has no assignee. Blocks 2 tasks.", count: 2 },
+        { id: blockerId, whyNow: "Has no assignee. Blocks 1 task.", count: 1 },
+      ];
+
+      const viewerRows = await blockerRows("viewer");
+      expect(viewSummary(viewerRows)).toEqual(expectedViewer);
+      expect(JSON.stringify(viewerRows)).not.toContain("Hidden blocked");
+      expect(JSON.stringify(viewerRows)).not.toContain(hiddenBlockedId);
+
+      // Authorised reader positive control: the hidden dependent counts for its owner.
+      const ownerRows = await blockerRows(privateOwner);
+      expect(ownerRows.find((item) => item.subject.id === blockerId)?.detail)
+        .toMatchObject({ kind: "blocker", blockedTaskCount: 2 });
+
+      // Adding another unreadable dependent and completing the first one does
+      // not move the viewer's count or rank.
+      const hiddenDependentId = await insertPrivate("ATV-7", "Hidden dependent", "todo");
+      await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: hiddenDependentId, type: "blocks" });
+      expect(viewSummary(await blockerRows("viewer"))).toEqual(expectedViewer);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, hiddenBlockedId));
+      expect(viewSummary(await blockerRows("viewer"))).toEqual(expectedViewer);
+      expect((await blockerRows(privateOwner)).find((item) => item.subject.id === blockerId)?.detail)
+        .toMatchObject({ kind: "blocker", blockedTaskCount: 2 });
+    });
   });
 });
