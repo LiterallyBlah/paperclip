@@ -973,6 +973,27 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  it("tells a non-owner addressee to answer the card instead of taking the task", () => {
+    const addressedInteraction = {
+      id: "card-1",
+      kind: "ask_user_questions",
+      readPath: "/api/issues/issue-1/interactions",
+      answerPaths: ["/api/issues/issue-1/interactions/card-1/respond"],
+    };
+    const payload = { reason: "interaction_pending", issue: { id: "issue-1", title: "Owned elsewhere" }, addressedInteraction };
+    for (const resumedSession of [false, true]) {
+      const prompt = renderPaperclipWakePrompt(payload, { resumedSession });
+      expect(prompt).toContain("## Question addressed to you");
+      expect(prompt).toContain("POST /api/issues/issue-1/interactions/card-1/respond");
+      expect(prompt).toContain("Do not check out the issue");
+      expect(prompt).not.toContain("continue the task");
+      expect(prompt).not.toContain("continue the current task");
+    }
+    const ordinary = renderPaperclipWakePrompt({ ...payload, addressedInteraction: null }, { resumedSession: false });
+    expect(ordinary).not.toContain("Question addressed to you");
+    expect(ordinary).toContain("continue the task");
+  });
+
   it.each([false, true])("renders the runtime checkout flag for ordinary task wakes (resume=%s)", resumedSession => {
     const payload = { reason: "issue_assigned", issue: { id: "issue-1", status: "in_progress" },
       comments: [], commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
