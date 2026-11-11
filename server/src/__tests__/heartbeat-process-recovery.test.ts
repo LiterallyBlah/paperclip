@@ -14168,6 +14168,53 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(followupRuns).toHaveLength(1);
   });
 
+  it("promotes a wake deferred behind a disposition repair that dispatch suppressed", async () => {
+    const f = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "succeeded", livenessState: "blocked" });
+    let gated = false;
+    let deferredWakeId: string | null = null;
+    const heartbeat = heartbeatService(db, {
+      beforeChatControlRecoveryCheck: async ({ stage }) => {
+        if (stage !== "dispatch" || gated) return;
+        gated = true;
+        // A board comment arrives while the repair run holds the task; its wake is parked.
+        const commentId = randomUUID();
+        await db.insert(issueComments).values({ id: commentId, companyId: f.companyId, issueId: f.issueId,
+          authorType: "user", authorUserId: "responsible-user", body: "Please continue." });
+        await heartbeat.wakeup(f.agentId, {
+          source: "automation", triggerDetail: "system", reason: "issue_commented",
+          payload: { issueId: f.issueId, commentId },
+          contextSnapshot: { issueId: f.issueId, taskId: f.issueId, commentId, wakeCommentId: commentId,
+            wakeReason: "issue_commented", source: "issue.comment" },
+          requestedByActorType: "user", requestedByActorId: "responsible-user",
+        });
+        const [parked] = await db.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.agentId, f.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+        deferredWakeId = parked?.id ?? null;
+        await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+          kind: "request_confirmation", status: "pending", payload: { version: 1, prompt: "Wait for the existing technical response" } });
+      },
+    });
+    const repair = await heartbeat.wakeup(f.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_continuation_needed",
+      requestedByActorType: "system", requestedByActorId: "recovery",
+      payload: { issueId: f.issueId },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, retryOfRunId: f.runId,
+        dispositionRepairSourceRunId: f.runId, source: "issue.legacy_disposition_repair",
+        legacyDispositionEpisode: { id: f.runId, attempt: 1, maxAttempts: 2 } },
+    });
+    expect(repair).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    expect(gated).toBe(true);
+    expect(deferredWakeId).not.toBeNull();
+    const [settled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, repair!.id));
+    expect(settled).toMatchObject({ status: "cancelled", errorCode: "legacy_disposition_repair_suppressed" });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    // The suppressed run's release drained the queue: the parked wake owns a run.
+    const [promoted] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferredWakeId!));
+    expect(promoted?.status).not.toBe("deferred_issue_execution");
+    expect(promoted?.runId).toBeTruthy();
+  });
+
   it.each([false, true])("fences intentional disposition suppression before provider dispatch (stale controller: %s)", async staleController => {
     const f = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "succeeded", livenessState: "blocked" });
     let gated = false;
