@@ -44,6 +44,22 @@ describe("keyboardShortcuts helpers", () => {
       expect(resolveAttentionQueueKeyAction({ ...baseArgs, key: "j", metaKey: true })).toBe("ignore");
       expect(resolveAttentionQueueKeyAction({ ...baseArgs, key: "Enter", hasSelection: false })).toBe("ignore");
     });
+
+    it("leaves Enter to a focused control inside the selected row (BLA-180)", () => {
+      // At 6f18750d Enter on a focused in-row Approve button toggled (collapsed)
+      // the selected row instead of activating the button.
+      const button = document.createElement("button");
+      const link = document.createElement("a");
+      link.href = "/PAP/issues/PAP-1";
+      const roleButton = document.createElement("div");
+      roleButton.setAttribute("role", "button");
+      for (const target of [button, link, roleButton]) {
+        expect(resolveAttentionQueueKeyAction({ ...baseArgs, key: "Enter", target })).toBe("ignore");
+      }
+      // Row navigation keys still work from a focused control.
+      expect(resolveAttentionQueueKeyAction({ ...baseArgs, key: "j", target: button })).toBe("next");
+      expect(resolveAttentionQueueKeyAction({ ...baseArgs, key: "Enter", target: document.body })).toBe("toggle");
+    });
   });
 
   it("detects editable shortcut targets", () => {
