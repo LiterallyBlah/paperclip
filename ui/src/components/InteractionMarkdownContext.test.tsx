@@ -333,6 +333,25 @@ describe("Markdown decision context on the task page (task chat)", () => {
     );
     expectRenderedContext(host.querySelector<HTMLElement>(".paperclip-markdown-compact")!);
   });
+
+  it("names the collapsed unanswered-question row without Markdown noise", () => {
+    const onReview = vi.fn();
+    const host = mount(
+      <TaskChatInteractionCard item={taskChatItem(questionInteraction)} showUnansweredQuestion onReviewRequest={onReview} />,
+    );
+    const row = host.querySelector<HTMLButtonElement>('[data-testid="task-chat-unanswered-question"]')!;
+    expect(row).toBeTruthy();
+    const name = row.getAttribute("aria-label") ?? "";
+    expect(name).toMatch(/^Answer question: Synthetic context heading /);
+    expect(name).toContain("storage choice");
+    expect(name).toContain("the design notes");
+    for (const noise of ["## ", "**", "|---|", "```", "](https://", "`"]) {
+      expect(name).not.toContain(noise);
+      expect(row.textContent).not.toContain(noise);
+    }
+    act(() => row.click());
+    expect(onReview).toHaveBeenCalledWith(questionInteraction.id);
+  });
 });
 
 describe("Markdown decision context in the Decisions resolver", () => {
