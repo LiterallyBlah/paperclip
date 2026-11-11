@@ -410,7 +410,7 @@ function ReceiptDisclosure({
     const questionSet = questionSetForInteraction(interaction);
     const response = questionResponseForInteraction(interaction, questionSet);
     request = (
-      <div className="grid gap-3">
+      <div className="grid min-w-0 grid-cols-1 gap-3">
         {questionSet.description ? (
           <div className="min-w-0 text-sm text-muted-foreground">
             <InteractionMarkdown externalReferences={externalReferences} inheritColor>
@@ -429,7 +429,7 @@ function ReceiptDisclosure({
             (value): value is string => Boolean(value),
           );
           return (
-            <div key={question.id}>
+            <div key={question.id} className="min-w-0">
               {question.header ? (
                 <p className="text-xs font-medium text-muted-foreground">
                   {question.header}
@@ -625,8 +625,8 @@ function ReceiptDisclosure({
     <div
       className={
         compact
-          ? "space-y-3 pb-3 pl-7 pr-1"
-          : "mt-2 space-y-3 border-t border-border/60 pt-3"
+          ? "min-w-0 space-y-3 pb-3 pl-7 pr-1"
+          : "mt-2 min-w-0 space-y-3 border-t border-border/60 pt-3"
       }
     >
       {request}

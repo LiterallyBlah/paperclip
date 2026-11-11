@@ -1293,37 +1293,13 @@ function AskUserQuestionsCard({
               key={question.id}
               className={compact ? "space-y-3" : "rounded-2xl border border-border/70 bg-background/82 p-4 shadow-(--shadow-extract-9)"}
             >
+              {/* The eyebrow and the pick chip share one row; the prompt
+                  (rendered Markdown, possibly with tables and code) uses the
+                  full card width below it. */}
               <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0 flex-1">
-                  {!compact ? <div className="text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
-                    Question {index + 1}
-                  </div> : null}
-                  <div
-                    id={`${interaction.id}-${question.id}-prompt`}
-                    data-decision-prompt={compact ? true : undefined}
-                    className={compact ? "min-w-0 text-lg font-medium leading-relaxed text-foreground" : "mt-1 min-w-0 text-sm leading-6 text-foreground"}
-                  >
-                    <InteractionMarkdown externalReferences={externalReferences}>
-                      {question.prompt}
-                    </InteractionMarkdown>
-                  </div>
-                  {/* Text-answer fields are named "<prefix> <rendered prompt
-                      text>" through aria-labelledby, so the accessible name
-                      has no raw Markdown syntax. */}
-                  <span id={`${interaction.id}-${question.id}-describe-label`} hidden>
-                    Describe your answer for
-                  </span>
-                  <span id={`${interaction.id}-${question.id}-other-label`} hidden>
-                    Other answer for
-                  </span>
-                  {question.helpText ? (
-                    <div className="mt-1 min-w-0 text-sm leading-6 text-muted-foreground">
-                      <InteractionMarkdown externalReferences={externalReferences} inheritColor>
-                        {question.helpText}
-                      </InteractionMarkdown>
-                    </div>
-                  ) : null}
-                </div>
+                {!compact ? <div className="text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
+                  Question {index + 1}
+                </div> : <span />}
                 {compact ? <span className="sr-only" id={`${interaction.id}-${question.id}-requirements`}>
                   {question.selectionMode === "single" ? "Choose one answer." : "Choose one or more answers."} {question.required ? "Required." : "Optional."}
                 </span> : <TaskField
@@ -1331,6 +1307,33 @@ function AskUserQuestionsCard({
                   value={question.required ? "Required" : "Optional"}
                   tone="subtle"
                 />}
+              </div>
+              <div className="min-w-0">
+                <div
+                  id={`${interaction.id}-${question.id}-prompt`}
+                  data-decision-prompt={compact ? true : undefined}
+                  className={compact ? "min-w-0 text-lg font-medium leading-relaxed text-foreground" : "mt-1 min-w-0 text-sm leading-6 text-foreground"}
+                >
+                  <InteractionMarkdown externalReferences={externalReferences}>
+                    {question.prompt}
+                  </InteractionMarkdown>
+                </div>
+                {/* Text-answer fields are named "<prefix> <rendered prompt
+                    text>" through aria-labelledby, so the accessible name
+                    has no raw Markdown syntax. */}
+                <span id={`${interaction.id}-${question.id}-describe-label`} hidden>
+                  Describe your answer for
+                </span>
+                <span id={`${interaction.id}-${question.id}-other-label`} hidden>
+                  Other answer for
+                </span>
+                {question.helpText ? (
+                  <div className="mt-1 min-w-0 text-sm leading-6 text-muted-foreground">
+                    <InteractionMarkdown externalReferences={externalReferences} inheritColor>
+                      {question.helpText}
+                    </InteractionMarkdown>
+                  </div>
+                ) : null}
               </div>
 
               <div className="mt-3 space-y-3">
