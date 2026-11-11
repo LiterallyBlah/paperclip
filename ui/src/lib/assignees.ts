@@ -14,6 +14,30 @@ export interface AssigneeOption {
 interface CommentAssigneeSuggestionInput {
   assigneeAgentId?: string | null;
   assigneeUserId?: string | null;
+  status?: string | null;
+  executionState?: {
+    status?: string | null;
+    currentParticipant?: { type?: string | null; userId?: string | null } | null;
+  } | null;
+}
+
+/**
+ * True when the viewer currently holds a pending native review/approval stage
+ * on this issue. Their ordinary comment must stay an ordinary comment: handing
+ * the stage back to another participant is a decision, not a reply default.
+ */
+export function viewerHoldsPendingExecutionStage(
+  issue: CommentAssigneeSuggestionInput,
+  currentUserId: string | null | undefined,
+): boolean {
+  const participant = issue.executionState?.currentParticipant;
+  return Boolean(
+    currentUserId
+      && issue.status === "in_review"
+      && issue.executionState?.status === "pending"
+      && participant?.type === "user"
+      && participant.userId === currentUserId,
+  );
 }
 
 interface CommentAssigneeSuggestionComment {
@@ -34,6 +58,11 @@ export function suggestedCommentAssigneeValue(
   currentAgentId?: string | null | undefined,
   activity: readonly ActivityEvent[] = [],
 ): string {
+  // A pending stage held by the viewer keeps its current assignment; any
+  // reassignment there has to be an explicit pick, not a silent default.
+  if (viewerHoldsPendingExecutionStage(issue, currentUserId)) {
+    return assigneeValueFromSelection(issue);
+  }
   const assignedToCurrentUser = Boolean(currentUserId && issue.assigneeUserId === currentUserId);
   if (assignedToCurrentUser) {
     const assignment = activity

@@ -2216,6 +2216,56 @@ describe("review round circuit breaker", () => {
     });
   });
 
+  // BLA-180 H3, server layer: a comment by the escalated human carries no
+  // decision. Only an explicit assignee in the same request moves the stage.
+  it("leaves the escalated hold untouched for the escalated human's comment-only update", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue(
+        { assigneeAgentId: null, assigneeUserId: boardUserId },
+        {
+          currentParticipant: { type: "user", userId: boardUserId },
+          changesRequestedCount: 3,
+        },
+      ),
+      policy,
+      requestedAssigneePatch: {},
+      actor: { userId: boardUserId },
+      allowBoardOverride: true,
+      commentBody: "Fix F-H2 as decided by CTO in this comment",
+    });
+
+    expect(result.decision).toBeUndefined();
+    expect(result.patch).toEqual({});
+  });
+
+  it("re-pends the hold on a configured agent only when the request names that assignee", () => {
+    // This is the mechanism behind the observed participant move: the task
+    // composer used to default a reply to "reassign to the reviewer agent", so
+    // a plain Send arrived with assigneeAgentId set. An explicit board
+    // reassignment stays a deliberate override and keeps the round count.
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue(
+        { assigneeAgentId: null, assigneeUserId: boardUserId },
+        {
+          currentParticipant: { type: "user", userId: boardUserId },
+          changesRequestedCount: 3,
+        },
+      ),
+      policy,
+      requestedAssigneePatch: { assigneeAgentId: qaAgentId, assigneeUserId: null },
+      actor: { userId: boardUserId },
+      allowBoardOverride: true,
+      commentBody: "Fix F-H2 as decided by CTO in this comment",
+    });
+
+    expect(result.decision).toBeUndefined();
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      changesRequestedCount: 3,
+    });
+  });
+
   it("resets the counter when the escalated human requests changes", () => {
     const result = applyIssueExecutionPolicyTransition({
       issue: reviewPendingIssue(
