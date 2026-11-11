@@ -30,6 +30,7 @@ import { InteractionPreparationNotice } from "@/components/InteractionPreparatio
 import { IssueThreadInteractionCard } from "@/components/IssueThreadInteractionCard";
 import { ConnectionIntentInteractionBody } from "@/features/connections/ConnectionIntentInteractionBody";
 import { MarkdownBody } from "@/components/MarkdownBody";
+import { InteractionMarkdown } from "@/components/InteractionMarkdown";
 import type { MentionOption } from "@/components/MarkdownEditor";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -387,11 +388,13 @@ function ReceiptDisclosure({
     const questionSet = questionSetForInteraction(interaction);
     const response = questionResponseForInteraction(interaction, questionSet);
     request = (
-      <div className="grid gap-3">
+      <div className="grid min-w-0 grid-cols-1 gap-3">
         {questionSet.description ? (
-          <p className="text-sm text-muted-foreground">
-            {questionSet.description}
-          </p>
+          <div className="min-w-0 text-sm text-muted-foreground">
+            <InteractionMarkdown externalReferences={externalReferences} inheritColor>
+              {questionSet.description}
+            </InteractionMarkdown>
+          </div>
         ) : null}
         {questionSet.questions.map((question) => {
           const answer = response?.answers[question.id];
@@ -404,17 +407,23 @@ function ReceiptDisclosure({
             (value): value is string => Boolean(value),
           );
           return (
-            <div key={question.id}>
+            <div key={question.id} className="min-w-0">
               {question.header ? (
                 <p className="text-xs font-medium text-muted-foreground">
                   {question.header}
                 </p>
               ) : null}
-              <p className="text-sm text-foreground">{question.prompt}</p>
+              <div className="min-w-0 text-sm text-foreground">
+                <InteractionMarkdown externalReferences={externalReferences}>
+                  {question.prompt}
+                </InteractionMarkdown>
+              </div>
               {question.helpText ? (
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  {question.helpText}
-                </p>
+                <div className="mt-0.5 min-w-0 text-xs text-muted-foreground">
+                  <InteractionMarkdown externalReferences={externalReferences} inheritColor>
+                    {question.helpText}
+                  </InteractionMarkdown>
+                </div>
               ) : null}
               <p className="mt-1 text-sm font-medium text-foreground">
                 Answer: {values.length > 0 ? values.join(", ") : "No answer"}
@@ -431,7 +440,11 @@ function ReceiptDisclosure({
       .map((option) => option.label);
     request = (
       <div>
-        <p className="text-sm text-foreground">{interaction.payload.prompt}</p>
+        <div className="min-w-0 text-sm text-foreground">
+          <InteractionMarkdown externalReferences={externalReferences}>
+            {interaction.payload.prompt}
+          </InteractionMarkdown>
+        </div>
         {interaction.status === "accepted" ? (
           <p className="mt-1 text-sm font-medium text-foreground">
             Answer:{" "}
@@ -458,7 +471,11 @@ function ReceiptDisclosure({
     );
     request = (
       <div>
-        <p className="text-sm text-foreground">{interaction.payload.prompt}</p>
+        <div className="min-w-0 text-sm text-foreground">
+          <InteractionMarkdown externalReferences={externalReferences}>
+            {interaction.payload.prompt}
+          </InteractionMarkdown>
+        </div>
         {decidedItems.length > 0 ? (
           <ul className="mt-2 grid gap-1 text-sm">
             {decidedItems.map((item) => {
@@ -520,7 +537,11 @@ function ReceiptDisclosure({
   } else {
     request = (
       <div className="grid gap-2">
-        <p className="text-sm text-foreground">{interaction.payload.prompt}</p>
+        <div className="min-w-0 text-sm text-foreground">
+          <InteractionMarkdown externalReferences={externalReferences}>
+            {interaction.payload.prompt}
+          </InteractionMarkdown>
+        </div>
         {interaction.payload.detailsMarkdown ? (
           <div className="text-sm">
             <MarkdownBody externalReferences={externalReferences}>
@@ -588,8 +609,8 @@ function ReceiptDisclosure({
     <div
       className={
         compact
-          ? "space-y-3 pb-3 pl-7 pr-1"
-          : "mt-2 space-y-3 border-t border-border/60 pt-3"
+          ? "min-w-0 space-y-3 pb-3 pl-7 pr-1"
+          : "mt-2 min-w-0 space-y-3 border-t border-border/60 pt-3"
       }
     >
       {request}
@@ -865,11 +886,17 @@ function ConfirmationCard({
         />
       ) : isPlanConfirmation && rejecting ? null : (
         <div className="space-y-2">
-          <p className="whitespace-pre-line break-words text-sm leading-5 text-foreground">
-            {isPlanConfirmation
-              ? "Do you accept this plan?"
-              : interaction.payload.prompt}
-          </p>
+          {isPlanConfirmation ? (
+            <p className="whitespace-pre-line break-words text-sm leading-5 text-foreground">
+              Do you accept this plan?
+            </p>
+          ) : (
+            <div className="min-w-0 break-words text-sm leading-5 text-foreground">
+              <InteractionMarkdown externalReferences={externalReferences}>
+                {interaction.payload.prompt}
+              </InteractionMarkdown>
+            </div>
+          )}
           {!isPlanConfirmation ? (
             <CompactTarget interaction={interaction} />
           ) : null}
@@ -1155,15 +1182,20 @@ function CheckboxConfirmationCard({
   return (
     <div>
       <div className="space-y-2">
-        <p className="whitespace-pre-line break-words text-sm leading-5 text-foreground">
-          {interaction.payload.prompt}
-        </p>
+        <div
+          id={`${interaction.id}-checkbox-prompt`}
+          className="min-w-0 break-words text-sm leading-5 text-foreground"
+        >
+          <InteractionMarkdown externalReferences={externalReferences}>
+            {interaction.payload.prompt}
+          </InteractionMarkdown>
+        </div>
         <CompactTarget interaction={interaction} />
       </div>
       <div
         className="mt-3 grid gap-1"
         role="group"
-        aria-label={interaction.payload.prompt}
+        aria-labelledby={`${interaction.id}-checkbox-prompt`}
       >
         {interaction.payload.options.length > 10 ? (
           <label className="relative mb-1 block">
@@ -1195,8 +1227,10 @@ function CheckboxConfirmationCard({
                 {option.label}
               </span>
               {option.description ? (
-                <span className="block text-xs leading-4 text-muted-foreground">
-                  {option.description}
+                <span className="block min-w-0 text-xs leading-4 text-muted-foreground">
+                  <InteractionMarkdown externalReferences={externalReferences} inheritColor>
+                    {option.description}
+                  </InteractionMarkdown>
                 </span>
               ) : null}
             </span>

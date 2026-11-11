@@ -206,9 +206,13 @@ function activeDismissalState(
   };
 }
 
-function stripMarkdown(value: string) {
+export function stripMarkdown(value: string) {
   return value
     .replace(/```[\s\S]*?```/g, " ")
+    // Tables: drop delimiter rows and cell pipes while lines still exist; the
+    // one-line excerpt cannot tell a table pipe from text afterwards.
+    .replace(/^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(?:\|[ \t]*:?-{3,}:?[ \t]*)+\|?[ \t]*$/gm, "")
+    .replace(/^[ \t]*\|(.*?)\|?[ \t]*$/gm, (_match, cells: string) => cells.split("|").map((cell) => cell.trim()).join(" "))
     .replace(/`([^`]+)`/g, "$1")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
