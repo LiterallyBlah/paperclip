@@ -1099,7 +1099,19 @@ type TerminalBlockerFacts = {
  * assignee, and the unblock step its owner recorded. A card that only says
  * "needs human attention" leaves the operator guessing why it was raised.
  */
-async function terminalBlockerFactsMap(db: Db, companyId: string, issueIds: string[]) {
+async function readableIssueIdSet(db: Db, companyId: string, issueIds: string[], readCondition: SQL<boolean>) {
+  const readable = new Set<string>();
+  for (const chunk of chunkValues([...new Set(issueIds)], ATTENTION_GRAPH_QUERY_CHUNK_SIZE)) {
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, chunk), readCondition));
+    for (const row of rows) readable.add(row.id);
+  }
+  return readable;
+}
+
+async function terminalBlockerFactsMap(db: Db, companyId: string, issueIds: string[], readCondition: SQL<boolean>) {
   const facts = new Map<string, TerminalBlockerFacts>();
   const ids = [...new Set(issueIds)];
   if (ids.length === 0) return facts;
@@ -1122,7 +1134,7 @@ async function terminalBlockerFactsMap(db: Db, companyId: string, issueIds: stri
         monitorNextCheckAt: issues.monitorNextCheckAt,
       })
       .from(issues)
-      .where(and(eq(issues.companyId, companyId), inArray(issues.id, chunk))));
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, chunk), readCondition)));
   }
   const ownerAgentId = (row: (typeof rows)[number]) => {
     const owner = row.status === "blocked" ? row.unblockDescriptor?.owner : null;
@@ -1725,11 +1737,20 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       const terminalIds = [...terminalCandidates.keys()];
       const [blockedWork, terminalFacts] = await Promise.all([
         blockedWorkMap(db, companyId, terminalIds),
-        terminalBlockerFactsMap(db, companyId, terminalIds),
+        terminalBlockerFactsMap(db, companyId, terminalIds, readCondition),
       ]);
+      // Admission above uses the full blocker graph. The count shown on the
+      // card, and the ranking that uses it, include only work the viewer can
+      // read.
+      const readableBlockedWork = await readableIssueIdSet(
+        db,
+        companyId,
+        [...blockedWork.values()].flatMap((ids) => [...ids]),
+        readCondition,
+      );
       for (const [terminalIssueId, candidate] of terminalCandidates) {
         const blockedTaskCount = new Set([
-          ...(blockedWork.get(terminalIssueId) ?? []),
+          ...[...(blockedWork.get(terminalIssueId) ?? [])].filter((id) => readableBlockedWork.has(id)),
           ...(blockedRootIdsByTerminal.get(terminalIssueId) ?? []),
         ]).size;
         const taskLabel = blockedTaskCount === 1 ? "task" : "tasks";

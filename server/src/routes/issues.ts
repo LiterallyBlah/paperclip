@@ -5401,11 +5401,40 @@ export function issueRoutes(
     };
   }
 
+  type BlockerAttentionWithTerminal = { terminalBlocker?: { id: string } | null } | null | undefined;
+
+  /**
+   * blockerAttention is computed over the full blocker graph, so its
+   * terminalBlocker summary can name an issue the viewer cannot read. Apply the
+   * same read check as the blockedBy edge stubs and drop that summary.
+   */
+  async function redactBlockerAttentionTerminals<A extends BlockerAttentionWithTerminal>(
+    req: Request,
+    companyId: string,
+    attentions: A[],
+  ): Promise<A[]> {
+    const terminalIds = attentions.flatMap((attention) => attention?.terminalBlocker?.id ? [attention.terminalBlocker.id] : []);
+    if (terminalIds.length === 0) return attentions;
+    const readableIds = await readableIssueEdgeIds(req, companyId, terminalIds);
+    return attentions.map((attention) => attention?.terminalBlocker && !readableIds.has(attention.terminalBlocker.id)
+      ? { ...attention, terminalBlocker: null }
+      : attention);
+  }
+
   async function redactIssueRelationEdgesOnRows<T extends {
     id: string;
     blockedBy?: IssueRelationIssueSummary[];
     blocks?: IssueRelationIssueSummary[];
-  }>(req: Request, companyId: string, rows: T[]): Promise<T[]> {
+    blockerAttention?: BlockerAttentionWithTerminal;
+  }>(req: Request, companyId: string, inputRows: T[]): Promise<T[]> {
+    const redactedAttention = await redactBlockerAttentionTerminals(
+      req,
+      companyId,
+      inputRows.map((row) => row.blockerAttention),
+    );
+    const rows = inputRows.map((row, index) => row.blockerAttention
+      ? { ...row, blockerAttention: redactedAttention[index] }
+      : row);
     const related = rows.flatMap((row) => [...(row.blockedBy ?? []), ...(row.blocks ?? [])]);
     const edgeIds = new Set<string>();
     const pending = [...related];
@@ -8948,7 +8977,8 @@ export function issueRoutes(
       svc.getRelationSummaries(issue.id),
       svc
         .listBlockerAttention(issue.companyId, [issue])
-        .then((map) => map.get(issue.id) ?? null),
+        .then((map) => redactBlockerAttentionTerminals(req, issue.companyId, [map.get(issue.id) ?? null]))
+        .then(([attention]) => attention),
       svc
         .listReviewAttention(issue.companyId, [issue])
         .then((map) => map.get(issue.id) ?? null),
@@ -9281,7 +9311,8 @@ export function issueRoutes(
       timing.time("relations", () => svc.getRelationSummaries(issue.id)),
       timing.time("blockers", () => svc
         .listBlockerAttention(issue.companyId, [issue])
-        .then((map) => map.get(issue.id) ?? null)),
+        .then((map) => redactBlockerAttentionTerminals(req, issue.companyId, [map.get(issue.id) ?? null]))
+        .then(([attention]) => attention)),
       timing.time("review", () => svc
         .listReviewAttention(issue.companyId, [issue])
         .then((map) => map.get(issue.id) ?? null)),

@@ -459,4 +459,44 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     expect(search.status).toBe(200);
     expect(search.body.results.map((row: { id: string }) => row.id)).not.toContain(fixture.privateIssueId);
   }, 20_000);
+  it("drops an unreadable terminal blocker summary from blockerAttention", async () => {
+    const fixture = await seedFixture();
+    const visibleIssue = await db.insert(issues).values({
+      companyId: fixture.companyId,
+      identifier: "PRV-4",
+      title: "Visible blocked issue",
+      status: "blocked",
+      priority: "medium",
+      createdByUserId: fixture.memberId,
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(issueRelations).values({
+      companyId: fixture.companyId,
+      issueId: fixture.privateIssueId,
+      relatedIssueId: visibleIssue.id,
+      type: "blocks",
+    });
+
+    // The owner can read the private chain and still sees its terminal blocker.
+    const ownerApp = await createApp(db, boardActor(fixture.companyId, fixture.ownerId));
+    const ownerDetail = await request(ownerApp).get(`/api/issues/${visibleIssue.id}`);
+    expect(ownerDetail.status, JSON.stringify(ownerDetail.body)).toBe(200);
+    expect(ownerDetail.body.blockerAttention.terminalBlocker).toMatchObject({ title: "Confidential child" });
+
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+    const detail = await request(app).get(`/api/issues/${visibleIssue.id}`);
+    expect(detail.status, JSON.stringify(detail.body)).toBe(200);
+    expect(detail.body.blockerAttention).toMatchObject({ state: "needs_attention", terminalBlocker: null });
+    expect(JSON.stringify(detail.body)).not.toContain("Confidential child");
+
+    const context = await request(app).get(`/api/issues/${visibleIssue.id}/heartbeat-context`);
+    expect(context.status, JSON.stringify(context.body)).toBe(200);
+    expect(context.body.issue.blockerAttention).toMatchObject({ terminalBlocker: null });
+    expect(JSON.stringify(context.body)).not.toContain("Confidential child");
+
+    const list = await request(app).get(`/api/companies/${fixture.companyId}/issues?status=blocked`);
+    expect(list.status, JSON.stringify(list.body)).toBe(200);
+    const visibleRow = list.body.find((row: { id: string }) => row.id === visibleIssue.id);
+    expect(visibleRow.blockerAttention).toMatchObject({ terminalBlocker: null });
+    expect(JSON.stringify(list.body)).not.toContain("Confidential child");
+  }, 20_000);
 });
