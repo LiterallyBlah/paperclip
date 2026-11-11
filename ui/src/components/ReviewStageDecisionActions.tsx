@@ -48,7 +48,7 @@ export function isReviewStageParticipant(
 /**
  * Approve / Request changes for a *pending native* review or approval stage
  * whose current participant is a user — e.g. the hand-off when the review-round
- * cap escalates an agent↔agent loop (BLA-180). Shared by the /decisions row
+ * cap escalates an agent↔agent loop. Shared by the /decisions row
  * and the task page so both resolve the same way: the participant's own
  * `PATCH /issues/:id` with `status` + `comment`, which the execution policy
  * records as the stage decision (approve → next stage or done; request changes

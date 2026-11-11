@@ -2216,7 +2216,7 @@ describe("review round circuit breaker", () => {
     });
   });
 
-  // BLA-180 H3, server layer: a comment by the escalated human carries no
+  // Server layer: a comment by the escalated human carries no
   // decision. Only an explicit assignee in the same request moves the stage.
   it("leaves the escalated hold untouched for the escalated human's comment-only update", () => {
     const result = applyIssueExecutionPolicyTransition({
@@ -2231,7 +2231,7 @@ describe("review round circuit breaker", () => {
       requestedAssigneePatch: {},
       actor: { userId: boardUserId },
       allowBoardOverride: true,
-      commentBody: "Fix F-H2 as decided by CTO in this comment",
+      commentBody: "Fix the open finding as decided in this comment",
     });
 
     expect(result.decision).toBeUndefined();
@@ -2255,7 +2255,7 @@ describe("review round circuit breaker", () => {
       requestedAssigneePatch: { assigneeAgentId: qaAgentId, assigneeUserId: null },
       actor: { userId: boardUserId },
       allowBoardOverride: true,
-      commentBody: "Fix F-H2 as decided by CTO in this comment",
+      commentBody: "Fix the open finding as decided in this comment",
     });
 
     expect(result.decision).toBeUndefined();
