@@ -17,6 +17,7 @@ import type { Agent, HeartbeatRun } from "@paperclipai/shared";
 import { agentsApi } from "@/api/agents";
 import { instanceSettingsApi } from "@/api/instanceSettings";
 import { CoordinatorPresentation } from "@/components/coordinator/CoordinatorPresentation";
+import { ThemeProvider } from "../../context/ThemeContext";
 import { DRAFT_DEBOUNCE_MS } from "../../lib/composer-draft";
 import {
   loadDraftSubmission,
@@ -213,7 +214,8 @@ afterEach(() => {
 });
 
 function render(ui: ReactElement) {
-  flushSync(() => root!.render(ui));
+  // Question prompts render through MarkdownBody, which reads the theme.
+  flushSync(() => root!.render(<ThemeProvider>{ui}</ThemeProvider>));
 }
 
 async function flushAsync() {
@@ -3212,9 +3214,11 @@ describe("TaskChatComposer", () => {
         (button) => button.textContent?.trim() === "Production",
       );
       expect(staging?.getAttribute("data-recommended")).toBe("true");
-      expect(staging?.className.split(" ")).toContain("bg-muted/50");
+      // The highlight sits on the option card that wraps the control and its
+      // Markdown description.
+      expect(staging?.parentElement?.className.split(" ")).toContain("bg-muted/50");
       expect(
-        production?.className
+        production?.parentElement?.className
           .split(" ")
           .some(
             (token) => token.startsWith("border") || token.startsWith("bg-"),
@@ -3223,7 +3227,7 @@ describe("TaskChatComposer", () => {
 
       flushSync(() => staging?.click());
       expect(staging?.getAttribute("data-selected")).toBe("true");
-      expect(staging?.className.split(" ")).toContain("bg-foreground/5");
+      expect(staging?.parentElement?.className.split(" ")).toContain("bg-foreground/5");
     });
 
     it("hides Skip when the takeover already provides a request-changes path", () => {

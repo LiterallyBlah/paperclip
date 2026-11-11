@@ -572,9 +572,12 @@ describe("TaskChatInteractionCard", () => {
 
     render({ type: "custom", key: "github:paperclipai/paperclip-desktop:pull:16" });
     expect(container.textContent).not.toContain("github:paperclipai");
-    const prompt = Array.from(container.querySelectorAll("p")).find((node) =>
+    // The prompt renders as Markdown; its container stays full width.
+    const prompt = Array.from(container.querySelectorAll(".paperclip-markdown")).find((node) =>
       node.textContent?.startsWith("The change is open"),
-    );
+    )?.parentElement;
+    // Blank-line breaks in the prompt stay visible as separate paragraphs.
+    expect(prompt?.querySelectorAll("p")).toHaveLength(2);
     expect(prompt?.className).not.toContain("flex-1");
     expect(prompt?.closest(".paperclip-markdown")?.querySelectorAll("p")).toHaveLength(2);
     expect(prompt?.parentElement?.className).not.toContain("justify-between");
@@ -616,9 +619,12 @@ describe("TaskChatInteractionCard", () => {
 
     render({ type: "custom", key: "github:paperclipai/paperclip-desktop:pull:16" });
     expect(container.textContent).not.toContain("github:paperclipai");
-    const prompt = Array.from(container.querySelectorAll("p")).find((node) =>
+    // The prompt renders as Markdown; its container stays full width.
+    const prompt = Array.from(container.querySelectorAll(".paperclip-markdown")).find((node) =>
       node.textContent?.startsWith("Pick the drafts"),
-    );
+    )?.parentElement;
+    // Blank-line breaks in the prompt stay visible as separate paragraphs.
+    expect(prompt?.querySelectorAll("p")).toHaveLength(2);
     expect(prompt?.className).not.toContain("flex-1");
     expect(prompt?.closest(".paperclip-markdown")?.querySelectorAll("p")).toHaveLength(2);
     expect(prompt?.parentElement?.className).not.toContain("justify-between");
