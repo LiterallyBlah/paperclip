@@ -1323,6 +1323,68 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       expect(ids).not.toContain(privateIssueId);
     });
 
+    async function seedBlockedByTerminal(blockerVisibility: "open" | "private") {
+      const { companyId } = await seedCompanyAndAgent();
+      const blockedIssueId = randomUUID();
+      const blockerIssueId = randomUUID();
+      await db.insert(issues).values([
+        { id: blockedIssueId, companyId, title: "Public blocked work", status: "blocked", priority: "medium", visibility: "open" },
+        {
+          id: blockerIssueId,
+          companyId,
+          title: "Confidential blocker",
+          status: "todo",
+          priority: "medium",
+          visibility: blockerVisibility,
+          ...(blockerVisibility === "private" ? { privacyRootIssueId: blockerIssueId } : {}),
+        },
+      ]);
+      await db.insert(issueRelations).values({
+        companyId, issueId: blockerIssueId, relatedIssueId: blockedIssueId, type: "blocks",
+      });
+      return { companyId, blockedIssueId, blockerIssueId };
+    }
+
+    it("omits a private terminal blocker's title from issues.list blockerAttention (BLA-227 F1)", async () => {
+      const { companyId, blockedIssueId, blockerIssueId } = await seedBlockedByTerminal("private");
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.slack-digest", createEventBusStub());
+      const listed = await services.issues.list({ companyId });
+      expect(listed.map((issue) => issue.id)).not.toContain(blockerIssueId);
+      const row = listed.find((issue) => issue.id === blockedIssueId) as any;
+      expect(row?.blockerAttention?.terminalBlockerIssueId).toBe(blockerIssueId);
+      expect(row?.blockerAttention?.terminalBlocker).toBeNull();
+      expect(JSON.stringify(listed)).not.toContain("Confidential blocker");
+    });
+
+    it("keeps a readable terminal blocker's title in issues.list blockerAttention", async () => {
+      const { companyId, blockedIssueId, blockerIssueId } = await seedBlockedByTerminal("open");
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.slack-digest", createEventBusStub());
+      const listed = await services.issues.list({ companyId });
+      const row = listed.find((issue) => issue.id === blockedIssueId) as any;
+      expect(row?.blockerAttention?.terminalBlocker).toEqual({
+        id: blockerIssueId, identifier: null, title: "Confidential blocker",
+      });
+    });
+
+    it("omits a private blocker from issues.list blockedInboxAttention (BLA-227 F1)", async () => {
+      const { companyId, blockedIssueId } = await seedBlockedByTerminal("private");
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.slack-digest", createEventBusStub());
+      const listed = await services.issues.list({ companyId, includeBlockedInboxAttention: true } as any);
+      const row = listed.find((issue) => issue.id === blockedIssueId) as any;
+      expect(row?.blockedInboxAttention).toBeDefined();
+      expect(row?.blockedInboxAttention?.sourceIssue?.id).toBe(blockedIssueId);
+      expect(row?.blockedInboxAttention?.leafIssue).toBeNull();
+      expect(JSON.stringify(listed)).not.toContain("Confidential blocker");
+    });
+
+    it("keeps a readable blocker in issues.list blockedInboxAttention", async () => {
+      const { companyId, blockedIssueId, blockerIssueId } = await seedBlockedByTerminal("open");
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.slack-digest", createEventBusStub());
+      const listed = await services.issues.list({ companyId, includeBlockedInboxAttention: true } as any);
+      const row = listed.find((issue) => issue.id === blockedIssueId) as any;
+      expect(row?.blockedInboxAttention?.leafIssue).toMatchObject({ id: blockerIssueId, title: "Confidential blocker" });
+    });
+
     it("returns null from issues.get for a private issue", async () => {
       const { companyId, openIssueId, privateIssueId } = await seedOpenAndPrivate();
       const services = buildHostServices(db, "plugin-record-id", "paperclip.slack-digest", createEventBusStub());

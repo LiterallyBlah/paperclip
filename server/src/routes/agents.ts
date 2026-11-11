@@ -4243,8 +4243,68 @@ export function agentRoutes(
       limit: ISSUE_LIST_DEFAULT_LIMIT,
     });
 
-    res.json(rows);
+    res.json(await redactInboxBlockerAttention(req, req.actor.companyId, rows));
   });
+
+  // blockerAttention.terminalBlocker carries the blocker's title. Omit it when
+  // the requesting actor cannot read that blocker, using the same issue:read
+  // decision the issue routes apply before they show a blocker (BLA-227 F1).
+  // Presentation only: dependency readiness and admission use the full graph.
+  type InboxBlockerAttentionRow = { blockerAttention?: { terminalBlocker?: { id: string } | null } | null };
+  async function redactInboxBlockerAttention<T extends object>(
+    req: Request,
+    companyId: string,
+    issueRows: T[],
+  ): Promise<T[]> {
+    const rows = issueRows as Array<T & InboxBlockerAttentionRow>;
+    const terminalIds = [...new Set(rows.flatMap((row) => {
+      const terminalId = row.blockerAttention?.terminalBlocker?.id;
+      return terminalId ? [terminalId] : [];
+    }))];
+    if (terminalIds.length === 0) return issueRows;
+    const terminals = await db
+      .select({
+        id: issuesTable.id,
+        companyId: issuesTable.companyId,
+        projectId: issuesTable.projectId,
+        parentId: issuesTable.parentId,
+        assigneeAgentId: issuesTable.assigneeAgentId,
+        assigneeUserId: issuesTable.assigneeUserId,
+        status: issuesTable.status,
+      })
+      .from(issuesTable)
+      .where(and(eq(issuesTable.companyId, companyId), inArray(issuesTable.id, terminalIds)));
+    const readable = new Set<string>();
+    await Promise.all(terminals.map(async (issue) => {
+      const decision = await access.decide({
+        actor: req.actor,
+        action: "issue:read",
+        resource: {
+          type: "issue",
+          companyId: issue.companyId,
+          issueId: issue.id,
+          projectId: issue.projectId,
+          parentIssueId: issue.parentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
+          status: issue.status,
+        },
+        scope: {
+          issueId: issue.id,
+          projectId: issue.projectId,
+          parentIssueId: issue.parentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
+        },
+      });
+      if (decision.allowed) readable.add(issue.id);
+    }));
+    return rows.map((row) => {
+      const terminalId = row.blockerAttention?.terminalBlocker?.id;
+      if (!row.blockerAttention || !terminalId || readable.has(terminalId)) return row;
+      return { ...row, blockerAttention: { ...row.blockerAttention, terminalBlocker: null } };
+    });
+  }
 
   router.get("/agents/:id/identity", async (req, res) => {
     const agent = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");

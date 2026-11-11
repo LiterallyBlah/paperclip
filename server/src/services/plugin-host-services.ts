@@ -951,6 +951,45 @@ export function buildHostServices(
           : edge));
     return { ...relation, blockedBy: redact(relation.blockedBy), blocks: redact(relation.blocks) };
   };
+  // blockerAttention.terminalBlocker and the blockedInboxAttention source,
+  // leaf and recovery references carry issue titles. Omit each one the plugin
+  // cannot read (BLA-227 F1). Presentation only: dependency readiness and
+  // admission use the full graph.
+  const pluginRedactBlockerAttention = async (companyId: string, rows: Issue[]): Promise<Issue[]> => {
+    const inboxIds = (row: Issue) => [
+      row.blockedInboxAttention?.sourceIssue?.id,
+      row.blockedInboxAttention?.leafIssue?.id,
+      row.blockedInboxAttention?.recoveryIssue?.id,
+    ].filter((id): id is string => Boolean(id));
+    const ids = rows.flatMap((row) => {
+      const terminalId = row.blockerAttention?.terminalBlocker?.id;
+      return [...(terminalId ? [terminalId] : []), ...inboxIds(row)];
+    });
+    if (ids.length === 0) return rows;
+    const readable = await pluginReadableIssueIdsByIds(companyId, ids);
+    const visible = <R extends { id: string }>(ref: R | null | undefined) => (ref && readable.has(ref.id) ? ref : null);
+    return rows.map((row) => {
+      const terminalId = row.blockerAttention?.terminalBlocker?.id;
+      const redactTerminal = Boolean(row.blockerAttention && terminalId && !readable.has(terminalId));
+      const inbox = row.blockedInboxAttention;
+      const redactInbox = Boolean(inbox && !inboxIds(row).every((id) => readable.has(id)));
+      if (!redactTerminal && !redactInbox) return row;
+      return {
+        ...row,
+        ...(redactTerminal && row.blockerAttention ? { blockerAttention: { ...row.blockerAttention, terminalBlocker: null } } : {}),
+        ...(redactInbox && inbox
+          ? {
+            blockedInboxAttention: {
+              ...inbox,
+              sourceIssue: visible(inbox.sourceIssue),
+              leafIssue: visible(inbox.leafIssue),
+              recoveryIssue: visible(inbox.recoveryIssue),
+            },
+          }
+          : {}),
+      };
+    });
+  };
 
   // Track active session event subscriptions for cleanup
   const activeSubscriptions = new Set<{ unsubscribe: () => void; timer: ReturnType<typeof setTimeout> }>();
@@ -2117,10 +2156,10 @@ export function buildHostServices(
         // Push the non-member visibility predicate into the list query so private
         // issues are filtered at the SQL layer before they can reach a plugin.
         const readCondition = await issueReadSqlCondition(db, pluginIssuePrivacyActor);
-        return applyWindow(
+        return pluginRedactBlockerAttention(companyId, applyWindow(
           (await issues.list(companyId, { ...(params as any), readCondition })) as Issue[],
           params,
-        );
+        ));
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
