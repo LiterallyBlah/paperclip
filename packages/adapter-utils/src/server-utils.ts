@@ -67,8 +67,13 @@ export interface RunProcessResult {
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
 }
 
+export type TerminalResultCleanupEvent = "terminal_result" | "turn_active";
+
 export interface TerminalResultCleanupOptions {
   hasTerminalResult: (output: { stdout: string; stderr: string }) => boolean;
+  observeOutputEvents?: (
+    chunk: { stdout: string; stderr: string },
+  ) => readonly TerminalResultCleanupEvent[];
   graceMs?: number;
 }
 
@@ -4857,10 +4862,30 @@ export async function runChildProcess(
           terminalCleanupKillTimer = null;
         };
 
-        const maybeArmTerminalResultCleanup = () => {
+        const maybeArmTerminalResultCleanup = (
+          delta?: { stdout: string; stderr: string },
+        ) => {
           const terminalCleanup = opts.terminalResultCleanup;
           if (!terminalCleanup || terminalCleanupStarted || timedOut) return;
-          if (!terminalResultSeen) {
+          if (terminalCleanup.observeOutputEvents) {
+            if (delta) {
+              try {
+                for (const event of terminalCleanup.observeOutputEvents(delta)) {
+                  if (event === "turn_active" && terminalResultSeen) {
+                    terminalResultSeen = false;
+                    if (terminalCleanupTimer) clearTimeout(terminalCleanupTimer);
+                    terminalCleanupTimer = null;
+                  } else if (event === "terminal_result") {
+                    terminalResultSeen = true;
+                    if (terminalCleanupTimer) clearTimeout(terminalCleanupTimer);
+                    terminalCleanupTimer = null;
+                  }
+                }
+              } catch (err) {
+                onLogError(err, runId, "failed to inspect terminal adapter output");
+              }
+            }
+          } else if (!terminalResultSeen) {
             const stdoutStart = Math.max(
               0,
               terminalResultStdoutScanOffset -
@@ -4936,7 +4961,7 @@ export async function runChildProcess(
           readable.pause();
           const text = String(chunk);
           stdout = appendWithCap(stdout, text);
-          maybeArmTerminalResultCleanup();
+          maybeArmTerminalResultCleanup({ stdout: text, stderr: "" });
           logChain = logChain
             .then(() => opts.onLog("stdout", text))
             .catch((err) =>
@@ -4954,7 +4979,7 @@ export async function runChildProcess(
           readable.pause();
           const text = String(chunk);
           stderr = appendWithCap(stderr, text);
-          maybeArmTerminalResultCleanup();
+          maybeArmTerminalResultCleanup({ stdout: "", stderr: text });
           logChain = logChain
             .then(() => opts.onLog("stderr", text))
             .catch((err) =>
