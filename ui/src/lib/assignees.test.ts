@@ -166,3 +166,48 @@ it.each(["issue.created", "issue.child_created"])("uses a REST %s receipt assign
   expect(suggestedCommentAssigneeValue({ assigneeUserId: "me" }, [{ authorAgentId: "commenter" }], "me", undefined, [event])).toBe("agent:creator");
   expect(suggestedCommentAssigneeValue({ assigneeUserId: "other" }, [], "other", undefined, [event])).toBe("");
 });
+
+describe("pending native review stage held by the viewer (BLA-180)", () => {
+  // Shape of a review-cap escalation: the reviewer agent requested changes and
+  // the stage was handed to the responsible human.
+  const escalatedBy = (actorId: string): ActivityEvent => ({
+    id: "escalation", companyId: "company", entityType: "issue", entityId: "task",
+    agentId: actorId, runId: null, actorType: "agent", actorId, action: "issue.updated",
+    createdAt: new Date("2026-11-11T01:55:36Z"),
+    details: { assigneeUserId: "me", _previous: { assigneeUserId: null } },
+  });
+  const held = {
+    status: "in_review",
+    assigneeUserId: "me",
+    executionState: { status: "pending", currentParticipant: { type: "user", userId: "me" } },
+  };
+
+  it("does not default an ordinary reply to reassigning the stage back to the reviewer agent", () => {
+    // At 6f18750d this suggested "agent:reviewer", so plain Send re-pended the
+    // stage on the agent (the H3 participant move).
+    expect(suggestedCommentAssigneeValue(held, [{ authorAgentId: "reviewer" }], "me", undefined, [escalatedBy("reviewer")]))
+      .toBe("user:me");
+  });
+
+  it("keeps a drifted agent assignee unchanged while the viewer holds the stage", () => {
+    expect(suggestedCommentAssigneeValue(
+      { ...held, assigneeUserId: null, assigneeAgentId: "worker" },
+      [{ authorAgentId: "reviewer" }],
+      "me",
+    )).toBe("agent:worker");
+  });
+
+  it("keeps the existing suggestion when someone else holds the stage or it is not pending", () => {
+    const history = [escalatedBy("reviewer")];
+    expect(suggestedCommentAssigneeValue(
+      { ...held, executionState: { status: "pending", currentParticipant: { type: "user", userId: "other" } } },
+      [], "me", undefined, history,
+    )).toBe("agent:reviewer");
+    expect(suggestedCommentAssigneeValue(
+      { ...held, executionState: { status: "changes_requested", currentParticipant: { type: "user", userId: "me" } } },
+      [], "me", undefined, history,
+    )).toBe("agent:reviewer");
+    expect(suggestedCommentAssigneeValue({ ...held, status: "in_progress" }, [], "me", undefined, history))
+      .toBe("agent:reviewer");
+  });
+});

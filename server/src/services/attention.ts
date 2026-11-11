@@ -1833,20 +1833,45 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         // it is resolved in-row with the three review verbs (PAP-16080 §4.4).
         // Covered reviews still deep-link — their real action lives elsewhere
         // (the pending interaction/approval card, a monitor, a live run).
+        //
+        // A pending native stage held by a user (e.g. the review-round cap
+        // escalation) is itself the decision: no card or approval exists to
+        // open, so the row resolves in place through the participant's own
+        // approve / request-changes path. The UI only offers the verbs to that
+        // participant; everyone else sees who must act.
+        const stageParticipantDecision = !stalled && !pendingApprovalId && hasHumanParticipant;
+        // A pending stage whose participant is an agent while the issue is
+        // assigned to a user is drifted: the user cannot decide it. Say who must.
+        const participantMismatch =
+          !stalled && !pendingApprovalId && !hasHumanParticipant && Boolean(currentParticipant);
+        const reviewStage = currentParticipant
+          ? {
+              stageType: state?.currentStageType ?? "review",
+              participant: {
+                type: currentParticipant.type,
+                agentId: currentParticipant.agentId ?? null,
+                userId: currentParticipant.userId ?? null,
+              },
+            }
+          : null;
         const reviewSubject = issueSubject(prefix, issue);
         add(createItem({
           companyId,
           sourceKind: "review",
           subject: stalled
             ? { ...reviewSubject, metadata: { ...reviewSubject.metadata, reviewAttentionState: "stalled" } }
-            : reviewSubject,
+            : reviewStage
+              ? { ...reviewSubject, metadata: { ...reviewSubject.metadata, reviewStage } }
+              : reviewSubject,
           whyNow: stalled
             ? "Issue is in review without a maintained reviewer, interaction, approval, monitor, run, wake, or recovery path."
             : pendingApprovalId
             ? "Issue is in review with a linked pending approval."
             : hasHumanParticipant
               ? "Issue is in review and the current execution participant is a user."
-              : "Issue is in review and assigned to a user.",
+              : participantMismatch
+                ? "Issue is assigned to a user, but its review stage is waiting on an agent participant. Only that participant can approve or request changes."
+                : "Issue is in review and assigned to a user.",
           decisionVerbs: stalled
             ? decisionVerbs(
                 { id: "choose_review_path", label: "Choose review path", description: "Add a reviewer or waiting path, return the issue to work, or accept it." },
@@ -1856,7 +1881,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
                 { id: "approve", label: "Approve", description: "Approve the review and advance the issue." },
                 { id: "request_changes", label: "Request changes", description: "Return the issue to the assignee with changes requested." },
               ),
-          inlineResolvable: stalled,
+          inlineResolvable: stalled || stageParticipantDecision,
           entryRule: stalled
             ? "issues.status = 'in_review' and reviewAttention.state = 'stalled'."
             : "issues.status = 'in_review' and human reviewer, user assignee, or linked pending approval exists.",
