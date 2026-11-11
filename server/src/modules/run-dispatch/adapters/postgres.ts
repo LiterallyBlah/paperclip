@@ -33,6 +33,7 @@ import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../..
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
 import { issueService } from "../../../services/issues.js";
+import { ADDRESSED_QUESTION_CONTEXT_KEY, readAddressedInteractionForWake } from "../../../services/addressed-interaction-wake.js";
 import {
   issueTreeControlService,
   isVerifiedIssueTreeControlInteractionWake,
@@ -218,8 +219,15 @@ export function createPostgresRunDispatchAdapter(
       // Already-admitted ordinary work owes the budget/run gate, not another
       // continuation or chat-control issue lock. Its authority is captured on
       // the run and reservation; protected recovery retains its admission.
-      const hintedIssueId = input.enforceContinuationOwnership === false ? null
-        : readNonEmptyString(parseObject(hint.contextSnapshot).issueId);
+      // A question run owns no task lock but must not outlive its card, so it
+      // still serializes with a human answer on the issue row.
+      const issueIdToLock = (contextSnapshot: unknown) => {
+        const context = parseObject(contextSnapshot);
+        return input.enforceContinuationOwnership === false && !readNonEmptyString(context[ADDRESSED_QUESTION_CONTEXT_KEY])
+          ? null
+          : readNonEmptyString(context.issueId);
+      };
+      const hintedIssueId = issueIdToLock(hint.contextSnapshot);
 
       const locked = async (typedTx: Db, publications: ActivityPublication[]) => {
         // Recovery always takes coordinator before issue/run. Only the
@@ -246,9 +254,7 @@ export function createPostgresRunDispatchAdapter(
           .then((rows) => rows[0] ?? null);
         if (!run) return { kind: "missing" as const };
 
-        const lockedIssueId = input.enforceContinuationOwnership === false ? null
-          : readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-        if (lockedIssueId !== hintedIssueId) return { kind: "retry" as const };
+        if (issueIdToLock(run.contextSnapshot) !== hintedIssueId) return { kind: "retry" as const };
         return { kind: "value" as const, value: await operation(typedTx, run, publications) };
       };
       const result: { kind: "missing" | "retry" } | { kind: "value"; value: T } = mode === "accounting"
@@ -552,10 +558,19 @@ export function createPostgresRunDispatchAdapter(
     );
 
     const wakeCommentId = deriveCommentId(context);
-    const isInteractionWake = allowsIssueInteractionWake(
-      context,
-      ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-    );
+    const addressedQuestion = issue
+      ? await readAddressedInteractionForWake(dbOrTx, {
+          companyId: input.companyId,
+          issueId,
+          agentId: input.agentId,
+          contextSnapshot: context,
+        })
+      : null;
+    const addressedQuestionInteractionId =
+      addressedQuestion && issue?.assigneeAgentId !== input.agentId ? addressedQuestion.id : null;
+    const isInteractionWake =
+      allowsIssueInteractionWake(context, ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS) ||
+      addressedQuestion !== null;
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason =
@@ -632,6 +647,17 @@ export function createPostgresRunDispatchAdapter(
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
+      isPendingInteractionAddresseeWake: addressedQuestion !== null,
+      addressedQuestionInteractionId,
+      addressedQuestionInvalidated: Boolean(
+        issue &&
+          !addressedQuestion &&
+          issue.assigneeAgentId !== input.agentId &&
+          (readNonEmptyString(context[ADDRESSED_QUESTION_CONTEXT_KEY]) ||
+            // A busy-retry flag cannot stand in for the origin a question run needs.
+            (context.source === "issue.interaction.created" &&
+              isNonAssigneeWorkspaceBusyRetry(retryReason, context))),
+      ),
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
@@ -1127,6 +1153,12 @@ export function createPostgresRunDispatchAdapter(
               ...parseObject(run.runnerProfileJson),
               aiConnectionNonAssigneeCommentWake: facts.issueAssigneeAgentId !== run.agentId,
             },
+            ...(facts.addressedQuestionInteractionId
+              ? { contextSnapshot: {
+                  ...parseObject(run.contextSnapshot),
+                  [ADDRESSED_QUESTION_CONTEXT_KEY]: facts.addressedQuestionInteractionId,
+                } }
+              : {}),
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
         }
         return { outcome: "not_stale" as const };
@@ -1150,6 +1182,37 @@ export function createPostgresRunDispatchAdapter(
     );
   }
 
+  /**
+   * A run admitted only to answer a card may reach the provider only while it
+   * can still answer that card. Deliberately separate from the continuation
+   * gate, which requires owning the issue execution lock.
+   */
+  async function cancelInvalidatedAddressedQuestion(
+    tx: Db,
+    run: HeartbeatRun,
+    expectedStatus: "queued" | "running",
+    now: Date,
+  ) {
+    const context = parseObject(run.contextSnapshot);
+    const interactionId = readNonEmptyString(context[ADDRESSED_QUESTION_CONTEXT_KEY]);
+    const issueId = readNonEmptyString(context.issueId);
+    if (!interactionId || !issueId) return null;
+    const current = await readAddressedInteractionForWake(tx, {
+      companyId: run.companyId,
+      issueId,
+      agentId: run.agentId,
+      contextSnapshot: context,
+      lockCard: true,
+    });
+    if (current?.id === interactionId) return null;
+    return cancelStaleRunInTx(tx, run, issueId, {
+      stale: true,
+      errorCode: "issue_interaction_not_pending",
+      reason: "Cancelled because the question this run was admitted to answer is no longer open to it",
+      details: { issueId, interactionId },
+    }, expectedStatus, now, true);
+  }
+
   async function dispatchResolvedInteractionIfCurrent<T>(
     input: DispatchResolvedInteractionInput<T>,
   ): Promise<DispatchResolvedInteractionOutcome<T>> {
@@ -1157,6 +1220,8 @@ export function createPostgresRunDispatchAdapter(
       if (run.status !== input.expectedStatus || run.resultJson?.cancellation || run.resultJson?.startupCancellation) {
         return { dispatched: false as const, cancellation: { outcome: "lost_race" as const } };
       }
+      const invalidatedQuestion = await cancelInvalidatedAddressedQuestion(tx, run, input.expectedStatus, input.now);
+      if (invalidatedQuestion) return { dispatched: false as const, cancellation: invalidatedQuestion };
       if (input.enforceContinuationOwnership !== false) {
         const { issueId, decision: initialDecision } = await decideCurrentRunStaleness(
           tx,
@@ -1246,6 +1311,8 @@ export function createPostgresRunDispatchAdapter(
         || claim.reservationId !== admission.claim.reservationId || claim.recoveryLeaseOwner !== admission.claim.recoveryLeaseOwner
         || claim.admittedAt !== admission.claim.admittedAt || claim.handedOffAt)
         return { dispatched: false as const, cancellation: { outcome: "lost_race" as const } };
+      const invalidatedQuestion = await cancelInvalidatedAddressedQuestion(tx, run, input.expectedStatus, input.now);
+      if (invalidatedQuestion) return { dispatched: false as const, cancellation: invalidatedQuestion };
 
       const [scope] = await tx.select({ companyStatus: companies.status, agentStatus: agents.status,
         lifecycleState: agents.lifecycleState, reservationId: budgetReservations.id,

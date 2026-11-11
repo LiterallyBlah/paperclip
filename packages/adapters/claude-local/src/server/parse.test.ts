@@ -147,6 +147,36 @@ describe("detectClaudeLoginRequired", () => {
   });
 });
 
+describe("detectClaudeLoginRequired scope", () => {
+  const toolEvent = (text: string) =>
+    JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: text }] } });
+
+  it.each(["unauthorized", "not logged in", "authentication required"])(
+    "ignores %s in tool output of a successful result", (phrase) => {
+      expect(detectClaudeLoginRequired({
+        parsed: { is_error: false, subtype: "success", result: "done" },
+        stdout: toolEvent(`grep output: ${phrase}`),
+        stderr: "",
+      }).requiresLogin).toBe(false);
+    });
+
+  it("ignores a login phrase on stderr of a successful result", () => {
+    expect(detectClaudeLoginRequired({
+      parsed: { is_error: false, subtype: "success", result: "done" },
+      stdout: "",
+      stderr: "MCP server: unauthorized",
+    }).requiresLogin).toBe(false);
+  });
+
+  it("still detects a login prompt in a failed result", () => {
+    expect(detectClaudeLoginRequired({
+      parsed: { is_error: true, subtype: "success", result: "Not logged in · Please run /login" },
+      stdout: toolEvent("unrelated"),
+      stderr: "",
+    }).requiresLogin).toBe(true);
+  });
+});
+
 describe("isClaudeModelNotFoundError", () => {
   it("detects model resolution failures from structured and fallback output", () => {
     expect(isClaudeModelNotFoundError({

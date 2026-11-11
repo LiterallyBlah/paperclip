@@ -5,11 +5,11 @@ import {
   asBoolean,
   parseObject,
   parseJson,
+  MAX_CAPTURE_BYTES,
 } from "@paperclipai/adapter-utils/server-utils";
 
-// The legacy login-prompt markers. The Claude CLI prints these words when it
-// asks the user to log in. The detector matches them against any probe output
-// line, which includes the raw stdout and stderr. This scope is pre-existing.
+// The login-prompt markers. The Claude CLI prints these words when it asks the
+// user to log in. See detectClaudeLoginRequired for the output they may match.
 const CLAUDE_LOGIN_PROMPT_RE =
   /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
@@ -247,10 +247,21 @@ export function detectClaudeLoginRequired(input: {
   const parsed = input.parsed ?? null;
   const resultText = asString(parsed?.result, "").trim();
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // The login-prompt markers match only Claude's own failure output: the parsed
+  // terminal fields (result, error, errors) and stderr of a failed result, or,
+  // when there is no terminal result, stderr and the non-JSON stdout lines. Stream-json events
+  // carry assistant text and tool output, so they never count, and a successful
+  // result never counts even if the process is later killed.
+  const failedResult = parsed !== null && claudeResultIndicatesAuthFailure(parsed);
+  const successResult = parsed !== null && !failedResult &&
+    asString(parsed.subtype, "").trim().toLowerCase() === "success";
+  const stdoutLines = input.stdout.split(/\r?\n/);
+  // At the capture cap the first line may be the tail of a cut record.
+  if (input.stdout.length >= MAX_CAPTURE_BYTES) stdoutLines.shift();
+  const plainStdout = stdoutLines.filter((line) => !line.trim().startsWith("{"));
+  const promptLines = (failedResult
+    ? [collectClaudeTerminalText(parsed ?? {}), input.stderr]
+    : successResult ? [] : [...plainStdout, input.stderr])
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -265,8 +276,18 @@ export function detectClaudeLoginRequired(input: {
     claudeResultIndicatesAuthFailure(parsed) &&
     CLAUDE_AUTH_TOKEN_FAILURE_RE.test(collectClaudeTerminalText(parsed));
 
+  // The CLI marks its own authentication error on a complete stream event with
+  // top-level metadata, which tool output and assistant text cannot set. It
+  // counts when the result is missing, cut off, or a failure.
+  const cliAuthError = !successResult && stdoutLines.some((line) => {
+    if (!line.trim().startsWith("{")) return false;
+    const event = parseJson(line.trim());
+    return event?.type === "assistant" && event.is_api_error_message === true &&
+      event.error === "authentication_failed";
+  });
+
   return {
-    requiresLogin: loginPrompt || tokenFailure,
+    requiresLogin: loginPrompt || tokenFailure || cliAuthError,
     loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
   };
 }

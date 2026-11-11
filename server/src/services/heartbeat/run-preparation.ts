@@ -1,3 +1,4 @@
+import { buildAddressedInteractionWake } from "../addressed-interaction-wake.js";
 import { skillAccessService } from "../skill-access.js";
 import type { AuthorizationActor } from "../authorization.js";
 import { spekoToolsForSession } from "../voice/speko-agent-tools.js";
@@ -2661,6 +2662,13 @@ export async function buildPaperclipWakePayload(input: {
     : [];
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    addressedInteraction: issueId
+      ? await buildAddressedInteractionWake(input.db, {
+          companyId: input.companyId,
+          issueId,
+          contextSnapshot: input.contextSnapshot,
+        })
+      : null,
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     chatCompletionUpdates: input.contextSnapshot.chatCompletionUpdates ?? null,
     attachmentOmissions,

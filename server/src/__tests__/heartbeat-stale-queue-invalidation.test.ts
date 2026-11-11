@@ -21,6 +21,12 @@ import {
   issues,
 } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
+import { issueService } from "../services/issues.ts";
+import express from "express";
+import request from "supertest";
+import { issueRoutes } from "../routes/issues.ts";
+import { errorHandler } from "../middleware/index.ts";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -35,6 +41,17 @@ import {
 import { runningProcesses } from "../adapters/index.ts";
 import { recoveryService } from "../services/recovery/service.ts";
 import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.ts";
+
+const preparationHook = vi.hoisted(() => ({ current: null as null | ((runId: string) => Promise<unknown>) }));
+vi.mock("../services/heartbeat/run-preparation.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/heartbeat/run-preparation.ts")>();
+  return { ...actual, buildPaperclipWakePayload: async (input: Parameters<typeof actual.buildPaperclipWakePayload>[0]) => {
+    const hook = preparationHook.current;
+    preparationHook.current = null;
+    await hook?.(input.runId!);
+    return actual.buildPaperclipWakePayload(input);
+  } };
+});
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -1834,5 +1851,411 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(1);
     await waitForCondition(async () => claimedIssue !== null);
     expect(claimedIssue).toEqual({ status: "in_progress", executionRunId: runId });
+  });
+
+  describe("interaction_pending addressee wakes on another assignee's issue", () => {
+    async function seedAddresseeFixture() {
+      const { companyId, agentId: assigneeAgentId } = await seedCompanyAndAgent({ agentName: "Assignee" });
+      const addresseeAgentId = randomUUID();
+      const otherAgentId = randomUUID();
+      for (const [id, name] of [[addresseeAgentId, "Addressee"], [otherAgentId, "Bystander"]] as const) {
+        await db.insert(agents).values({ id, companyId, name, role: "engineer", status: "active",
+          adapterType: "codex_local", adapterConfig: {},
+          runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {} });
+      }
+      const [issue] = await db.insert(issues).values({ companyId, title: "Assignee asks another agent",
+        status: "in_progress", priority: "medium", assigneeAgentId }).returning();
+      return { companyId, assigneeAgentId, addresseeAgentId, otherAgentId, issueId: issue.id };
+    }
+
+    async function seedInteraction(input: {
+      companyId: string; issueId: string; addresseeAgentId: string | null; createdByAgentId: string;
+      status?: string; dismissed?: boolean; kind?: string; effectiveResolverPolicy?: string;
+    }) {
+      const [row] = await db.insert(issueThreadInteractions).values({
+        companyId: input.companyId, issueId: input.issueId, kind: input.kind ?? "ask_user_questions",
+        status: input.status ?? "pending", continuationPolicy: "wake_assignee",
+        ...(input.effectiveResolverPolicy ? { effectiveResolverPolicy: input.effectiveResolverPolicy } : {}),
+        addresseeAgentId: input.addresseeAgentId, createdByAgentId: input.createdByAgentId,
+        payload: { version: 1, questions: [{ id: "q1", prompt: "Proceed?", selectionMode: "single",
+          options: [{ id: "yes", label: "Yes" }] }] } as never,
+        dismissedAt: input.dismissed ? new Date() : null,
+      }).returning();
+      return row.id;
+    }
+
+    // The exact payload and context the interaction-creation route sends.
+    function routeWake(issueId: string, interactionId: string, requestedByActorId: string) {
+      return {
+        source: "automation" as const, triggerDetail: "system" as const, reason: "interaction_pending",
+        payload: { issueId, interactionId, interactionKind: "ask_user_questions", sourceCommentId: null,
+          sourceRunId: null, mutation: "interaction" },
+        idempotencyKey: `interaction-pending:${interactionId}`,
+        requestedByActorType: "agent" as const, requestedByActorId,
+        contextSnapshot: { issueId, taskId: issueId, interactionId, interactionKind: "ask_user_questions",
+          sourceCommentId: null, sourceRunId: null, wakeReason: "interaction_pending",
+          source: "issue.interaction.created" },
+      };
+    }
+
+    async function settledRun(runId: string) {
+      await waitForCondition(async () => {
+        const run = await heartbeat.getRun(runId);
+        return run?.status !== "queued" && run?.status !== "running";
+      });
+      await heartbeat.drainActiveRunExecutions();
+      return heartbeat.getRun(runId);
+    }
+
+    it("runs the named addressee's queued wake through the real wakeup intake and claim", async () => {
+      const f = await seedAddresseeFixture();
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId });
+      const queued = await heartbeat.wakeup(f.addresseeAgentId, routeWake(f.issueId, interactionId, f.assigneeAgentId));
+      expect(queued?.id).toBeTruthy();
+      const run = await settledRun(queued!.id);
+      expect(run).toMatchObject({ status: "succeeded" });
+      expect(run?.errorCode ?? null).toBeNull();
+      expect(countExecuteCallsForRun(queued!.id)).toBe(1);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      // The addressee answers without taking the assignee's ownership or execution lock.
+      expect(issue).toMatchObject({ assigneeAgentId: f.assigneeAgentId, status: "in_progress" });
+      expect(issue.executionRunId).not.toBe(queued!.id);
+      expect(issue.checkoutRunId).not.toBe(queued!.id);
+    });
+
+    it("runs an already-queued addressee wake when it is promoted later", async () => {
+      const f = await seedAddresseeFixture();
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId });
+      const { runId } = await seedQueuedRun({ companyId: f.companyId, agentId: f.addresseeAgentId, issueId: f.issueId,
+        wakeReason: "interaction_pending", invocationSource: "automation",
+        contextExtras: { interactionId, interactionKind: "ask_user_questions", sourceCommentId: null,
+          source: "issue.interaction.created" } });
+      await heartbeat.resumeQueuedRuns();
+      expect(await settledRun(runId)).toMatchObject({ status: "succeeded" });
+      expect(countExecuteCallsForRun(runId)).toBe(1);
+    });
+
+    type Fixture = Awaited<ReturnType<typeof seedAddresseeFixture>>;
+    const negativeCases: Array<{
+      name: string;
+      // Returns the run agent, wake reason and interaction id to queue, after any state change.
+      arrange: (f: Fixture) => Promise<{ agentId: string; wakeReason?: string; interactionId?: string | null }>;
+    }> = [
+      { name: "a different agent than the addressee", arrange: async (f) => ({ agentId: f.otherAgentId,
+        interactionId: await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+          addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId }) }) },
+      { name: "an interaction on a different issue", arrange: async (f) => {
+        const [other] = await db.insert(issues).values({ companyId: f.companyId, title: "Other issue",
+          status: "in_progress", priority: "medium", assigneeAgentId: f.assigneeAgentId }).returning();
+        return { agentId: f.addresseeAgentId, interactionId: await seedInteraction({ companyId: f.companyId,
+          issueId: other.id, addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId }) };
+      } },
+      { name: "an interaction in a different company", arrange: async (f) => {
+        const other = await seedCompanyAndAgent({ agentName: "Foreign assignee" });
+        const [foreignIssue] = await db.insert(issues).values({ companyId: other.companyId, title: "Foreign issue",
+          status: "in_progress", priority: "medium", assigneeAgentId: other.agentId }).returning();
+        return { agentId: f.addresseeAgentId, interactionId: await seedInteraction({ companyId: other.companyId,
+          issueId: foreignIssue.id, addresseeAgentId: f.addresseeAgentId, createdByAgentId: other.agentId }) };
+      } },
+      { name: "an unknown interaction id", arrange: async (f) => ({ agentId: f.addresseeAgentId, interactionId: randomUUID() }) },
+      { name: "a missing interaction id", arrange: async (f) => ({ agentId: f.addresseeAgentId, interactionId: null }) },
+      { name: "a malformed interaction id", arrange: async (f) => ({ agentId: f.addresseeAgentId, interactionId: "not-a-uuid" }) },
+      ...(["answered", "accepted", "rejected", "cancelled", "expired", "failed", "withdrawn"] as const).map((status) => ({
+        name: `an interaction that is now ${status}`,
+        arrange: async (f: Fixture) => ({ agentId: f.addresseeAgentId, interactionId: await seedInteraction({
+          companyId: f.companyId, issueId: f.issueId, addresseeAgentId: f.addresseeAgentId,
+          createdByAgentId: f.assigneeAgentId, status }) }),
+      })),
+      { name: "a dismissed pending interaction", arrange: async (f) => ({ agentId: f.addresseeAgentId,
+        interactionId: await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+          addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId, dismissed: true }) }) },
+      { name: "an interaction without an agent addressee", arrange: async (f) => ({ agentId: f.addresseeAgentId,
+        interactionId: await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+          addresseeAgentId: null, createdByAgentId: f.assigneeAgentId }) }) },
+      { name: "an unrelated wake reason that carries a pending interaction id", arrange: async (f) => ({
+        agentId: f.addresseeAgentId, wakeReason: "issue_status_changed",
+        interactionId: await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+          addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId }) }) },
+      { name: "an ordinary assignment wake after reassignment", arrange: async (f) => ({
+        agentId: f.addresseeAgentId, wakeReason: "issue_assigned", interactionId: null }) },
+    ];
+
+    it.each(negativeCases)("still cancels the queued wake for $name as issue_assignee_changed", async ({ arrange }) => {
+      const f = await seedAddresseeFixture();
+      const { agentId, wakeReason, interactionId } = await arrange(f);
+      const { runId } = await seedQueuedRun({ companyId: f.companyId, agentId, issueId: f.issueId,
+        wakeReason: wakeReason ?? "interaction_pending", invocationSource: "automation",
+        contextExtras: { ...(interactionId ? { interactionId } : {}), interactionKind: "ask_user_questions",
+          sourceCommentId: null, source: "issue.interaction.created" } });
+      await heartbeat.resumeQueuedRuns();
+      expect(await settledRun(runId)).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+    });
+
+    it("revalidates at promotion: an ask answered after the wake was queued no longer exempts it", async () => {
+      const f = await seedAddresseeFixture();
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId });
+      const { runId } = await seedQueuedRun({ companyId: f.companyId, agentId: f.addresseeAgentId, issueId: f.issueId,
+        wakeReason: "interaction_pending", invocationSource: "automation",
+        contextExtras: { interactionId, interactionKind: "ask_user_questions", source: "issue.interaction.created" } });
+      await db.update(issueThreadInteractions).set({ status: "answered", resolvedAt: new Date() })
+        .where(eq(issueThreadInteractions.id, interactionId));
+      await heartbeat.resumeQueuedRuns();
+      expect(await settledRun(runId)).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+    });
+
+    it("answers the question and finishes without taking the task", async () => {
+      const f = await seedAddresseeFixture();
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId });
+      const [before] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      let checkoutStatus: number | null = null;
+      let wakePayload: Record<string, unknown> = {};
+      mockAdapterExecute.mockImplementationOnce(async ({ runId, context }: {
+        runId: string; context: { paperclipWake: Record<string, unknown> };
+      }) => {
+        wakePayload = context.paperclipWake;
+        // The addressee is still refused the task itself (#16563's 409).
+        await issueService(db).checkout(f.issueId, f.addresseeAgentId, ["in_progress"], runId)
+          .catch((err) => { checkoutStatus = err.status; });
+        await issueThreadInteractionService(db).answerQuestions(
+          { id: f.issueId, companyId: f.companyId, status: "in_progress" }, interactionId,
+          { answers: [{ questionId: "q1", optionIds: ["yes"] }] }, { agentId: f.addresseeAgentId, runId });
+        return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, provider: "test", model: "test" };
+      });
+
+      const queued = await heartbeat.wakeup(f.addresseeAgentId, routeWake(f.issueId, interactionId, f.assigneeAgentId));
+      const run = await settledRun(queued!.id);
+
+      expect(run).toMatchObject({ status: "succeeded", errorCode: null });
+      expect(checkoutStatus).toBe(409);
+      expect(wakePayload.addressedInteraction).toEqual({
+        id: interactionId, kind: "ask_user_questions", readPath: `/api/issues/${f.issueId}/interactions`,
+        answerPaths: [`/api/issues/${f.issueId}/interactions/${interactionId}/respond`],
+      });
+      const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+      expect(card.status).toBe("answered");
+      const [after] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      expect(after).toMatchObject({ assigneeAgentId: f.assigneeAgentId, status: before.status,
+        checkoutRunId: before.checkoutRunId, executionRunId: before.executionRunId });
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toEqual([]);
+    });
+
+    it("runs an addressed wake past another in-review participant", async () => {
+      const f = await seedAddresseeFixture();
+      await db.update(issues).set({ status: "in_review", executionState: { status: "pending",
+        currentStageType: "review", currentParticipant: { type: "agent", agentId: f.otherAgentId } } as never })
+        .where(eq(issues.id, f.issueId));
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId });
+      const { runId } = await seedQueuedRun({ companyId: f.companyId, agentId: f.addresseeAgentId, issueId: f.issueId,
+        wakeReason: "interaction_pending", invocationSource: "automation",
+        contextExtras: { interactionId, interactionKind: "ask_user_questions", source: "issue.interaction.created" } });
+      await heartbeat.resumeQueuedRuns();
+      expect(await settledRun(runId)).toMatchObject({ status: "succeeded" });
+    });
+
+    // Rewritten from Oracle's "keeps the dependency gate" test for the owner's choice: the question runs, answer-only.
+    it("runs an addressed wake on a dependency-blocked issue, in bounded interaction mode", async () => {
+      const f = await seedAddresseeFixture();
+      const [blocker] = await db.insert(issues).values({ companyId: f.companyId, title: "Unfinished blocker",
+        status: "todo", priority: "medium", assigneeAgentId: f.assigneeAgentId }).returning();
+      await db.execute(sql`INSERT INTO issue_relations (company_id, issue_id, related_issue_id, type)
+        VALUES (${f.companyId}, ${blocker.id}, ${f.issueId}, 'blocks')`);
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId });
+      const queued = await heartbeat.wakeup(f.addresseeAgentId, routeWake(f.issueId, interactionId, f.assigneeAgentId));
+      const run = await settledRun(queued!.id);
+      expect(run).toMatchObject({ status: "succeeded" });
+      expect(run?.contextSnapshot).toMatchObject({ dependencyBlockedInteraction: true });
+      expect(countExecuteCallsForRun(queued!.id)).toBe(1);
+    });
+
+    it("keeps the dependency gate for a question that is no longer pending", async () => {
+      const f = await seedAddresseeFixture();
+      const [blocker] = await db.insert(issues).values({ companyId: f.companyId, title: "Unfinished blocker",
+        status: "todo", priority: "medium", assigneeAgentId: f.assigneeAgentId }).returning();
+      await db.execute(sql`INSERT INTO issue_relations (company_id, issue_id, related_issue_id, type)
+        VALUES (${f.companyId}, ${blocker.id}, ${f.issueId}, 'blocks')`);
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId, status: "answered" });
+      const { runId } = await seedQueuedRun({ companyId: f.companyId, agentId: f.addresseeAgentId, issueId: f.issueId,
+        wakeReason: "interaction_pending", invocationSource: "automation",
+        contextExtras: { interactionId, interactionKind: "ask_user_questions", source: "issue.interaction.created" } });
+      await heartbeat.resumeQueuedRuns();
+      expect(await settledRun(runId)).toMatchObject({ status: "cancelled", errorCode: "issue_dependencies_blocked" });
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+    });
+
+    async function seedOriginRun(f: Fixture, interactionId: string, agentId = f.addresseeAgentId) {
+      const { runId } = await seedQueuedRun({ companyId: f.companyId, agentId, issueId: f.issueId,
+        wakeReason: "interaction_pending", invocationSource: "automation",
+        contextExtras: { interactionId, interactionKind: "ask_user_questions", source: "issue.interaction.created" } });
+      await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      return runId;
+    }
+
+    function queueRetry(f: Fixture, interactionId: string, retryOfRunId: string, extra: Record<string, unknown> = {}) {
+      return seedQueuedRun({ companyId: f.companyId, agentId: f.addresseeAgentId, issueId: f.issueId,
+        wakeReason: "ai_connection_busy", invocationSource: "automation",
+        contextExtras: { interactionId, interactionKind: "ask_user_questions", source: "issue.interaction.created",
+          retryOfRunId, retryReason: "ai_connection_busy", ...extra } });
+    }
+
+    const expectNeverDispatched = async (runId: string, errorCode: string) => {
+      expect(await settledRun(runId)).toMatchObject({ status: "cancelled", errorCode });
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+    };
+
+    it("still tells a busy-retry of an addressed wake to answer, not to take the task", async () => {
+      const f = await seedAddresseeFixture();
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId });
+      const originRunId = await seedOriginRun(f, interactionId);
+      const { runId } = await queueRetry(f, interactionId, originRunId, { aiConnectionBusyDeferredWhileAssignee: false });
+      await heartbeat.resumeQueuedRuns();
+      expect(await settledRun(runId)).toMatchObject({ status: "succeeded" });
+      const call = mockAdapterExecute.mock.calls.find(([context]) => context?.runId === runId)!;
+      expect(call[0].context.paperclipWake.addressedInteraction).toMatchObject({ id: interactionId });
+    });
+
+    it.each([
+      ["a fabricated origin run", async () => randomUUID()],
+      ["an origin run of another agent", async (f: Fixture, interactionId: string) => seedOriginRun(f, interactionId, f.otherAgentId)],
+    ])("rejects a retry marker naming %s", async (_name, retryOf) => {
+      const f = await seedAddresseeFixture();
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId });
+      const { runId } = await queueRetry(f, interactionId, await retryOf(f, interactionId));
+      await heartbeat.resumeQueuedRuns();
+      await expectNeverDispatched(runId, "issue_assignee_changed");
+    });
+
+    it("fabricated-busy-retry: does not let the busy-retry flag replace a question's origin", async () => {
+      const f = await seedAddresseeFixture();
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId });
+      const { runId } = await queueRetry(f, interactionId, randomUUID(), { aiConnectionBusyDeferredWhileAssignee: false });
+      await heartbeat.resumeQueuedRuns();
+      await expectNeverDispatched(runId, "issue_interaction_not_pending");
+    });
+
+    it("stops a retry whose admitted question was answered, even with busy-retry authority", async () => {
+      const f = await seedAddresseeFixture();
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId, status: "answered" });
+      const originRunId = await seedOriginRun(f, interactionId);
+      const { runId } = await queueRetry(f, interactionId, originRunId, {
+        aiConnectionBusyDeferredWhileAssignee: false, addressedQuestionInteractionId: interactionId });
+      await heartbeat.resumeQueuedRuns();
+      await expectNeverDispatched(runId, "issue_interaction_not_pending");
+    });
+
+    it.each([
+      ["a human-only card", { effectiveResolverPolicy: "human_only" }],
+      ["an unanswerable card kind", { kind: "connection_intent" }],
+    ])("does not run for %s", async (_name, card) => {
+      const f = await seedAddresseeFixture();
+      const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+        addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId, ...card });
+      const { runId } = await seedQueuedRun({ companyId: f.companyId, agentId: f.addresseeAgentId, issueId: f.issueId,
+        wakeReason: "interaction_pending", invocationSource: "automation",
+        contextExtras: { interactionId, interactionKind: card.kind ?? "ask_user_questions", source: "issue.interaction.created" } });
+      await heartbeat.resumeQueuedRuns();
+      await expectNeverDispatched(runId, "issue_assignee_changed");
+    });
+
+    describe("when the question changes during preparation", () => {
+      const cases: Array<[string, (f: Fixture, interactionId: string, runId: string) => Promise<unknown>]> = [
+        ["answered through the answer service", (f, interactionId, runId) => issueThreadInteractionService(db).answerQuestions(
+          { id: f.issueId, companyId: f.companyId, status: "in_progress" }, interactionId,
+          { answers: [{ questionId: "q1", optionIds: ["yes"] }] }, { agentId: f.addresseeAgentId, runId })],
+        ["dismissed through the interaction service", (f, interactionId) => issueThreadInteractionService(db).dismissInteraction(
+          { id: f.issueId, companyId: f.companyId }, interactionId, { userId: "board-user" })],
+        ["readdressed to another agent", (f, interactionId) => db.update(issueThreadInteractions)
+          .set({ addresseeAgentId: f.otherAgentId }).where(eq(issueThreadInteractions.id, interactionId))],
+      ];
+
+      it.each(cases)("stops the run before dispatch when it is %s", async (_name, change) => {
+        const f = await seedAddresseeFixture();
+        const interactionId = await seedInteraction({ companyId: f.companyId, issueId: f.issueId,
+          addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId });
+        preparationHook.current = (runId) => change(f, interactionId, runId);
+        const queued = await heartbeat.wakeup(f.addresseeAgentId, routeWake(f.issueId, interactionId, f.assigneeAgentId));
+        await expectNeverDispatched(queued!.id, "issue_interaction_not_pending");
+        expect(preparationHook.current).toBeNull();
+        const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+        expect(issue.assigneeAgentId).toBe(f.assigneeAgentId);
+      });
+    });
+
+    it("carries a question from the real creation route to the agent's answer", async () => {
+      const f = await seedAddresseeFixture();
+      const routeApp = (agentId: string, runId: string) => {
+        const app = express();
+        app.use(express.json());
+        app.use((req, _res, next) => {
+          req.actor = { type: "agent", agentId, companyId: f.companyId, runId, source: "agent_jwt" } as never;
+          next();
+        });
+        app.use("/api", issueRoutes(db, {} as never));
+        app.use(errorHandler);
+        return app;
+      };
+      const statuses: Record<string, number> = {};
+      let interactionId: string | null = null;
+      mockAdapterExecute.mockImplementation(async ({ runId, context }: {
+        runId: string; context: { paperclipWake?: { addressedInteraction?: { answerPaths: string[]; readPath: string } } };
+      }) => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        if (run.agentId === f.assigneeAgentId && !interactionId) {
+          // The owner's own run asks, as it does in production.
+          const created = await request(routeApp(f.assigneeAgentId, runId))
+            .post(`/api/issues/${f.issueId}/interactions`)
+            .send({ kind: "ask_user_questions", idempotencyKey: `question:${f.issueId}:v1`,
+              addresseeAgentId: f.addresseeAgentId, continuationPolicy: "wake_assignee",
+              payload: { version: 1, questions: [{ id: "q1", prompt: "Proceed?", selectionMode: "single",
+                options: [{ id: "yes", label: "Yes" }] }] } });
+          statuses.create = created.status;
+          interactionId = created.body.id as string;
+        } else if (run.agentId === f.addresseeAgentId) {
+          const app = routeApp(f.addresseeAgentId, runId);
+          const card = context.paperclipWake!.addressedInteraction!;
+          statuses.read = (await request(app).get(card.readPath)).status;
+          statuses.checkout = (await request(app).post(`/api/issues/${f.issueId}/checkout`)
+            .send({ agentId: f.addresseeAgentId, expectedStatuses: ["in_progress"] })).status;
+          statuses.answer = (await request(app).post(card.answerPaths[0]!)
+            .send({ answers: [{ questionId: "q1", optionIds: ["yes"] }] })).status;
+        }
+        return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, provider: "test", model: "test" };
+      });
+
+      const [ownerBefore] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      const asked = await heartbeat.wakeup(f.assigneeAgentId, {
+        source: "automation", triggerDetail: "system", reason: "issue_assigned",
+        payload: { issueId: f.issueId }, requestedByActorType: "system",
+        contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_assigned" },
+      });
+      await settledRun(asked!.id);
+      expect(statuses.create).toBe(201);
+
+      await waitForCondition(async () => (await db.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, f.addresseeAgentId))).length > 0);
+      const [{ id: addresseeRunId }] = await db.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, f.addresseeAgentId));
+      expect(await settledRun(addresseeRunId)).toMatchObject({ status: "succeeded", errorCode: null });
+      expect(statuses).toEqual({ create: 201, read: 200, checkout: 409, answer: 200 });
+
+      const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId!));
+      expect(card).toMatchObject({ status: "answered", resolvedByAgentId: f.addresseeAgentId, resolvedByRunId: addresseeRunId });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      expect(issue.assigneeAgentId).toBe(ownerBefore.assigneeAgentId);
+      expect(issue.status).toBe("in_progress");
+      expect([issue.checkoutRunId, issue.executionRunId]).not.toContain(addresseeRunId);
+    });
   });
 });

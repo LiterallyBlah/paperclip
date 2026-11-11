@@ -20,6 +20,7 @@ import {
   issueDocuments,
   issueRelations,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueTreeHolds,
   issues,
   nativeRunFinalizations,
@@ -31,6 +32,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../../../__tests__/helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
+import { issueThreadInteractionService } from "../../../services/issue-thread-interactions.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { reserveRunBudget } from "../../../services/budget-reservations.js";
@@ -44,6 +46,17 @@ import { costService } from "../../../services/costs.js";
 // feeds the mapped facts back through the real gate to prove the wiring
 // produces the same suppression a caller would have seen before this module
 // existed.
+const finalCardRead = vi.hoisted(() => ({ calls: 0, pause: null as null | (() => Promise<void>) }));
+vi.mock("../../../services/addressed-interaction-wake.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../services/addressed-interaction-wake.js")>();
+  return { ...actual, readAddressedInteractionForWake: async (...args: Parameters<typeof actual.readAddressedInteractionForWake>) => {
+    const result = await actual.readAddressedInteractionForWake(...args);
+    // The dispatch gate reads the card once per phase; the second read is the last.
+    if (finalCardRead.pause && finalCardRead.calls++ === 1) await finalCardRead.pause();
+    return result;
+  } };
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -348,6 +361,64 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(dispatched).toBe(false);
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]![lock]).toBe(competingId);
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, competingId)))[0]?.status).toBe("running");
+  });
+
+  describe("final check of an addressed question", () => {
+    const changes: Array<[string, (f: { issueId: string; companyId: string; otherAgentId: string; interactionId: string }) => Promise<unknown>]> = [
+      ["human answer", (f) => issueThreadInteractionService(db).answerQuestions(
+        { id: f.issueId, companyId: f.companyId, status: "in_progress" }, f.interactionId,
+        { answers: [{ questionId: "q1", optionIds: ["yes"] }] }, { userId: "board-user" })],
+      ["human dismissal", (f) => issueThreadInteractionService(db).dismissInteraction(
+        { id: f.issueId, companyId: f.companyId }, f.interactionId, { userId: "board-user" })],
+      ["retargeting", (f) => db.update(issueThreadInteractions)
+        .set({ addresseeAgentId: f.otherAgentId }).where(eq(issueThreadInteractions.id, f.interactionId))],
+    ];
+
+    it.each(changes)("holds a %s until the provider handoff completes", async (_name, change) => {
+      const { companyId, agentId: addresseeAgentId } = await seedCompanyAndAgent();
+      const ownerAgentId = randomUUID();
+      const otherAgentId = randomUUID();
+      for (const id of [ownerAgentId, otherAgentId]) {
+        await db.insert(agents).values({ id, companyId, name: id, role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+      }
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, assigneeAgentId: ownerAgentId, status: "in_progress" });
+      const interactionId = randomUUID();
+      await db.insert(issueThreadInteractions).values({ id: interactionId, companyId, issueId, kind: "ask_user_questions",
+        status: "pending", continuationPolicy: "wake_assignee", addresseeAgentId, createdByAgentId: ownerAgentId,
+        payload: { version: 1, questions: [{ id: "q1", prompt: "Proceed?", selectionMode: "single", options: [{ id: "yes", label: "Yes" }] }] } as never });
+      const runId = await seedRun({ companyId, agentId: addresseeAgentId, status: "running", contextSnapshot: {
+        issueId, interactionId, wakeReason: "interaction_pending", source: "issue.interaction.created", addressedQuestionInteractionId: interactionId } });
+      const reservation = await reserveRunBudget(db, companyId, runId, null);
+
+      let contender: Promise<unknown> | null = null;
+      let contenderSettled = false;
+      let contenderWaitedOnLock = false;
+      finalCardRead.calls = 0;
+      finalCardRead.pause = async () => {
+        contender = change({ issueId, companyId, otherAgentId, interactionId }).finally(() => { contenderSettled = true; });
+        for (let i = 0; i < 100 && !contenderSettled && !contenderWaitedOnLock; i += 1) {
+          const rows = await db.execute(sql`select 1 from pg_stat_activity where wait_event_type = 'Lock' and datname = current_database()`);
+          contenderWaitedOnLock = rows.length > 0;
+          if (!contenderWaitedOnLock) await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      };
+      let settledAtHandoff: boolean | null = null;
+      try {
+        const adapter = createPostgresRunDispatchAdapter(db);
+        const outcome = await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId, reservationId: reservation.id,
+          expectedStatus: "running", enforceContinuationOwnership: false, now: new Date(),
+          dispatch: async () => { settledAtHandoff = contenderSettled; } });
+        expect(outcome).toMatchObject({ dispatched: true });
+      } finally {
+        finalCardRead.pause = null;
+      }
+
+      expect(contenderWaitedOnLock).toBe(true);
+      expect(settledAtHandoff).toBe(false);
+      await contender;
+      await db.delete(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+    });
   });
 
   it.each(["native_safe_replacement", "native_provider_overloaded"])("does not dispatch %s when the task becomes blocked after scheduling", async retryReason => {
