@@ -4,7 +4,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agents,
   agentWakeupRequests,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -84,6 +86,8 @@ describeEmbeddedPostgres("deferred wake promotion after a queued holder is withd
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-deferred-wake-stale-cancel-");
     db = createDb(tempDb.connectionString);
     await ensureIssueRelationsTable(db);
+    await db.insert(authUsers).values({ id: "responsible-user", name: "Fixture owner", email: "owner@example.test",
+      createdAt: new Date(), updatedAt: new Date() });
     heartbeat = heartbeatService(db);
   }, 60_000);
 
@@ -131,6 +135,8 @@ describeEmbeddedPostgres("deferred wake promotion after a queued holder is withd
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user",
+      status: "active", membershipRole: "member" });
     await db.insert(agents).values([
       {
         id: assigneeAgentId,
@@ -248,6 +254,8 @@ describeEmbeddedPostgres("deferred wake promotion after a queued holder is withd
     const runs = await assigneeRuns(assigneeAgentId, holderRunId);
     expect(runs).toHaveLength(1);
     expect(runs[0]?.wakeupRequestId).toBe(deferred!.id);
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runs[0]!.id)))[0]?.status).toBe("succeeded");
 
     // The exemption is verified against retained evidence, not the row alone.
     await db.insert(heartbeatRunEvents).values({ companyId, runId: holderRunId, agentId: otherAgentId,
@@ -268,8 +276,9 @@ describeEmbeddedPostgres("deferred wake promotion after a queued holder is withd
       addresseeAgentId: otherAgentId,
       resolvedByAgentId: otherAgentId,
       resolvedAt: new Date(),
-      payload: { version: 1, questions: [{ id: "q1", prompt: "Which window?", selectionMode: "single", options: [] }] },
-      result: { version: 1, answers: [{ questionId: "q1", optionIds: [], text: "After the current run." }] },
+      payload: { version: 1, questions: [{ id: "q1", prompt: "Which window?", selectionMode: "single",
+        options: [{ id: "after", label: "After the current run" }] }] },
+      result: { version: 1, answers: [{ questionId: "q1", optionIds: ["after"] }] },
     });
     // The question was answered meanwhile, so the addressee's queued run is
     // obsolete. The assignee's resume wake carries the answered card.
@@ -312,5 +321,7 @@ describeEmbeddedPostgres("deferred wake promotion after a queued holder is withd
     const runs = await assigneeRuns(assigneeAgentId, holderRunId);
     expect(runs).toHaveLength(1);
     expect(runs[0]?.wakeupRequestId).toBe(deferred!.id);
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runs[0]!.id)))[0]?.status).toBe("succeeded");
   });
 });
