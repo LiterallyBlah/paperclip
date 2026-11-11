@@ -12,6 +12,8 @@ import type {
 } from "@paperclipai/adapter-utils";
 import type { MentionOption } from "@/components/MarkdownEditor";
 import { MarkdownBody } from "@/components/MarkdownBody";
+import { InteractionMarkdown } from "@/components/InteractionMarkdown";
+import { isPlainOptionCardClick } from "@/lib/option-card-click";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -131,45 +133,61 @@ function SelectOption({
   disabled: boolean;
   onClick: () => void;
 }) {
+  // The description is Markdown and can hold links and code-block buttons, so
+  // it sits next to the option control instead of inside it (no nested
+  // interactive content). The control references it with aria-describedby,
+  // and a plain click on the description still toggles the option.
+  const descriptionId = description ? `${id}-description` : undefined;
   return (
-    <button
-      type="button"
-      id={id}
-      role={multiple ? "checkbox" : "radio"}
-      aria-checked={selected}
-      disabled={disabled}
+    <div
       className={cn(
-        "tc-question-option flex w-full items-start gap-2 rounded-md px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60",
+        "rounded-md transition-colors has-[>[data-option-control]:focus-visible]:ring-2 has-[>[data-option-control]:focus-visible]:ring-ring",
+        disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
         selected
           ? "bg-foreground/5"
           : recommended
             ? "bg-muted/50"
             : "hover:bg-muted/40",
       )}
-      data-selected={selected ? "true" : "false"}
-      data-recommended={recommended ? "true" : "false"}
-      onClick={onClick}
+      onClick={(event) => {
+        if (!disabled && isPlainOptionCardClick(event)) onClick();
+      }}
     >
-      <span
-        aria-hidden
+      <button
+        type="button"
+        id={id}
+        role={multiple ? "checkbox" : "radio"}
+        aria-checked={selected}
+        aria-describedby={descriptionId}
+        disabled={disabled}
+        data-option-control=""
         className={cn(
-          "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center border",
-          multiple ? "rounded-sm" : "rounded-full",
-          selected
-            ? "border-primary bg-primary text-primary-foreground"
-            : "border-muted-foreground/50",
+          "tc-question-option flex w-full items-start gap-2 px-2.5 pt-2 text-left focus-visible:outline-none disabled:cursor-not-allowed",
+          description ? "pb-0" : "pb-2",
         )}
+        data-selected={selected ? "true" : "false"}
+        data-recommended={recommended ? "true" : "false"}
+        onClick={onClick}
       >
-        {selected ? (
-          multiple ? (
-            <Check className="h-3 w-3" />
-          ) : (
-            <span className="h-1.5 w-1.5 rounded-full bg-current" />
-          )
-        ) : null}
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="flex flex-wrap items-center gap-1.5 text-sm font-medium leading-5 text-foreground">
+        <span
+          aria-hidden
+          className={cn(
+            "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center border",
+            multiple ? "rounded-sm" : "rounded-full",
+            selected
+              ? "border-primary bg-primary text-primary-foreground"
+              : "border-muted-foreground/50",
+          )}
+        >
+          {selected ? (
+            multiple ? (
+              <Check className="h-3 w-3" />
+            ) : (
+              <span className="h-1.5 w-1.5 rounded-full bg-current" />
+            )
+          ) : null}
+        </span>
+        <span className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 text-sm font-medium leading-5 text-foreground">
           <span>{label}</span>
           {recommended ? (
             <span className="rounded-sm bg-background/70 px-1.5 py-0.5 text-(length:--text-micro) font-medium text-muted-foreground">
@@ -177,13 +195,16 @@ function SelectOption({
             </span>
           ) : null}
         </span>
-        {description ? (
-          <span className="block text-xs leading-4 text-muted-foreground">
-            {description}
-          </span>
-        ) : null}
-      </span>
-    </button>
+      </button>
+      {description ? (
+        <div
+          id={descriptionId}
+          className="min-w-0 pb-2 pl-8.5 pr-2.5 text-xs leading-4 text-muted-foreground"
+        >
+          <InteractionMarkdown inheritColor>{description}</InteractionMarkdown>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -216,9 +237,9 @@ export function QuestionResponseSummary({
                   {question.header}
                 </span>
               ) : null}
-              <span className="block text-sm text-foreground">
-                {question.prompt}
-              </span>
+              <div className="min-w-0 text-sm text-foreground">
+                <InteractionMarkdown>{question.prompt}</InteractionMarkdown>
+              </div>
             </dt>
             <dd className="mt-0.5 text-foreground">
               {values.length > 0 ? values.join(", ") : "No answer"}
@@ -289,7 +310,7 @@ function QuestionFormForRequest({
   const [working, setWorking] = useState<"submit" | "cancel" | null>(null);
   const [inputUploading, setInputUploading] = useState(false);
   const [error, setError] = useState<FormError | null>(null);
-  const promptRef = useRef<HTMLParagraphElement>(null);
+  const promptRef = useRef<HTMLDivElement>(null);
   const previousPage = useRef(page);
 
   useEffect(() => {
@@ -561,18 +582,23 @@ function QuestionFormForRequest({
             {question.header}
           </p>
         ) : null}
-        <p
+        <div
           ref={promptRef}
           tabIndex={-1}
           id={`${id}-${question.id}-prompt`}
-          className="text-sm font-medium leading-5 text-foreground"
+          className="min-w-0 text-sm leading-5 text-foreground"
         >
-          {question.prompt}
-        </p>
+          <InteractionMarkdown>{question.prompt}</InteractionMarkdown>
+        </div>
+        {/* Named "<prefix> <rendered prompt text>" through aria-labelledby,
+            so the accessible name has no raw Markdown syntax. */}
+        <span id={`${id}-${question.id}-filter-label`} hidden>
+          Filter choices for
+        </span>
         {question.helpText ? (
-          <p className="mt-1 text-xs leading-4 text-muted-foreground">
-            {question.helpText}
-          </p>
+          <div className="mt-1 min-w-0 text-xs leading-4 text-muted-foreground">
+            <InteractionMarkdown inheritColor>{question.helpText}</InteractionMarkdown>
+          </div>
         ) : null}
       </div>
       {question.answerMode === "text" ? (
@@ -591,7 +617,7 @@ function QuestionFormForRequest({
             onSubmit={() => {
               if (!inputUploading && currentError == null) progressOrSubmit();
             }}
-            attachAriaLabel={`Attach image to answer for ${question.prompt}`}
+            attachAriaLabel="Attach image to this answer"
           />
         </div>
       ) : (
@@ -615,7 +641,7 @@ function QuestionFormForRequest({
                   }))
                 }
                 placeholder="Filter choices"
-                aria-label={`Filter choices for ${question.prompt}`}
+                aria-labelledby={`${id}-${question.id}-filter-label ${id}-${question.id}-prompt`}
                 className="pl-8"
               />
             </label>
@@ -663,7 +689,7 @@ function QuestionFormForRequest({
                     if (!inputUploading && currentError == null)
                       progressOrSubmit();
                   }}
-                  attachAriaLabel={`Attach image to other answer for ${question.prompt}`}
+                  attachAriaLabel="Attach image to the other answer"
                 />
               ) : null}
             </div>

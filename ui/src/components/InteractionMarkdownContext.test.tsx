@@ -18,6 +18,7 @@ import {
   answeredAskUserQuestionsInteraction,
   pendingAskUserQuestionsInteraction,
   pendingAskUserQuestionsWithFreeTextOption,
+  genericPendingRequestConfirmationInteraction,
   pendingRequestCheckboxConfirmationInteraction,
   pendingRequestConfirmationInteraction,
 } from "../fixtures/issueThreadInteractionFixtures";
@@ -26,6 +27,7 @@ import { TooltipProvider } from "./ui/tooltip";
 import { IssueThreadInteractionCard } from "./IssueThreadInteractionCard";
 import { AttentionInteractionResolver } from "./AttentionInteractionResolver";
 import { DecisionCard } from "./DecisionCard";
+import { TaskChatInteractionCard } from "./task-chat/TaskChatInteractionCard";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -286,6 +288,50 @@ describe("Markdown decision context in the thread card", () => {
     const group = checkboxHost.querySelector('[aria-label="Selectable options"]')!;
     expect(group.querySelector("ul li code")?.textContent).toBe("cache-key");
     expect(group.textContent).not.toContain("**");
+  });
+});
+
+describe("Markdown decision context on the task page (task chat)", () => {
+  function taskChatItem(interaction: typeof questionInteraction | typeof genericPendingRequestConfirmationInteraction) {
+    return { kind: "interaction", id: interaction.id, interaction } as unknown as Parameters<typeof TaskChatInteractionCard>[0]["item"];
+  }
+
+  it("renders a Markdown question prompt, help text and option descriptions in the question form", async () => {
+    const submit = vi.fn(async () => undefined);
+    const host = mount(
+      <TaskChatInteractionCard item={taskChatItem(questionInteraction)} presentation="takeover" onSubmitInteractionAnswers={submit} />,
+    );
+    const prompt = host.querySelector<HTMLElement>('[id$="-storage-prompt"]')!;
+    expect(prompt).toBeTruthy();
+    expectRenderedContext(prompt);
+    expect(prompt.className).not.toContain("font-medium");
+    const help = prompt.parentElement!.querySelector<HTMLElement>(":scope > div:not([id])");
+    expect(help?.querySelector("strong")?.textContent).toBe("one");
+
+    const radio = host.querySelector<HTMLButtonElement>('[role="radio"][id$="-storage-shared"]')!;
+    expect(radio.querySelector("a, button, .paperclip-markdown")).toBeNull();
+    const description = document.getElementById(radio.getAttribute("aria-describedby")!)!;
+    expect(description.querySelector("strong")?.textContent).toBe("shared");
+    expect(description.querySelector("ul li code")?.textContent).toBe("cache-key");
+
+    // Clicking the plain description selects the option; a link inside it does not.
+    const link = description.querySelector("a")!;
+    link.addEventListener("click", (event) => event.preventDefault());
+    act(() => link.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+    expect(radio.getAttribute("aria-checked")).toBe("false");
+    act(() => description.querySelector("p")!.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(radio.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("renders a Markdown confirmation prompt in the compact task card", () => {
+    const confirmation = {
+      ...genericPendingRequestConfirmationInteraction,
+      payload: { ...genericPendingRequestConfirmationInteraction.payload, prompt: MARKDOWN_CONTEXT },
+    };
+    const host = mount(
+      <TaskChatInteractionCard item={taskChatItem(confirmation)} presentation="takeover" onAcceptInteraction={vi.fn()} />,
+    );
+    expectRenderedContext(host.querySelector<HTMLElement>(".paperclip-markdown-compact")!);
   });
 });
 
