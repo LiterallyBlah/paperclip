@@ -173,6 +173,7 @@ describeEmbeddedPostgres("attention service", () => {
     createdAt?: Date;
     unblockDescriptor?: { owner: { userId: string } | { agentId: string } | "board"; action: string } | null;
     blockedTransitionAt?: Date | null;
+    blockedOwnerNotifiedAt?: Date | null;
     visibility?: "open" | "private";
     privacyRootIssueId?: string | null;
     responsibleUserId?: string | null;
@@ -199,6 +200,7 @@ describeEmbeddedPostgres("attention service", () => {
       executionState: input.executionState ?? null,
       unblockDescriptor: input.unblockDescriptor ?? null,
       blockedTransitionAt: input.blockedTransitionAt ?? null,
+      blockedOwnerNotifiedAt: input.blockedOwnerNotifiedAt ?? null,
       visibility: input.visibility ?? "open",
       privacyRootIssueId: input.privacyRootIssueId ?? null,
       responsibleUserId: input.responsibleUserId ?? null,
@@ -2191,6 +2193,7 @@ describeEmbeddedPostgres("attention service", () => {
         assigneeAgentId: workerId,
         unblockDescriptor: { owner: { agentId: workerId }, action: "Resume when the outside reply arrives." },
         blockedTransitionAt: new Date(ROUTABLE_BLOCKED_ROLLOUT_AT.getTime() + 1),
+        blockedOwnerNotifiedAt: new Date(ROUTABLE_BLOCKED_ROLLOUT_AT.getTime() + 2),
       });
       const dependantId = await insertIssue({ companyId, identifier: "ATG-2", title: "Dependant", status: "blocked" });
       await db.insert(issueRelations).values({ companyId, issueId: waitingId, relatedIssueId: dependantId, type: "blocks" });
@@ -2211,6 +2214,7 @@ describeEmbeddedPostgres("attention service", () => {
         assigneeAgentId: pausedId,
         unblockDescriptor: { owner: { agentId: pausedId }, action: "Resume when the outside reply arrives" },
         blockedTransitionAt: new Date(ROUTABLE_BLOCKED_ROLLOUT_AT.getTime() + 1),
+        blockedOwnerNotifiedAt: new Date(ROUTABLE_BLOCKED_ROLLOUT_AT.getTime() + 2),
       });
       const dependantId = await insertIssue({ companyId, identifier: "ATK-2", title: "Dependant", status: "blocked" });
       await db.insert(issueRelations).values({ companyId, issueId: waitingId, relatedIssueId: dependantId, type: "blocks" });
@@ -2226,6 +2230,47 @@ describeEmbeddedPostgres("attention service", () => {
       });
       expect(rows[0]?.decisionVerbs.find((verb) => verb.id === "unblock")?.description)
         .toBe("Resume when the outside reply arrives");
+    });
+
+    it("counts the union of blocked parents and explicitly blocked work", async () => {
+      const { companyId, workerId } = await seedCompany("ATM");
+      const parentId = await insertIssue({ companyId, identifier: "ATM-1", title: "Blocked parent", status: "blocked" });
+      const leafId = await insertIssue({
+        companyId,
+        identifier: "ATM-2",
+        title: "Stalled review leaf",
+        status: "in_review",
+        parentId,
+        assigneeAgentId: workerId,
+      });
+      const todoId = await insertIssue({ companyId, identifier: "ATM-3", title: "Explicitly blocked follow-up", status: "todo" });
+      await db.insert(issueRelations).values({ companyId, issueId: leafId, relatedIssueId: todoId, type: "blocks" });
+
+      const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+      const row = feed.items.find((item) => item.dedupKey === `blocker:${leafId}`);
+
+      expect(row?.detail).toMatchObject({ kind: "blocker", blockedTaskCount: 2 });
+      expect(row?.whyNow).toContain("Blocks 2 tasks.");
+    });
+
+    it("raises no card for a review leaf with a saved future monitor", async () => {
+      const { companyId, workerId } = await seedCompany("ATO");
+      const parentId = await insertIssue({ companyId, identifier: "ATO-1", title: "Blocked parent", status: "blocked" });
+      const leafId = await insertIssue({
+        companyId,
+        identifier: "ATO-2",
+        title: "Monitored review leaf",
+        status: "in_review",
+        parentId,
+        assigneeAgentId: workerId,
+      });
+      const dueAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+      await db.update(issues).set({ monitorNextCheckAt: dueAt }).where(eq(issues.id, leafId));
+
+      const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+      // This fork carries upstream #10398, so the monitor covers the leaf.
+      expect(feed.items.some((item) => item.dedupKey === `blocker:${leafId}`)).toBe(false);
     });
 
     it("counts the blocked parents of a stalled review child and names its owner", async () => {
