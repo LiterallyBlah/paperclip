@@ -34,6 +34,7 @@ import { cn, formatDateTime, formatShortDate } from "../lib/utils";
 import { InteractionPreparationNotice } from "./InteractionPreparationNotice";
 import { InteractionAudienceLine } from "./InteractionAudienceLine";
 import { MarkdownBody, type MarkdownExternalReferenceMap } from "./MarkdownBody";
+import { isPlainOptionCardClick } from "../lib/option-card-click";
 import { Button } from "./ui/button";
 import { Checkbox } from "./ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
@@ -978,6 +979,32 @@ function SuggestTasksCard({
   );
 }
 
+/**
+ * Markdown for short interaction text (prompts, help text, option
+ * descriptions). It reuses the shared MarkdownBody renderer, which ignores raw
+ * HTML and sanitises URLs, and the compact style so plain text keeps the size
+ * and line height of its container.
+ */
+function InteractionMarkdown({
+  children,
+  externalReferences,
+  inheritColor = false,
+}: {
+  children: string;
+  externalReferences?: MarkdownExternalReferenceMap;
+  /** Take the text colour of the container (muted or selected states). */
+  inheritColor?: boolean;
+}) {
+  return (
+    <MarkdownBody
+      className={cn("paperclip-markdown-compact", inheritColor && "paperclip-markdown-on-accent")}
+      externalReferences={externalReferences}
+    >
+      {children}
+    </MarkdownBody>
+  );
+}
+
 function QuestionOptionButton({
   id,
   label,
@@ -985,6 +1012,7 @@ function QuestionOptionButton({
   selected,
   selectionMode,
   onClick,
+  externalReferences,
 }: {
   id: string;
   label: string;
@@ -992,42 +1020,57 @@ function QuestionOptionButton({
   selected: boolean;
   selectionMode: "single" | "multi";
   onClick: () => void;
+  externalReferences?: MarkdownExternalReferenceMap;
 }) {
+  // The description is Markdown and can hold links and code-block buttons, so
+  // it sits next to the option control instead of inside it (no nested
+  // interactive content). The control references it with aria-describedby.
+  const descriptionId = description ? `${id}-description` : undefined;
   return (
-    <button
-      type="button"
-      role={selectionMode === "single" ? "radio" : "checkbox"}
-      aria-checked={selected}
+    <div
+      data-question-option-card=""
       className={cn(
-        "w-full rounded-sm border px-4 py-3 text-left transition-colors outline-none focus-visible:border-ring focus-visible:ring-(length:--rad-3) focus-visible:ring-ring/50",
+        "w-full cursor-pointer rounded-sm border text-left transition-colors has-[>[data-option-control]:focus-visible]:border-ring has-[>[data-option-control]:focus-visible]:ring-(length:--rad-3) has-[>[data-option-control]:focus-visible]:ring-ring/50",
         selected
           ? "border-sky-500/80 bg-sky-500/10 text-sky-950 dark:border-sky-400/80 dark:bg-sky-400/15 dark:text-sky-50"
           : "border-border/70 bg-transparent text-foreground hover:border-sky-500/70 hover:bg-sky-500/10 dark:hover:border-sky-400/70 dark:hover:bg-sky-400/10",
       )}
-      id={id}
-      onClick={onClick}
+      onClick={(event) => {
+        if (isPlainOptionCardClick(event)) onClick();
+      }}
     >
-      <div
+      <button
+        type="button"
+        role={selectionMode === "single" ? "radio" : "checkbox"}
+        aria-checked={selected}
+        aria-describedby={descriptionId}
+        data-option-control=""
         className={cn(
-          "text-sm font-medium",
+          "block w-full px-4 pt-3 text-left text-sm font-medium outline-none",
+          description ? "pb-0" : "pb-3",
           selected ? "text-sky-950 dark:text-sky-50" : "text-foreground",
         )}
+        id={id}
+        onClick={onClick}
       >
         {label}
-      </div>
+      </button>
       {description ? (
         <div
+          id={descriptionId}
           className={cn(
-            "mt-1 text-sm leading-6",
+            "mt-1 min-w-0 px-4 pb-3 text-sm leading-6",
             selected
               ? "text-sky-900/80 dark:text-sky-100/80"
               : "text-muted-foreground",
           )}
         >
-          {description}
+          <InteractionMarkdown externalReferences={externalReferences} inheritColor>
+            {description}
+          </InteractionMarkdown>
         </div>
       ) : null}
-    </button>
+    </div>
   );
 }
 
@@ -1248,20 +1291,33 @@ function AskUserQuestionsCard({
               className="rounded-2xl border border-border/70 bg-background/82 p-4 shadow-(--shadow-extract-9)"
             >
               <div className="flex items-start justify-between gap-3">
-                <div>
+                <div className="min-w-0 flex-1">
                   <div className="text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
                     Question {index + 1}
                   </div>
                   <div
                     id={`${interaction.id}-${question.id}-prompt`}
-                    className="mt-1 text-sm font-semibold text-foreground"
+                    className="mt-1 min-w-0 text-sm leading-6 text-foreground"
                   >
-                    {question.prompt}
+                    <InteractionMarkdown externalReferences={externalReferences}>
+                      {question.prompt}
+                    </InteractionMarkdown>
                   </div>
+                  {/* Text-answer fields are named "<prefix> <rendered prompt
+                      text>" through aria-labelledby, so the accessible name
+                      has no raw Markdown syntax. */}
+                  <span id={`${interaction.id}-${question.id}-describe-label`} hidden>
+                    Describe your answer for
+                  </span>
+                  <span id={`${interaction.id}-${question.id}-other-label`} hidden>
+                    Other answer for
+                  </span>
                   {question.helpText ? (
-                    <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                      {question.helpText}
-                    </p>
+                    <div className="mt-1 min-w-0 text-sm leading-6 text-muted-foreground">
+                      <InteractionMarkdown externalReferences={externalReferences} inheritColor>
+                        {question.helpText}
+                      </InteractionMarkdown>
+                    </div>
                   ) : null}
                 </div>
                 <TaskField
@@ -1288,6 +1344,7 @@ function AskUserQuestionsCard({
                           id={`${interaction.id}-${question.id}-${option.id}`}
                           label={option.label}
                           description={option.description}
+                          externalReferences={externalReferences}
                           selected={optionSelected}
                           selectionMode={question.selectionMode}
                           onClick={() =>
@@ -1295,7 +1352,7 @@ function AskUserQuestionsCard({
                         />
                         {isFreeText && optionSelected ? (
                           <Textarea
-                            aria-label={`Describe your answer for ${question.prompt}`}
+                            aria-labelledby={`${interaction.id}-${question.id}-describe-label ${interaction.id}-${question.id}-prompt`}
                             value={draftOtherAnswers[question.id] ?? ""}
                             onChange={(event) =>
                               setDraftOtherAnswers((current) => ({
@@ -1336,7 +1393,7 @@ function AskUserQuestionsCard({
                     </button>
                     {otherActiveQuestions[question.id] ? (
                       <Textarea
-                        aria-label={`Other answer for ${question.prompt}`}
+                        aria-labelledby={`${interaction.id}-${question.id}-other-label ${interaction.id}-${question.id}-prompt`}
                         value={draftOtherAnswers[question.id] ?? ""}
                         onChange={(event) =>
                           setDraftOtherAnswers((current) => ({
@@ -1448,8 +1505,10 @@ function AskUserQuestionsCard({
                 key={question.id}
                 className="rounded-2xl border border-border/70 bg-background/82 p-4"
               >
-                <div className="text-sm font-semibold text-foreground">
-                  {question.prompt}
+                <div className="min-w-0 text-sm leading-6 text-foreground">
+                  <InteractionMarkdown externalReferences={externalReferences}>
+                    {question.prompt}
+                  </InteractionMarkdown>
                 </div>
                 <div className="mt-2 flex flex-wrap gap-2">
                   {labels.length > 0 ? (
@@ -2666,8 +2725,10 @@ function RequestConfirmationCard({
     <div className="space-y-4">
       {interaction.status === "pending" ? (
         <div className="space-y-3 rounded-sm border border-border/70 bg-background/75 p-4">
-          <div className="text-sm leading-6 text-foreground">
-            {interaction.payload.prompt}
+          <div className="min-w-0 text-sm leading-6 text-foreground">
+            <InteractionMarkdown externalReferences={externalReferences}>
+              {interaction.payload.prompt}
+            </InteractionMarkdown>
           </div>
           {interaction.payload.detailsMarkdown ? (
             <div className="border-t border-border/60 pt-3 text-sm">
@@ -2858,6 +2919,7 @@ function CheckboxOptionRow({
   checked,
   disabled,
   onToggle,
+  externalReferences,
 }: {
   id: string;
   label: string;
@@ -2865,6 +2927,7 @@ function CheckboxOptionRow({
   checked: boolean;
   disabled: boolean;
   onToggle: (checked: boolean) => void;
+  externalReferences?: MarkdownExternalReferenceMap;
 }) {
   return (
     <label
@@ -2886,7 +2949,11 @@ function CheckboxOptionRow({
       <div className="min-w-0 flex-1">
         <div className="text-sm font-medium leading-5 text-foreground">{label}</div>
         {description ? (
-          <p className="mt-0.5 text-sm leading-5 text-muted-foreground">{description}</p>
+          <div className="mt-0.5 min-w-0 text-sm leading-5 text-muted-foreground">
+            <InteractionMarkdown externalReferences={externalReferences} inheritColor>
+              {description}
+            </InteractionMarkdown>
+          </div>
         ) : null}
       </div>
     </label>
@@ -3037,7 +3104,11 @@ function RequestCheckboxConfirmationCard({
         {/* Show each piece of state once: a connection-authorization prompt is
             the same sentence as the card title, so repeating it here is noise. */}
         {interaction.payload.prompt === interaction.title ? null : (
-          <div className="text-sm leading-6 text-foreground">{interaction.payload.prompt}</div>
+          <div className="min-w-0 text-sm leading-6 text-foreground">
+            <InteractionMarkdown externalReferences={externalReferences}>
+              {interaction.payload.prompt}
+            </InteractionMarkdown>
+          </div>
         )}
         {interaction.payload.detailsMarkdown ? (
           <div className="border-t border-border/60 pt-3 text-sm">
@@ -3089,6 +3160,7 @@ function RequestCheckboxConfirmationCard({
                 id={`${interaction.id}-${option.id}`}
                 label={option.label}
                 description={option.description}
+                externalReferences={externalReferences}
                 checked={checked}
                 disabled={working !== null || (!checked && atMax)}
                 onToggle={(value) => toggleOption(option.id, value)}
@@ -3385,7 +3457,11 @@ function RequestItemVerdictsCard({
       {/* Prompt + details (S1) */}
       <div className="space-y-3 rounded-sm border border-border/70 bg-background/75 p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="text-sm leading-6 text-foreground">{payload.prompt}</div>
+          <div className="min-w-0 flex-1 text-sm leading-6 text-foreground">
+            <InteractionMarkdown externalReferences={externalReferences}>
+              {payload.prompt}
+            </InteractionMarkdown>
+          </div>
           <VerdictProgressBadge progress={progress} pendingReason={invalidDraftIds.size > 0} />
         </div>
         {payload.detailsMarkdown ? (
