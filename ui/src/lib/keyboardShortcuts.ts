@@ -86,6 +86,13 @@ export function isModifierOnlyKey(key: string): boolean {
   return MODIFIER_ONLY_KEYS.has(key);
 }
 
+const INTERACTIVE_CONTROL_SELECTOR =
+  "button, a[href], summary, select, [role='button'], [role='link'], [role='menuitem'], [role='checkbox'], [role='radio'], [role='switch'], [role='tab'], [role='option']";
+
+function isInteractiveControlTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && target.matches(INTERACTIVE_CONTROL_SELECTOR);
+}
+
 export function resolveAttentionQueueKeyAction({
   defaultPrevented,
   key,
@@ -116,6 +123,10 @@ export function resolveAttentionQueueKeyAction({
     case "ArrowUp":
       return "previous";
     case "Enter":
+      // Enter on a focused control (a row's Approve, Request changes, link…)
+      // belongs to that control; toggling the selected row instead would
+      // swallow the activation and collapse the resolver (BLA-180).
+      if (isInteractiveControlTarget(target)) return "ignore";
       return hasSelection ? "toggle" : "ignore";
     case "x":
       return hasSelection ? "dismiss" : "ignore";
