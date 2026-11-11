@@ -9,6 +9,7 @@ import type {
   AttentionSourceKind,
   AttentionWorkspaceRef,
 } from "@paperclipai/shared";
+import { markdownToPlainText } from "./markdown-plain-text";
 
 export type AttentionListOptions = AttentionFeedQuery;
 
@@ -187,6 +188,12 @@ function quote(text: string | null | undefined): string | null {
   return `“${trimmed}”`;
 }
 
+// Prompt and question text is agent-authored Markdown (often truncated
+// server-side mid-syntax); the one-line preview shows its words, not its syntax.
+function quoteMarkdown(text: string | null | undefined): string | null {
+  return quote(text ? markdownToPlainText(text) : text);
+}
+
 function countNoun(count: number, singular: string): string {
   return `${count} ${count === 1 ? singular : `${singular}s`}`;
 }
@@ -207,13 +214,13 @@ export function attentionDetailLine(item: AttentionItem): string | null {
     case "approval":
       return quote(detail.summaryExcerpt);
     case "confirmation":
-      return quote(detail.promptExcerpt);
+      return quoteMarkdown(detail.promptExcerpt);
     case "checkbox_confirmation": {
-      const q = quote(detail.promptExcerpt);
+      const q = quoteMarkdown(detail.promptExcerpt);
       return q ? `${countNoun(detail.optionCount, "option")} — ${q}` : countNoun(detail.optionCount, "option");
     }
     case "questions": {
-      const q = quote(detail.firstQuestionText);
+      const q = quoteMarkdown(detail.firstQuestionText);
       const label = countNoun(detail.questionCount, "question");
       return q ? `${label} — ${q}` : label;
     }
@@ -223,7 +230,7 @@ export function attentionDetailLine(item: AttentionItem): string | null {
       return q ? `${label} — ${q}` : label;
     }
     case "item_verdicts": {
-      const q = quote(detail.promptExcerpt);
+      const q = quoteMarkdown(detail.promptExcerpt);
       const label = `${countNoun(detail.itemCount, "item")} to verdict`;
       return q ? `${label} — ${q}` : label;
     }

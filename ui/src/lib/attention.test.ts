@@ -405,6 +405,57 @@ describe("attentionDetailLine (§7)", () => {
   it("returns null when there is no detail block", () => {
     expect(attentionDetailLine(buildItem({ detail: null }))).toBeNull();
   });
+
+  it("flattens Markdown in the first question to plain words", () => {
+    const line = attentionDetailLine(
+      buildItem({
+        detail: {
+          kind: "questions",
+          questionCount: 1,
+          firstQuestionText:
+            "## Synthetic context\n\nPick a **storage** option for `svc-a`:\n\n| Option | Cost |\n|---|---|\n| Disk | low |\n\n- [docs](https://example.test)",
+          images: [],
+        },
+      }),
+    );
+    expect(line).toBe("1 question — “Synthetic context Pick a storage option for svc-a: Option Cost Disk low docs”");
+    expect(line).not.toMatch(/\*\*|\||---|##|`|\]\(/);
+  });
+
+  it("flattens Markdown in confirmation, checkbox and verdict prompt excerpts", () => {
+    const promptExcerpt = "Ship **the** `v2` [plan](https://example.test)?";
+    const expected = "“Ship the v2 plan?”";
+    expect(attentionDetailLine(buildItem({ detail: { kind: "confirmation", promptExcerpt, images: [] } as never }))).toBe(expected);
+    expect(
+      attentionDetailLine(buildItem({ detail: { kind: "checkbox_confirmation", optionCount: 2, promptExcerpt, images: [] } as never })),
+    ).toBe(`2 options — ${expected}`);
+    expect(
+      attentionDetailLine(buildItem({ detail: { kind: "item_verdicts", itemCount: 3, promptExcerpt, images: [] } as never })),
+    ).toBe(`3 items to verdict — ${expected}`);
+  });
+
+  it("keeps a server-truncated excerpt readable when it ends mid-syntax", () => {
+    for (const firstQuestionText of [
+      "Context:\n```ts\nconst a = 1;",
+      "| Option | Cost |\n|---|---|\n| Disk | lo...",
+      "Pick the **storage opt...",
+    ]) {
+      const line = attentionDetailLine(
+        buildItem({ detail: { kind: "questions", questionCount: 1, firstQuestionText, images: [] } }),
+      );
+      expect(line).toMatch(/^1 question — “.+”$/);
+      expect(line).not.toMatch(/```|\|---/);
+    }
+  });
+
+  it("leaves a plain-text question unchanged apart from joining lines", () => {
+    const line = attentionDetailLine(
+      buildItem({
+        detail: { kind: "questions", questionCount: 1, firstQuestionText: "Which auth provider (Google or GitHub)?", images: [] },
+      }),
+    );
+    expect(line).toBe("1 question — “Which auth provider (Google or GitHub)?”");
+  });
 });
 
 describe("sortAttentionItems", () => {
