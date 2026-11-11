@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useId, useMemo, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -22,6 +22,7 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Textarea } from "./ui/textarea";
 import { MarkdownBody } from "./MarkdownBody";
+import { isPlainOptionCardClick } from "../lib/option-card-click";
 
 /**
  * Presentational card for a single Decisions-v1 decision (PAP-14966 / PAP-14939
@@ -242,6 +243,7 @@ export function DecisionCard({
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const [confirmOptionId, setConfirmOptionId] = useState<string | null>(null);
   const [confirmText, setConfirmText] = useState("");
+  const optionDomId = useId();
 
   const open = decision.status === "open";
   const dismissed =
@@ -447,35 +449,56 @@ export function DecisionCard({
             const previewRows = cancelTree && cancelTreePreview ? cancelTreePreview(cancelTree.targetIssueId) : null;
             const confirmRef = cancelTree ? resolveIssue(cancelTree.targetIssueId) : null;
             const confirmToken = confirmRef?.identifier ?? confirmRef?.id ?? cancelTree?.targetIssueId ?? "";
+            const descriptionId = option.description ? `${optionDomId}-${option.id}-description` : undefined;
+            const effectsId = option.effects.length > 0 ? `${optionDomId}-${option.id}-effects` : undefined;
+            const describedBy = [descriptionId, effectsId].filter(Boolean).join(" ") || undefined;
             return (
               <div key={option.id} className="space-y-2">
-                <button
-                  type="button"
-                  disabled={disabled}
-                  onClick={() => runOption(option)}
+                {/* The option description is Markdown and can hold links and
+                    code-block buttons, so it sits next to the option button
+                    instead of inside it (no nested interactive content). A
+                    plain click on the card still runs the option. */}
+                <div
+                  data-decision-option-card=""
+                  onClick={(event) => {
+                    if (!disabled && isPlainOptionCardClick(event)) runOption(option);
+                  }}
                   className={cn(
-                    "w-full rounded-sm border px-4 py-3 text-left transition-colors outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50",
-                    disabled && "cursor-not-allowed opacity-60",
+                    "w-full rounded-sm border pb-3 text-left transition-colors has-[>[data-option-control]:focus-visible]:border-ring has-[>[data-option-control]:focus-visible]:ring-2 has-[>[data-option-control]:focus-visible]:ring-ring/50",
+                    disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
                     destructive
-                      ? "border-rose-500/70 bg-rose-500/5 text-foreground hover:border-rose-500 hover:bg-rose-500/10"
-                      : "border-border/70 bg-transparent text-foreground hover:border-sky-500/70 hover:bg-sky-500/10",
+                      ? cn("border-rose-500/70 bg-rose-500/5 text-foreground", !disabled && "hover:border-rose-500 hover:bg-rose-500/10")
+                      : cn("border-border/70 bg-transparent text-foreground", !disabled && "hover:border-sky-500/70 hover:bg-sky-500/10"),
                   )}
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className={cn("text-sm font-medium", destructive && "text-rose-700 dark:text-rose-300")}>
-                      {option.label}
-                    </span>
-                    {blockedStale && (
-                      <span className="shrink-0 rounded-full border border-amber-500/60 bg-amber-500/10 px-2 py-0.5 text-(length:--text-micro) font-medium text-amber-800 dark:text-amber-200">
-                        Blocked · stale
+                  <button
+                    type="button"
+                    disabled={disabled}
+                    onClick={() => runOption(option)}
+                    aria-describedby={describedBy}
+                    data-option-control=""
+                    className="block w-full px-4 pt-3 text-left outline-none disabled:cursor-not-allowed"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className={cn("text-sm font-medium", destructive && "text-rose-700 dark:text-rose-300")}>
+                        {option.label}
                       </span>
-                    )}
-                  </div>
+                      {blockedStale && (
+                        <span className="shrink-0 rounded-full border border-amber-500/60 bg-amber-500/10 px-2 py-0.5 text-(length:--text-micro) font-medium text-amber-800 dark:text-amber-200">
+                          Blocked · stale
+                        </span>
+                      )}
+                    </div>
+                  </button>
                   {option.description && (
-                    <div className="mt-1 text-sm leading-6 text-muted-foreground">{option.description}</div>
+                    <div id={descriptionId} className="mt-1 min-w-0 px-4 text-sm leading-6 text-muted-foreground">
+                      <MarkdownBody className="paperclip-markdown-compact paperclip-markdown-on-accent">
+                        {option.description}
+                      </MarkdownBody>
+                    </div>
                   )}
                   {option.effects.length > 0 && (
-                    <ul className="mt-2 space-y-0.5">
+                    <ul id={effectsId} className="mt-2 space-y-0.5 px-4">
                       {option.effects.map((effect, index) => (
                         <li
                           key={index}
@@ -490,7 +513,7 @@ export function DecisionCard({
                       ))}
                     </ul>
                   )}
-                </button>
+                </div>
 
                 {/* Destructive cancel-tree confirm gate */}
                 {confirming && cancelTree && (
