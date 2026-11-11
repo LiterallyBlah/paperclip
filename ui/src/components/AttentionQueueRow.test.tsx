@@ -32,6 +32,7 @@ vi.mock("../api/issues", () => ({
     acceptInteraction: vi.fn(),
     rejectInteraction: vi.fn(),
     decideStalledReview: vi.fn(() => Promise.resolve({})),
+    update: vi.fn(() => Promise.resolve({})),
   },
 }));
 
@@ -263,6 +264,119 @@ describe("AttentionQueueRow", () => {
       );
       expect(el.querySelector('[data-testid="review-policy-badge"]')).toBeNull();
     }
+  });
+
+  // BLA-180: the review-round cap hands a pending native stage to a user. The
+  // row must offer that user the stage's own verbs, not information only.
+  const userHeldStageItem = (userId = "me", expandedState?: { inlineResolvable?: boolean }) =>
+    buildItem({
+      sourceKind: "review" as AttentionSourceKind,
+      inlineResolvable: expandedState?.inlineResolvable ?? true,
+      decisionVerbs: [
+        { id: "approve", label: "Approve", description: "" },
+        { id: "request_changes", label: "Request changes", description: "" },
+      ],
+      subject: {
+        kind: "issue",
+        id: "issue-1",
+        companyId: "c1",
+        title: "Escalated native review",
+        identifier: "PAP-1",
+        status: "in_review",
+        href: "/PAP/issues/PAP-1",
+        metadata: {
+          reviewStage: { stageType: "review", participant: { type: "user", agentId: null, userId } },
+        },
+      },
+      whyNow: "Issue is in review and the current execution participant is a user.",
+    });
+
+  function typeNote(el: HTMLElement, value: string) {
+    const textarea = el.querySelector('[data-testid="review-stage-note"]') as HTMLTextAreaElement;
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+    act(() => {
+      setter?.call(textarea, value);
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  }
+
+  it("gives the stage participant labelled Approve / Request changes on the native decision path", async () => {
+    const el = render(
+      <AttentionQueueRow
+        item={userHeldStageItem()}
+        companyId="c1"
+        currentUserId="me"
+        expanded
+        onToggleExpand={noop}
+        onDismiss={noop}
+      />,
+    );
+    const approve = el.querySelector('[data-testid="review-stage-approve"]') as HTMLButtonElement;
+    const requestChanges = el.querySelector('[data-testid="review-stage-request-changes"]') as HTMLButtonElement;
+    expect(approve?.textContent).toContain("Approve");
+    expect(requestChanges?.textContent).toContain("Request changes");
+    // Not the stalled-review resolver: its endpoint refuses a non-stalled review.
+    expect(el.textContent).not.toContain("Send back to work");
+    const textarea = el.querySelector('[data-testid="review-stage-note"]') as HTMLTextAreaElement;
+    const label = el.querySelector(`label[for="${textarea.id}"]`);
+    expect(label?.textContent).toContain("decision note");
+    // Verbs stay focusable with an empty note and explain instead of no-oping.
+    expect(approve.disabled).toBe(false);
+    act(() => approve.click());
+    expect(issuesApi.update).not.toHaveBeenCalled();
+    expect(el.querySelector('[role="alert"]')?.textContent).toContain("Add a note to approve");
+
+    typeNote(el, "Looks good");
+    act(() => approve.click());
+    await vi.waitFor(() =>
+      expect(issuesApi.update).toHaveBeenCalledWith("issue-1", { status: "done", comment: "Looks good" }),
+    );
+
+    vi.mocked(issuesApi.update).mockClear();
+    typeNote(el, "Fix F-H2");
+    act(() => requestChanges.click());
+    await vi.waitFor(() =>
+      expect(issuesApi.update).toHaveBeenCalledWith("issue-1", { status: "in_progress", comment: "Fix F-H2" }),
+    );
+    expect(issuesApi.decideStalledReview).not.toHaveBeenCalled();
+  });
+
+  it("labels the collapsed participant row with the decision it opens", () => {
+    const onToggleExpand = vi.fn();
+    const item = userHeldStageItem();
+    const el = render(
+      <AttentionQueueRow
+        item={item}
+        companyId="c1"
+        currentUserId="me"
+        expanded={false}
+        onToggleExpand={onToggleExpand}
+        onDismiss={noop}
+      />,
+    );
+    const open = el.querySelector('[data-testid="review-stage-open-decision"]') as HTMLButtonElement;
+    expect(open?.textContent).toBe("Approve or request changes");
+    act(() => open.click());
+    expect(onToggleExpand).toHaveBeenCalledWith(item);
+  });
+
+  it("tells a non-participant who must act instead of offering verbs", () => {
+    const el = render(
+      <AttentionQueueRow
+        item={userHeldStageItem("someone-else")}
+        companyId="c1"
+        currentUserId="me"
+        userLabelMap={new Map([["someone-else", "Dana"]])}
+        expanded
+        onToggleExpand={noop}
+        onDismiss={noop}
+      />,
+    );
+    expect(el.querySelector('[data-testid="review-stage-approve"]')).toBeNull();
+    expect(el.querySelector('[data-testid="review-stage-open-decision"]')).toBeNull();
+    expect(el.querySelector('[data-testid="review-stage-waiting"]')?.textContent).toContain("waiting on Dana");
+    const openTask = [...el.querySelectorAll('[data-testid="review-stage-waiting"] a')];
+    expect(openTask.map((a) => [a.getAttribute("href"), a.textContent])).toEqual([["/PAP/issues/PAP-1", "Open task"]]);
   });
 
   it("deep-links a covered review instead of inlining", () => {

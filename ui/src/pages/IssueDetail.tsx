@@ -16,6 +16,7 @@ import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { trackRecentProject } from "@/lib/recent-projects";
 import { Settings as ChatSettings } from "lucide-react";
 import { agentDetailHref } from "./agent-detail-navigation";
+import { IssueReviewStageDecisionPanel } from "../components/IssueReviewStageDecisionPanel";
 import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
@@ -7816,6 +7817,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption}
               canRetry={canResolveBoardRecoveryAction} onRetry={taskRetry.retry}
               optimistic={taskRetry.optimistic} takingLonger={taskRetry.takingLonger} error={taskRetry.error} />
+          )}
+
+          {resolvedDetailTab === "chat" && (
+            <IssueReviewStageDecisionPanel
+              className={shellSectionClass}
+              issue={issue}
+              currentUserId={currentUserId}
+              agentMap={agentMap}
+              userLabelMap={userLabelMap}
+            />
           )}
 
           {issue.status === "in_review" && issue.externalConversationState === "waiting" && (

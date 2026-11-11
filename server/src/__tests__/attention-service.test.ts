@@ -269,6 +269,65 @@ describeEmbeddedPostgres("attention service", () => {
     expect(feed.items.flatMap((item) => item.queues).some((queue) => queue.key === "internal-review")).toBe(false);
   });
 
+  it("resolves a user-held native review stage in place and names the participant on drifted stages (BLA-180)", async () => {
+    const { companyId, workerId, reviewerId } = await seedCompany("ATR");
+    // The review-round cap handed the pending stage to the responsible user.
+    const escalatedId = await insertIssue({
+      companyId,
+      identifier: "ATR-1",
+      title: "Escalated native review",
+      status: "in_review",
+      assigneeUserId: "board-user",
+      executionState: {
+        ...pendingUserExecutionState("board-user"),
+        returnAssignee: { type: "agent", agentId: workerId },
+        changesRequestedCount: 3,
+      },
+    });
+    // Drifted: assigned to the user, but the stage still waits on the agent.
+    const driftedId = await insertIssue({
+      companyId,
+      identifier: "ATR-2",
+      title: "Drifted native review",
+      status: "in_review",
+      assigneeUserId: "board-user",
+      executionState: pendingAgentExecutionState(reviewerId),
+    });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const escalated = feed.items.find((item) => item.sourceKind === "review" && item.subject.id === escalatedId);
+    expect(escalated).toMatchObject({
+      inlineResolvable: true,
+      decisionVerbs: [
+        expect.objectContaining({ id: "approve", label: "Approve" }),
+        expect.objectContaining({ id: "request_changes", label: "Request changes" }),
+      ],
+      subject: expect.objectContaining({
+        metadata: expect.objectContaining({
+          reviewStage: {
+            stageType: "review",
+            participant: { type: "user", agentId: null, userId: "board-user" },
+          },
+        }),
+      }),
+    });
+
+    const drifted = feed.items.find((item) => item.sourceKind === "review" && item.subject.id === driftedId);
+    expect(drifted).toMatchObject({
+      // The user cannot decide an agent-held stage, so it is not offered in-row.
+      inlineResolvable: false,
+      whyNow: expect.stringContaining("Only that participant can approve or request changes"),
+      subject: expect.objectContaining({
+        metadata: expect.objectContaining({
+          reviewStage: {
+            stageType: "review",
+            participant: { type: "agent", agentId: reviewerId, userId: null },
+          },
+        }),
+      }),
+    });
+  });
+
   it("returns ranked decision-only items for every active source and excludes non-human or transient rows", async () => {
     const { companyId, workerId, reviewerId } = await seedCompany("ATN");
     const baseTime = new Date("2026-07-09T12:00:00.000Z");
