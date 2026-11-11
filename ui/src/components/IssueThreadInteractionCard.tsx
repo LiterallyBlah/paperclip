@@ -35,6 +35,7 @@ import { InteractionPreparationNotice } from "./InteractionPreparationNotice";
 import { InteractionAudienceLine } from "./InteractionAudienceLine";
 import { MarkdownBody, type MarkdownExternalReferenceMap } from "./MarkdownBody";
 import { isPlainOptionCardClick } from "../lib/option-card-click";
+import { InteractionMarkdown } from "./InteractionMarkdown";
 import { Button } from "./ui/button";
 import { Checkbox } from "./ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
@@ -976,32 +977,6 @@ function SuggestTasksCard({
         </div>
       ) : null}
     </div>
-  );
-}
-
-/**
- * Markdown for short interaction text (prompts, help text, option
- * descriptions). It reuses the shared MarkdownBody renderer, which ignores raw
- * HTML and sanitises URLs, and the compact style so plain text keeps the size
- * and line height of its container.
- */
-function InteractionMarkdown({
-  children,
-  externalReferences,
-  inheritColor = false,
-}: {
-  children: string;
-  externalReferences?: MarkdownExternalReferenceMap;
-  /** Take the text colour of the container (muted or selected states). */
-  inheritColor?: boolean;
-}) {
-  return (
-    <MarkdownBody
-      className={cn("paperclip-markdown-compact", inheritColor && "paperclip-markdown-on-accent")}
-      externalReferences={externalReferences}
-    >
-      {children}
-    </MarkdownBody>
   );
 }
 

@@ -23,6 +23,7 @@ import { Input } from "./ui/input";
 import { Textarea } from "./ui/textarea";
 import { MarkdownBody } from "./MarkdownBody";
 import { isPlainOptionCardClick } from "../lib/option-card-click";
+import { InteractionMarkdown } from "./InteractionMarkdown";
 
 /**
  * Presentational card for a single Decisions-v1 decision (PAP-14966 / PAP-14939
@@ -492,9 +493,7 @@ export function DecisionCard({
                   </button>
                   {option.description && (
                     <div id={descriptionId} className="mt-1 min-w-0 px-4 text-sm leading-6 text-muted-foreground">
-                      <MarkdownBody className="paperclip-markdown-compact paperclip-markdown-on-accent">
-                        {option.description}
-                      </MarkdownBody>
+                      <InteractionMarkdown inheritColor>{option.description}</InteractionMarkdown>
                     </div>
                   )}
                   {option.effects.length > 0 && (
