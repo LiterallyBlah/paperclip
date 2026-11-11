@@ -33,6 +33,9 @@ export function markdownToPlainText(markdown: string): string {
     .replace(/^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?/gm, "")
     // Horizontal rules.
     .replace(/^\s*(?:[-*_]\s*){3,}$/gm, "")
+    // Tables: drop delimiter rows, keep cell text without the pipes.
+    .replace(/^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(?:\|[ \t]*:?-{3,}:?[ \t]*)+\|?[ \t]*$/gm, "")
+    .replace(/^[ \t]*\|(.*?)\|?[ \t]*$/gm, (_match, cells: string) => cells.split("|").map((cell) => cell.trim()).join(" "))
     // Emphasis and strikethrough. Underscore forms must sit on word boundaries
     // so snake_case identifiers survive.
     .replace(/(\*\*|__)(?=\S)([\s\S]*?\S)\1/g, (match, marker: string, text: string, offset: number, source: string) =>

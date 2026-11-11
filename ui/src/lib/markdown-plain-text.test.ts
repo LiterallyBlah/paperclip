@@ -38,3 +38,15 @@ describe("markdownToPlainText", () => {
       .toBe("Approve the saved plan for a printable menu?");
   });
 });
+
+describe("markdownToPlainText tables and plain prompts (BLA-185)", () => {
+  it("keeps plain prompts unchanged", () => {
+    expect(markdownToPlainText("Which color?")).toBe("Which color?");
+    expect(markdownToPlainText("Pick yes|no for snake_case")).toBe("Pick yes|no for snake_case");
+  });
+
+  it("flattens a synthetic table into cell text without pipes or delimiter rows", () => {
+    const md = ["Compare:", "", "| Option | Cost |", "|---|:---:|", "| Shared | `low` |"].join("\n");
+    expect(markdownToPlainText(md)).toBe("Compare: Option Cost Shared low");
+  });
+});
