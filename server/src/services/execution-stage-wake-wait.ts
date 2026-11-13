@@ -1,11 +1,12 @@
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
-import { readExecutionStageId } from "../modules/wake-queue/domain/values.js";
+import { readExecutionStageId } from "../modules/wake-queue/index.js";
 
 export {
   EXECUTION_STAGE_WAKE_REASONS,
   EXECUTION_STAGE_WAKE_WAIT_CAUSE,
   isKeptExecutionStageWake,
-} from "../modules/wake-queue/domain/values.js";
+  readExecutionStageId,
+} from "../modules/wake-queue/index.js";
 
 type ParsedExecutionState = NonNullable<ReturnType<typeof parseIssueExecutionState>>;
 
