@@ -53,6 +53,7 @@ import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboar
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
+import { buildExecutionStageWakeContext } from "../services/execution-stage-wake-wait.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
@@ -2130,23 +2131,6 @@ function isApprovalReviewComment(body: string) {
       normalized,
     )
   );
-}
-
-function buildExecutionStageWakeContext(input: {
-  state: ParsedExecutionState;
-  wakeRole: ExecutionStageWakeContext["wakeRole"];
-  allowedActions: string[];
-}): ExecutionStageWakeContext {
-  return {
-    wakeRole: input.wakeRole,
-    stageId: input.state.currentStageId,
-    stageType: input.state.currentStageType,
-    currentParticipant: input.state.currentParticipant,
-    returnAssignee: input.state.returnAssignee,
-    reviewRequest: input.state.reviewRequest ?? null,
-    lastDecisionOutcome: input.state.lastDecisionOutcome,
-    allowedActions: input.allowedActions,
-  };
 }
 
 function summarizeIssueRelationForActivity(relation: {

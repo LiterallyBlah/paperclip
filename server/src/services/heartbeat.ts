@@ -1354,6 +1354,7 @@ export function heartbeatService(
     withChatControlRecoveryGate,
     trackWakeup,
     resumeQueuedRuns,
+    resumeDeferredStageWakes,
     parseHeartbeatPolicy,
     nextTimerHeartbeatAt,
     claimDueTimerHeartbeat,
@@ -4158,6 +4159,14 @@ export function heartbeatService(
           logger.error({ err, runId: run.id }, "failed to promote legacy comment queue after cleanup");
         });
       }
+      // A hand-off to a review stage stopped this run; the next participant's
+      // stage wake waited for exactly this cleanup. Admit it now.
+      const cleanedIssueId = readNonEmptyString(latestRun?.contextSnapshot?.issueId) ?? latestRun?.nativeIssueId ?? null;
+      if (latestRun && cleanedIssueId && isHeartbeatRunTerminalStatus(latestRun.status)) {
+        await resumeDeferredStageWakes({ companyId: run.companyId, issueId: cleanedIssueId }).catch(err => {
+          logger.error({ err, runId: run.id }, "failed to resume kept execution-stage wakes after cleanup");
+        });
+      }
       if (
         !nativeSessionResumeScheduled &&
         !nativeWorkspaceFinalizeScheduled &&
@@ -4469,6 +4478,7 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    resumeDeferredStageWakes,
 
     resumeQueuedRunsAfterDrain,
 
