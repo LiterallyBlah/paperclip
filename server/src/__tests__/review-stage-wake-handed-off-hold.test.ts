@@ -13,6 +13,7 @@ import {
   companyMemberships,
   createDb,
   heartbeatRuns,
+  issueComments,
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
@@ -21,6 +22,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
+import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -292,6 +294,29 @@ describeEmbeddedPostgres("review stage participant behind the executor's handed-
     return { ...s, executionState, lostWakeId: lost!.id };
   }
 
+  /**
+   * A later comment for the participant, deferred behind the executor's hold
+   * and never run; no execution lock remains whose release would promote it.
+   */
+  async function addParkedCommentWake(s: Seeded) {
+    const [hold] = await holdsFor(s);
+    const commentedAt = new Date(Date.now() - 2 * 60_000);
+    const [comment] = await db.insert(issueComments).values({
+      companyId: s.companyId, issueId: s.issueId, authorAgentId: s.executorId, authorType: "agent",
+      body: "One more note for the review.", createdAt: commentedAt, updatedAt: commentedAt,
+    }).returning();
+    const [deferred] = await db.insert(agentWakeupRequests).values({
+      companyId: s.companyId, agentId: s.participantId, source: "automation", triggerDetail: "system",
+      reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "agent", requestedByActorId: s.executorId,
+      requestedAt: commentedAt, createdAt: commentedAt, updatedAt: commentedAt,
+      payload: withQueuedCommentIdsInWakePayload({ issueId: s.issueId, mutation: "comment",
+        executionWait: { recoveryActionId: hold!.id, reason: "execution_recovery",
+          message: "Waiting for execution recovery. Your message is saved." } }, [comment!.id]),
+    }).returning();
+    return deferred!;
+  }
+
   describe.each(ROLE_PAIRS)("retained hold: executor $executorRole, participant $participantRole", (roles) => {
     it("re-admits the lost stage wake once, keeping stage, participant, counter and hold", async () => {
       const s = await seedRetainedHold(roles);
@@ -321,6 +346,44 @@ describeEmbeddedPostgres("review stage participant behind the executor's handed-
       expect((await stageRuns()).map(run => [run.status, run.errorCode])).toEqual([["succeeded", null]]);
       await heartbeat.reconcileStrandedAssignedIssues();
       await heartbeat.resumeQueuedRuns();
+      expect(await stageRuns()).toHaveLength(1);
+    });
+
+    it("re-admits the lost stage wake once when a later comment wake was deferred behind the same hold", async () => {
+      const s = await seedRetainedHold(roles);
+      const heartbeat = heartbeatService(db);
+      const holdBefore = await holdsFor(s);
+      const deferred = await addParkedCommentWake(s);
+      const [lockState] = await db.select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+        .from(issues).where(eq(issues.id, s.issueId));
+      expect(lockState).toEqual({ executionRunId: null, checkoutRunId: null });
+
+      await heartbeat.reconcileStrandedAssignedIssues();
+      const stageRuns = async () => (await runsFor(s, s.participantId))
+        .filter(run => (run.contextSnapshot as Record<string, unknown>).source === "issue.execution_stage");
+      // Old behaviour: the deferred comment wake hides the lost stage wake, so no run.
+      const runs = await stageRuns();
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.contextSnapshot).toMatchObject({ wakeReason: STAGE_WAKE_REASON,
+        executionStage: { stageId: s.stageId, currentParticipant: { agentId: s.participantId } } });
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, s.issueId));
+      expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: s.participantId });
+      expect(issue!.executionState).toMatchObject({ currentStageId: s.stageId, changesRequestedCount: 2,
+        lastDecisionId: s.executionState.lastDecisionId,
+        currentParticipant: { type: "agent", agentId: s.participantId } });
+      expect((await runsFor(s, s.executorId)).map(run => run.id)).toEqual([s.executorRunId]);
+      expect(await holdsFor(s)).toEqual(holdBefore);
+
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect((await stageRuns()).map(run => [run.status, run.errorCode])).toEqual([["succeeded", null]]);
+      // The saved comment is no longer stranded: it was delivered by a participant run.
+      const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred!.id));
+      expect(after!.status).not.toBe("deferred_issue_execution");
+      expect(after!.runId).not.toBeNull();
+      await heartbeat.reconcileStrandedAssignedIssues();
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
       expect(await stageRuns()).toHaveLength(1);
     });
   });
@@ -371,6 +434,35 @@ describeEmbeddedPostgres("review stage participant behind the executor's handed-
     await heartbeatService(db).reconcileStrandedAssignedIssues();
     expect((await runsFor(s, s.participantId)).filter(run => run.status !== "succeeded")).toHaveLength(0);
     expect((await wakesFor(s, s.participantId)).filter(row => row.id !== s.lostWakeId && row.runId)).toEqual([]);
+  });
+
+  const parkedRefusals: Array<[string, (s: Awaited<ReturnType<typeof seedRetainedHold>>) => Promise<unknown>]> = [
+    ["a workspace repair hold", (s) => db.update(issueRecoveryActions).set({
+      evidence: sql`${issueRecoveryActions.evidence} || '{"workspaceRestoreFailure":"restore_unsafe_archive"}'::jsonb`,
+    }).where(eq(issueRecoveryActions.sourceIssueId, s.issueId))],
+    ["a stage that is no longer current", (s) => db.update(issues)
+      .set({ executionState: { ...s.executionState, currentStageId: randomUUID() } }).where(eq(issues.id, s.issueId))],
+    ...refusals,
+    ["an execution lock whose release promotes the parked wake", async (s) => {
+      const [lockRun] = await db.insert(heartbeatRuns).values({
+        companyId: s.companyId, agentId: s.executorId, status: "queued", runtimeMode: "legacy",
+        invocationSource: "assignment", triggerDetail: "system",
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }).returning();
+      await db.update(issues).set({ executionRunId: lockRun!.id, executionLockedAt: new Date() })
+        .where(eq(issues.id, s.issueId));
+    }],
+  ];
+
+  it.each(parkedRefusals)("leaves a parked comment wake and the lost stage wake alone for %s", async (_label, refuse) => {
+    const s = await seedRetainedHold(ROLE_PAIRS[0]);
+    const deferred = await addParkedCommentWake(s);
+    await refuse(s);
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect((await runsFor(s, s.participantId)).filter(run => run.status !== "succeeded")).toHaveLength(0);
+    expect((await wakesFor(s, s.participantId)).filter(row => row.id !== s.lostWakeId && row.id !== deferred.id)).toEqual([]);
+    const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred.id));
+    expect(after).toMatchObject({ status: "deferred_issue_execution", runId: null });
   });
 
   it("does not re-admit a lost wake for a stage that is no longer current", async () => {
