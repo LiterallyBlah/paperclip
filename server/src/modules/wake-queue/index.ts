@@ -28,6 +28,12 @@ export type {
   RunSummary,
 } from "./application/types.js";
 export { WakeQueueApplicationError } from "./application/types.js";
+export {
+  EXECUTION_STAGE_WAKE_REASONS,
+  EXECUTION_STAGE_WAKE_WAIT_CAUSE,
+  isKeptExecutionStageWake,
+  readExecutionStageId,
+} from "./domain/values.js";
 export type {
   IssueSnapshot,
   RunSnapshot,

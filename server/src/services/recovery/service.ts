@@ -1,7 +1,11 @@
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { getExecutionBlocker } from "../execution-blocker.js";
-import { buildPendingStageParticipantWakeup, EXECUTION_STAGE_WAKE_READMIT_KEY_PREFIX } from "../execution-stage-wake-wait.js";
-import { EXECUTION_STAGE_WAKE_WAIT_CAUSE, readExecutionStageId } from "../../modules/wake-queue/domain/values.js";
+import {
+  buildPendingStageParticipantWakeup,
+  EXECUTION_STAGE_WAKE_READMIT_KEY_PREFIX,
+  EXECUTION_STAGE_WAKE_WAIT_CAUSE,
+  readExecutionStageId,
+} from "../execution-stage-wake-wait.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { RESTRICTED_WORKSPACE_SOURCE_REASON } from "../workspace-source-restriction.js";
