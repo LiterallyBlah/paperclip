@@ -1,4 +1,11 @@
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
+import { getExecutionBlocker } from "../execution-blocker.js";
+import {
+  buildPendingStageParticipantWakeup,
+  EXECUTION_STAGE_WAKE_READMIT_KEY_PREFIX,
+  EXECUTION_STAGE_WAKE_WAIT_CAUSE,
+  readExecutionStageId,
+} from "../execution-stage-wake-wait.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { RESTRICTED_WORKSPACE_SOURCE_REASON } from "../workspace-source-restriction.js";
@@ -1085,10 +1092,21 @@ export function recoveryService(
     return { consecutive, latestFinishedAt };
   }
 
+  /**
+   * A deferred wake that never produced a run and is not a kept stage wake.
+   * Only an execution-lock release or a cleared gate can promote it.
+   */
+  const parkedDeferredWakeSql = () => and(
+    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    isNull(agentWakeupRequests.runId),
+    sql`coalesce(${agentWakeupRequests.payload} -> 'executionWait' ->> 'cause', '') <> ${EXECUTION_STAGE_WAKE_WAIT_CAUSE}`,
+  );
+
   async function hasActiveExecutionPath(
     companyId: string,
     issueId: string,
     agentId?: string | null,
+    options: { ignoreParkedDeferredWakes?: boolean } = {},
   ) {
     const [run, deferredWake, nativeRecovery] = await Promise.all([
       db
@@ -1113,6 +1131,7 @@ export function recoveryService(
           and(
             eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            options.ignoreParkedDeferredWakes ? not(parkedDeferredWakeSql()!) : undefined,
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
             agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
           ),
@@ -1821,6 +1840,39 @@ export function recoveryService(
       )
       .limit(1)
       .then((rows) => Boolean(rows[0]));
+  }
+
+  /**
+   * The current participant's stage wake that an admission gate ended without
+   * a run, when that receipt is still the participant's latest word on the
+   * task and no run followed it. A later wake parked behind the same gate
+   * without a run does not supersede it. A wake already re-admitted once is
+   * never returned again, so one lost wake yields at most one re-admission.
+   */
+  async function findLostStageParticipantWake(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+    stageId: string | null,
+  ) {
+    if (!stageId) return null;
+    const [latest] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.agentId, agentId),
+      sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+      not(parkedDeferredWakeSql()!),
+    )).orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.createdAt)).limit(1);
+    if (!latest || latest.status !== "skipped" || latest.runId ||
+        latest.reason !== "execution_reconciliation_required" ||
+        latest.idempotencyKey?.startsWith(EXECUTION_STAGE_WAKE_READMIT_KEY_PREFIX) ||
+        readExecutionStageId(latest.payload) !== stageId) return null;
+    const [later] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId),
+      eq(heartbeatRuns.agentId, agentId),
+      or(eq(heartbeatRuns.nativeIssueId, issueId), sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`),
+      gte(heartbeatRuns.createdAt, latest.requestedAt),
+    )).limit(1);
+    return later ? null : latest;
   }
 
   async function getLatestAcceptedContinuationInteraction(
@@ -4702,11 +4754,27 @@ export function recoveryService(
         continue;
       }
 
+      // The participant's stage wake that a gate, since cleared for this
+      // participant, ended without a run: re-admitted once further below.
+      const foundLostStageWake = issue.status === "in_review" && participantAgentId && pendingExecutionState && agentInvokable
+        ? await findLostStageParticipantWake(issue.companyId, issue.id, participantAgentId,
+          pendingExecutionState.currentStageId ?? null)
+        : null;
+      const stageWake = foundLostStageWake && pendingExecutionState
+        ? buildPendingStageParticipantWakeup(issue.id, pendingExecutionState) : null;
+      const lostStageWake = foundLostStageWake && participantAgentId && stageWake?.agentId === participantAgentId &&
+        !(await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId)) &&
+        !(await isInvocationBudgetBlocked(issue, participantAgentId)) &&
+        !(await getExecutionBlocker(db, issue.companyId, issue.id, { admittingAgentId: participantAgentId }))
+        ? foundLostStageWake : null;
       if (
         await hasActiveExecutionPath(
           issue.companyId,
           issue.id,
           issue.status === "in_review" ? agentId : null,
+          // A wake parked behind the gate that ended the stage wake is not a
+          // live path while no execution lock remains whose release promotes it.
+          { ignoreParkedDeferredWakes: Boolean(lostStageWake) && !issue.executionRunId && !issue.checkoutRunId },
         )
       ) {
         result.skipped += 1;
@@ -5103,6 +5171,32 @@ export function recoveryService(
       if (issue.status === "in_review") {
         if (!participantAgentId || !pendingExecutionState) {
           result.skipped += 1;
+          continue;
+        }
+        // A gate that has since cleared (for example another agent's handed-off
+        // run) may have ended the participant's stage wake without a run. Admit
+        // the current stage's wake once, through ordinary admission and every
+        // gate it applies; refusals keep the existing handling below.
+        if (lostStageWake && stageWake) {
+          const readmitted = await deps.enqueueWakeup(participantAgentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: stageWake.reason,
+            payload: stageWake.payload,
+            contextSnapshot: stageWake.contextSnapshot,
+            requestedByActorType: "system",
+            requestedByActorId: "execution-stage-readmit",
+            idempotencyKey: `${EXECUTION_STAGE_WAKE_READMIT_KEY_PREFIX}${lostStageWake.id}`,
+          }).catch((err) => {
+            logger.warn({ err, issueId: issue.id, wakeId: lostStageWake.id }, "lost stage wake was not re-admitted");
+            return null;
+          });
+          if (readmitted) {
+            result.reviewParticipantRequeued += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
           continue;
         }
         const participantLatestRun = participantLatestRunForRecovery;

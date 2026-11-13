@@ -1055,7 +1055,9 @@ export function createPostgresRunDispatchAdapter(
         } };
       }
     }
-    const recovery = await getExecutionBlocker(tx, run.companyId, issueId, { conversationResetCommentId: deriveCommentId(contextSnapshot) });
+    const recovery = await getExecutionBlocker(tx, run.companyId, issueId, {
+      conversationResetCommentId: deriveCommentId(contextSnapshot), admittingAgentId: run.agentId,
+    });
     if (recovery) return { issueId, facts: null, executionBlocker: recovery, decision: { stale: true as const,
       errorCode: "execution_reconciliation_required" as const, reason: recovery.nextAction,
       details: { issueId, recoveryActionId: recovery.recoveryActionId },

@@ -10,6 +10,7 @@ import {
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
   isConfigurationIncompleteFailedRun,
+  isKeptExecutionStageWake,
   isWorkspaceValidationFailedRun,
   readNonEmptyString,
 } from "../domain/values.js";
@@ -168,6 +169,14 @@ async function runReleaseDrain(
       );
     }
     processedWakeIds.add(candidate.id);
+
+    // A stage wake kept behind another agent's finishing run has its own
+    // resume, which re-checks the current stage participant under the task
+    // lock. Generic promotion must not start it without that check.
+    if (isKeptExecutionStageWake(candidate)) {
+      preservedWakeIds.push(candidate.id);
+      continue;
+    }
 
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
