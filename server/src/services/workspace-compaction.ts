@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 // Directory names that hold regenerable output: installed dependencies, build
@@ -75,6 +76,31 @@ function scanBudget(options: ScanOptions) {
 // Git process cannot hold the reaper.
 const GIT_READ_TIMEOUT_MS = 60_000;
 
+// The agent controls the checkout, its `.git` entry and the repository config
+// that entry leads to. These options stop that config from making a Git read
+// run a program: `core.fsmonitor` names a command that `check-ignore` and
+// `ls-files` run, and a promisor remote makes Git fetch a missing object through
+// a configured transport. Command-line config outranks repository config. The
+// server's own Git environment variables are dropped, so they cannot point the
+// read at another repository or config, and system and global config are not
+// read.
+const GIT_READ_CONFIG_ARGS = ["-c", "core.fsmonitor=false", "-c", `core.hooksPath=${os.devNull}`];
+
+function gitReadEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.toUpperCase().startsWith("GIT_")) env[key] = value;
+  }
+  return {
+    ...env,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: os.devNull,
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
 async function runGitRead(
   worktreePath: string,
   args: string[],
@@ -83,8 +109,14 @@ async function runGitRead(
   return await new Promise<string>((resolve, reject) => {
     const child = execFile(
       "git",
-      ["-C", worktreePath, ...args],
-      { cwd: worktreePath, timeout: GIT_READ_TIMEOUT_MS, signal: options.signal, maxBuffer: 16 * 1024 * 1024 },
+      [...GIT_READ_CONFIG_ARGS, "-C", worktreePath, ...args],
+      {
+        cwd: worktreePath,
+        env: gitReadEnv(),
+        timeout: GIT_READ_TIMEOUT_MS,
+        signal: options.signal,
+        maxBuffer: 16 * 1024 * 1024,
+      },
       (error, stdout) => {
         const exitCode = (error as { code?: unknown } | null)?.code;
         if (!error || (typeof exitCode === "number" && options.okExitCodes?.includes(exitCode))) {

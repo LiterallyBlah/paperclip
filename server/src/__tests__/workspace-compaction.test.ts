@@ -8,6 +8,7 @@ import {
   WORKSPACE_COMPACTION_TRASH_DIR,
   deleteWorkspaceCompactionTrash,
   findRegenerableWorkspaceDirs,
+  findTaskDirectoryRegenerableDirs,
   isLinkedGitWorktree,
   moveWorkspaceDirsToTrash,
   purgeStaleWorkspaceCompactionTrash,
@@ -210,5 +211,75 @@ describe("compaction trash", () => {
     await purgeStaleWorkspaceCompactionTrash(parent, 60 * 60 * 1000);
     await expect(fs.access(stale)).rejects.toThrow();
     await expect(fs.access(fresh)).resolves.toBeUndefined();
+  });
+});
+
+// The agent controls a checkout and the Git config its `.git` entry leads to.
+// A Git read by the server must not run a program that config names.
+describe("compaction Git reads over an agent-controlled checkout", () => {
+  async function agentCheckouts() {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-compaction-config-")));
+    tempDirs.push(root);
+    const taskDirectory = path.join(root, "task");
+    // A checkout with a `.git` directory.
+    const plain = path.join(taskDirectory, "plain");
+    // A checkout whose `.git` file points at a Git directory the agent chose.
+    const gitFile = path.join(taskDirectory, "gitfile");
+    const agentGitDir = path.join(root, "agent-chosen-gitdir");
+    await fs.mkdir(plain, { recursive: true });
+    await git(plain, ["init", "-b", "main"]);
+    await fs.mkdir(gitFile, { recursive: true });
+    await git(gitFile, ["init", "-b", "main", "--separate-git-dir", agentGitDir]);
+    for (const checkout of [plain, gitFile]) {
+      await git(checkout, ["config", "user.name", "Paperclip Test"]);
+      await git(checkout, ["config", "user.email", "test@paperclip.local"]);
+      await write(path.join(checkout, ".gitignore"), "node_modules/\n");
+      await git(checkout, ["add", ".gitignore"]);
+      await git(checkout, ["commit", "-m", "Initial commit"]);
+      await write(path.join(checkout, "node_modules/dep/index.js"));
+    }
+    return { root, taskDirectory, plain, gitFile };
+  }
+
+  const exists = (target: string) => fs.lstat(target).then(() => true, () => false);
+
+  it("does not run a core.fsmonitor command from repository config", async () => {
+    const { root, taskDirectory, plain, gitFile } = await agentCheckouts();
+    expect(await isLinkedGitWorktree(gitFile)).toBe(true);
+    const marker = path.join(root, "fsmonitor-ran");
+    // Set last: the fixture's own Git calls would run it too.
+    for (const checkout of [plain, gitFile]) {
+      await git(checkout, ["config", "core.fsmonitor", `touch '${marker}'; exit 1`]);
+    }
+
+    expect(await findRegenerableWorkspaceDirs(gitFile)).toEqual(["node_modules"]);
+    expect(await findRegenerableWorkspaceDirs(plain)).toEqual(["node_modules"]);
+    expect(await findTaskDirectoryRegenerableDirs(taskDirectory)).toEqual(["gitfile/node_modules", "plain/node_modules"]);
+    expect(await exists(marker)).toBe(false);
+  });
+
+  it("does not run a promisor remote's transport to fetch a missing object", async () => {
+    const { root, taskDirectory, plain, gitFile } = await agentCheckouts();
+    const marker = path.join(root, "lazy-fetch-ran");
+    for (const checkout of [plain, gitFile]) {
+      // Git reads a skip-worktree `.gitignore` from the index blob. With the
+      // blob missing in a partial clone, Git fetches it from the promisor remote.
+      const blob = await git(checkout, ["rev-parse", "HEAD:.gitignore"]);
+      await git(checkout, ["update-index", "--skip-worktree", ".gitignore"]);
+      await fs.rm(path.join(checkout, ".gitignore"));
+      const objects = await git(checkout, ["rev-parse", "--git-path", "objects"]);
+      await fs.rm(path.resolve(checkout, objects, blob.slice(0, 2), blob.slice(2)));
+      await git(checkout, ["config", "core.repositoryformatversion", "1"]);
+      await git(checkout, ["config", "extensions.partialClone", "origin"]);
+      await git(checkout, ["config", "remote.origin.promisor", "true"]);
+      await git(checkout, ["config", "remote.origin.url", `ext::sh -c touch% ${marker}`]);
+      await git(checkout, ["config", "protocol.ext.allow", "always"]);
+    }
+
+    // The blob stays missing, so nothing proves `node_modules` is ignored.
+    expect(await findRegenerableWorkspaceDirs(gitFile)).toEqual([]);
+    expect(await findRegenerableWorkspaceDirs(plain)).toEqual([]);
+    expect(await findTaskDirectoryRegenerableDirs(taskDirectory)).toEqual([]);
+    expect(await exists(marker)).toBe(false);
   });
 });
