@@ -9,6 +9,8 @@ import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { EXECUTION_RECONCILIATION_CAUSES, type ExecutionBlocker } from "@paperclipai/shared";
+import { parseIssueExecutionState } from "./issue-execution-policy.js";
+import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA, nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { unreconciledNativeExportPredicate } from "./native-runtime/native-workspace-reconstruction.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -66,9 +68,39 @@ export function executionBlockerPredicate() {
   );
 }
 
-export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {
+/**
+ * A no-replay hold on a run its own agent stopped by handing the task to a
+ * review stage protects that agent's unverified actions. It belongs to that
+ * agent's continuation, so it does not gate the stage's current participant
+ * while that agent neither owns nor reviews the task. Workspace repair holds
+ * are never scoped this way: no agent can work without the files.
+ */
+export function isHandedOffExecutorHold(
+  action: Pick<typeof issueRecoveryActions.$inferSelect, "cause" | "evidence">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "agentId" | "status" | "errorCode" | "resultJson"> | null | undefined,
+  task: { status: string; assigneeAgentId: string | null; executionState: unknown } | null | undefined,
+  admittingAgentId: string,
+): boolean {
+  if (!run || !task || action.cause !== "legacy_execution_requires_reconciliation") return false;
+  if (hasWorkspaceRestoreFailure(action.evidence) || hasRequiredWorkspaceRecovery(action.evidence) ||
+      action.evidence.reviewParticipantAgentId !== undefined || action.evidence.executionReconciliation !== undefined) return false;
+  if (run.agentId === admittingAgentId || run.status !== "cancelled" || run.errorCode !== "issue_reassigned" ||
+      run.resultJson?.reassignmentStopConfirmed !== true || hasWorkspaceRestoreFailure(run.resultJson) ||
+      hasRequiredWorkspaceRecovery(run.resultJson)) return false;
+  if (task.status !== "in_review" || task.assigneeAgentId === run.agentId) return false;
+  const state = parseIssueExecutionState(task.executionState);
+  return state?.status === "pending" && state.currentParticipant?.type === "agent" &&
+    state.currentParticipant.agentId === admittingAgentId;
+}
+
+export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: {
+  conversationResetCommentId?: string | null;
+  /** The agent being admitted; scopes holds that belong to another agent's continuation. */
+  admittingAgentId?: string | null;
+}): Promise<ExecutionBlocker | null> {
   const [conversation] = await db.select({ agentId: issues.conversationAgentId,
     boundaryId: issues.conversationBoundaryCommentId, status: issues.status,
+    executionState: issues.executionState,
     assigneeAgentId: issues.assigneeAgentId, statusVersion: issues.statusVersion,
     executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId }).from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
@@ -102,12 +134,24 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
 
   const ownership = await getConversationOwnershipBlocker(db, companyId, issueId);
   if (ownership) return { ...ownership, recoveryActionId: null };
-  const [action] = restoreHold ? [restoreHold] : await db.select().from(issueRecoveryActions).where(and(
+  const candidates = restoreHold ? [restoreHold] : await db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
     boundary ? gt(issueRecoveryActions.createdAt, boundary.createdAt) : undefined,
-  )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1);
+  )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(options?.admittingAgentId ? 100 : 1);
+  let action: (typeof candidates)[number] | undefined;
+  for (const candidate of candidates) {
+    if (!restoreHold && options?.admittingAgentId) {
+      const candidateRunId = z.string().guid().safeParse(candidate.evidence.runId ?? candidate.evidence.sourceRunId);
+      const [candidateRun] = candidateRunId.success ? await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, candidateRunId.data),
+      )).limit(1) : [];
+      if (isHandedOffExecutorHold(candidate, candidateRun, conversation, options.admittingAgentId)) continue;
+    }
+    action = candidate;
+    break;
+  }
   if (!action) return null;
   const parsedRunId = z.string().guid().safeParse(action.evidence.runId ?? action.evidence.sourceRunId);
   const runId = parsedRunId.success ? parsedRunId.data : null;

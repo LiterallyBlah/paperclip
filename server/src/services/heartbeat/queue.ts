@@ -40,6 +40,12 @@ import { validateNativeWorkspaceReconstruction } from "../native-runtime/native-
 import { isConversationAdapter } from "../conversation-continuation.js";
 import { recordExecutionWait } from "../execution-wait.js";
 import {
+  EXECUTION_STAGE_WAKE_REASONS,
+  EXECUTION_STAGE_WAKE_WAIT_CAUSE,
+  isCurrentExecutionStageParticipant,
+  isKeptExecutionStageWake,
+} from "../execution-stage-wake-wait.js";
+import {
   getNativeReviewAssignment,
   readNativeReviewAssignmentContext,
 } from "../native-runtime/native-review-participant.js";
@@ -1806,9 +1812,73 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return cancelled;
   }
 
+  /**
+   * Admit execution-stage wakes that were kept while another agent's
+   * finishing run still owned the task. Called after a run's cleanup for its
+   * task, and from the periodic sweep for releases that happen elsewhere (or
+   * across a restart). Ordinary admission decides each wake under the task
+   * lock and consumes the kept receipt atomically with the run it queues.
+   */
+  async function resumeDeferredStageWakes(input: { companyId?: string; issueId?: string } = {}) {
+    if ((await getSchedulingSuppression()).suppressed) return;
+    const now = Date.now();
+    const waits = await db.select().from(agentWakeupRequests).where(and(
+      input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
+      input.issueId ? sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}` : undefined,
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      inArray(agentWakeupRequests.reason, [...EXECUTION_STAGE_WAKE_REASONS]),
+      sql`${agentWakeupRequests.payload}->'executionWait'->>'cause' = ${EXECUTION_STAGE_WAKE_WAIT_CAUSE}`,
+      // A task-scoped call follows that task's cleanup; the periodic sweep
+      // revisits a kept wake at most every 30 seconds.
+      input.issueId ? undefined : lte(agentWakeupRequests.updatedAt, new Date(now - 30_000)),
+    )).orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
+    for (const wake of waits) {
+      if (!isKeptExecutionStageWake(wake)) continue;
+      const payload = parseObject(wake.payload);
+      const issueId = readNonEmptyString(payload.issueId);
+      if (!issueId) continue;
+      const blocker = await getExecutionBlocker(db, wake.companyId, issueId);
+      if (blocker?.cause === EXECUTION_STAGE_WAKE_WAIT_CAUSE) {
+        // Still owned: rotate behind newer receipts so one long cleanup
+        // cannot starve wakes whose owner has already released.
+        await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+          eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution")));
+        continue;
+      }
+      const {
+        executionWait: _executionWait,
+        [DEFERRED_WAKE_CONTEXT_KEY]: deferredContext,
+        ...wakePayload
+      } = payload;
+      await enqueueWakeup(wake.agentId, {
+        source: wake.source as WakeupOptions["source"],
+        triggerDetail: (wake.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
+        reason: wake.reason,
+        payload: wakePayload,
+        contextSnapshot: parseObject(deferredContext),
+        requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+        requestedByActorId: wake.requestedByActorId,
+        idempotencyKey: wake.idempotencyKey,
+        stageWakeResume: true,
+      }, wake.id).catch(async (err) => {
+        logger.warn({ err, wakeId: wake.id }, "kept execution-stage wake was not admitted");
+        // A refusal thrown before any receipt was written is final too, as it
+        // is for a fresh stage wake. Unexpected failures keep the wake for a
+        // later pass.
+        if (!(err instanceof HttpError) || err.status >= 500) return;
+        await db.update(agentWakeupRequests).set({
+          status: "skipped", error: err.message, finishedAt: new Date(), updatedAt: new Date(),
+        }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      });
+    }
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
+    await resumeDeferredStageWakes();
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
@@ -2408,6 +2478,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       queuedCommentIdsFromRunContext(enrichedContextSnapshot).length === 0 &&
       !isInteractionResolutionWakePayload(payload ?? {}) &&
       !hasInteractionContinuationWakeContext(enrichedContextSnapshot);
+    // Settle a kept stage-wake receipt this resume did not consume. The
+    // status guard keeps a concurrent admission's consumption authoritative.
+    const finishKeptStageWake = async (
+      requestId: string,
+      result: { status: "skipped" | "cancelled" | "coalesced"; reason?: string; error?: string | null; runId?: string },
+      queryDb: Db = db,
+    ) => {
+      const now = new Date();
+      await queryDb.update(agentWakeupRequests).set({
+        status: result.status,
+        ...(result.reason ? { reason: result.reason } : {}),
+        error: result.error ?? null,
+        ...(result.runId ? { runId: result.runId } : {}),
+        finishedAt: now,
+        updatedAt: now,
+      }).where(and(eq(agentWakeupRequests.id, requestId), eq(agentWakeupRequests.companyId, agent.companyId),
+        eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    };
     const writeSkippedRequest = async (
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
@@ -2416,6 +2504,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       // A temporary refusal must leave the handoff retryable, without burning
       // its one durable receipt ID on a skipped wake.
       if (caseRequest) return { created: false };
+      if (executionWaitRequestId && opts.stageWakeResume) {
+        // Only the previous owner's cleanup keeps a stage wake. Any other
+        // refusal ends it exactly as it would end a fresh stage wake.
+        await finishKeptStageWake(executionWaitRequestId, {
+          status: "skipped", reason: skipReason, error: patch.error ?? null,
+        });
+        return { created: false };
+      }
       if (executionWaitRequestId) {
         await db.update(agentWakeupRequests).set({
           payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
@@ -2800,6 +2896,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
       const cancelledRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
+      // Set when a resumed stage wake is kept again behind the previous owner.
+      let stageWakeKept = false;
 
       const outcome = await db
         .transaction(async (tx) => {
@@ -2813,20 +2911,51 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
               // A user message can join a queue originally created by a
               // system wake. Admission validates the saved user comment or board click.
-              (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
-                ? undefined : eq(agentWakeupRequests.requestedByActorType, "user"),
-              opts.queuedCommentInterruptId === executionWaitRequestId
-                ? sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${opts.requestedByActorId ?? ""}`
-                : opts.queuedCommentRequestId === executionWaitRequestId ? undefined
-                  : eq(agentWakeupRequests.requestedByActorId, opts.requestedByActorId ?? ""),
+              // A resumed stage wake keeps the identity of the actor whose
+              // hand-off requested it, including a missing one.
+              opts.stageWakeResume
+                ? (opts.requestedByActorType ? eq(agentWakeupRequests.requestedByActorType, opts.requestedByActorType)
+                  : isNull(agentWakeupRequests.requestedByActorType))
+                : (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
+                  ? undefined : eq(agentWakeupRequests.requestedByActorType, "user"),
+              opts.stageWakeResume
+                ? (opts.requestedByActorId ? eq(agentWakeupRequests.requestedByActorId, opts.requestedByActorId)
+                  : isNull(agentWakeupRequests.requestedByActorId))
+                : opts.queuedCommentInterruptId === executionWaitRequestId
+                  ? sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${opts.requestedByActorId ?? ""}`
+                  : opts.queuedCommentRequestId === executionWaitRequestId ? undefined
+                    : eq(agentWakeupRequests.requestedByActorId, opts.requestedByActorId ?? ""),
               sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
             ));
             // The issue lock serializes cleanup callbacks and periodic workers.
             // An adopted, discarded, or edited receipt is no longer authority.
-            if (!pending || (!opts.taskRetryRequestId && !(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
+            if (!pending || (opts.stageWakeResume ? !isKeptExecutionStageWake(pending) :
+                (!opts.taskRetryRequestId && !(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
                 !(opts.queuedCommentInterruptId && await readQueuedInteractionResponse(tx as unknown as Db,
-                  agent.companyId, issueId, pending.payload)))) {
+                  agent.companyId, issueId, pending.payload))))) {
               return { kind: "deferred" as const };
+            }
+            if (opts.stageWakeResume) {
+              // Re-check review authority under the task lock: only the current
+              // participant of the same pending stage may still be started.
+              const [current] = await tx.select({ status: issues.status, executionState: issues.executionState })
+                .from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)));
+              if (!current || !isCurrentExecutionStageParticipant(current, agentId, pending.payload)) {
+                await finishKeptStageWake(pending.id, { status: "cancelled",
+                  error: "The review stage or its participant changed before this wake could start." }, tx as unknown as Db);
+                return { kind: "skipped" as const };
+              }
+              // A run this participant already has for the task delivers the
+              // stage; a second admission would duplicate it.
+              const [existingRun] = await tx.select().from(heartbeatRuns).where(and(
+                eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agentId),
+                or(eq(heartbeatRuns.nativeIssueId, issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
+                inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+              )).orderBy(asc(heartbeatRuns.createdAt)).limit(1);
+              if (existingRun) {
+                await finishKeptStageWake(pending.id, { status: "coalesced", runId: existingRun.id }, tx as unknown as Db);
+                return { kind: "coalesced" as const, run: existingRun };
+              }
             }
             if (opts.taskRetryRequestId) {
               const retry = readTaskRetryIntent(pending.payload);
@@ -3064,6 +3193,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
+              executionState: issues.executionState,
               createdAt: issues.createdAt,
             })
             .from(issues)
@@ -3291,7 +3421,27 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           ) => {
             if (caseRequest) waitForCaseAdmission("execution_reconciliation_required", executionBlocker.nextAction);
             opts.issueStateGuard?.onExecutionDeferred?.(executionBlocker.cause);
-            const condition = { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait };
+            // Handing a task to a review stage stops the executor's run, whose
+            // process and environment lease are released only by its own
+            // finalisation. Keep the current participant's stage wake until
+            // then instead of ending it; any other gate still ends it below.
+            const keepsStageWake = executionBlocker.cause === EXECUTION_STAGE_WAKE_WAIT_CAUSE &&
+              Boolean(executionBlocker.agentId) && executionBlocker.agentId !== agentId &&
+              Boolean(reason && EXECUTION_STAGE_WAKE_REASONS.has(reason)) &&
+              enrichedContextSnapshot.source === "issue.execution_stage" &&
+              isCurrentExecutionStageParticipant(issue, agentId, payload);
+            const condition = keepsStageWake
+              ? { recoveryActionId: null, cause: executionBlocker.cause, runId: executionBlocker.runId,
+                reason: executionBlocker.cause, message: executionBlocker.nextAction }
+              : { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait };
+            if (executionWaitRequestId && opts.stageWakeResume) {
+              if (!keepsStageWake) {
+                await finishKeptStageWake(executionWaitRequestId, { status: "skipped",
+                  reason: "execution_reconciliation_required", error: executionBlocker.nextAction }, tx as unknown as Db);
+                return { kind: "skipped" as const };
+              }
+              stageWakeKept = true;
+            }
             if (executionWaitRequestId) {
               await tx.update(agentWakeupRequests).set({
                 payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}', ${JSON.stringify(condition)}::jsonb)`,
@@ -3299,7 +3449,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
               return { kind: "deferred" as const };
             }
-            if (durableRequest || wakeCommentId ||
+            if (durableRequest || wakeCommentId || keepsStageWake ||
                 hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
                 readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
               await tx.insert(agentWakeupRequests).values({
@@ -3339,7 +3489,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const explicitContinuationRunId = randomUUID();
           const executionBlocker = await getExecutionBlocker(
             tx as unknown as Db, issue.companyId, issue.id,
-            { conversationResetCommentId: opts.requestedByActorType === "user" ? wakeCommentId : null },
+            { conversationResetCommentId: opts.requestedByActorType === "user" ? wakeCommentId : null, admittingAgentId: agentId },
           );
           // Prove eligibility without retiring the hold. Later gates can still
           // decline this wake; hold retirement and successor creation stay atomic.
@@ -4208,7 +4358,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // in separate turns, or finalization will deliver it a second time.
           const pendingComments =
             (executionWaitRequestId || canCoalesceComments) &&
-            (ownsReconstructionContinuation || !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id)))
+            (ownsReconstructionContinuation || !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id,
+              { admittingAgentId: agentId })))
               ? await tx
                   .select()
                   .from(agentWakeupRequests)
@@ -4359,6 +4510,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
       if (outcome.kind === "durable") {
         return outcome.receipt.runId ? getRun(outcome.receipt.runId) : null;
+      }
+      if (executionWaitRequestId && opts.stageWakeResume && !stageWakeKept) {
+        // Settle a resumed stage wake that no admission consumed: a run that
+        // absorbed it delivers it; any other answer was a refusal recorded on
+        // its own receipt. A consumed receipt is left as it is.
+        await finishKeptStageWake(executionWaitRequestId,
+          outcome.kind === "coalesced" || outcome.kind === "queued" || outcome.kind === "replayed"
+            ? { status: "coalesced", runId: outcome.run.id }
+            : { status: "skipped", error: "Admission answered this stage wake on a separate receipt after the previous run released the task." });
       }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") {
         return null;
@@ -4909,6 +5069,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     withChatControlRecoveryGate,
     trackWakeup,
     resumeQueuedRuns,
+    resumeDeferredStageWakes,
     parseHeartbeatPolicy,
     claimDueTimerHeartbeat,
   };

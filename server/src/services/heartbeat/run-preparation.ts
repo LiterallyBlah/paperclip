@@ -833,6 +833,12 @@ export interface WakeupOptions {
   queuedCommentRequestId?: string;
   /** Internal delivery of the authenticated task-level Retry receipt. */
   taskRetryRequestId?: string;
+  /**
+   * Internal resume of an execution-stage wake kept while another agent's
+   * finishing run still owned the task. Only the server's stage-wake resume
+   * sets this, together with that kept receipt's ID.
+   */
+  stageWakeResume?: boolean;
   /** Exact failed run selected by an authenticated board Retry request. */
   failedRunId?: string | null;
   durableChatRequest?: DurableChatWakeupRequest;
