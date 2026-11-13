@@ -16,7 +16,7 @@ interface IssueReviewStageDecisionPanelProps {
 }
 
 /**
- * Task-page home for a pending native review/approval stage decision (BLA-180).
+ * Task-page home for a pending native review/approval stage decision.
  *
  * Renders when the stage is held by a user — controls for that user, a "who
  * must act" line for everyone else — and when the task is assigned to the

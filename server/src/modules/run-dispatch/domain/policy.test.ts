@@ -448,7 +448,7 @@ describe("decideQueuedRunStaleness", () => {
         .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
     });
 
-    // Rewritten for the owner's choice: the question runs past another review stage, answer-only.
+    // An addressed question runs past another review stage, in answer-only mode.
     it("passes the review-participant gate but keeps the terminal-status and pending-response gates", () => {
       expect(decideQueuedRunStaleness({
         ...addresseeFacts(),

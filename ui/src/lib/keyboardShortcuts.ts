@@ -125,7 +125,7 @@ export function resolveAttentionQueueKeyAction({
     case "Enter":
       // Enter on a focused control (a row's Approve, Request changes, link…)
       // belongs to that control; toggling the selected row instead would
-      // swallow the activation and collapse the resolver (BLA-180).
+      // swallow the activation and collapse the resolver.
       if (isInteractiveControlTarget(target)) return "ignore";
       return hasSelection ? "toggle" : "ignore";
     case "x":

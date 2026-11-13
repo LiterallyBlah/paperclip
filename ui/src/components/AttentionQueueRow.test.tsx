@@ -266,7 +266,7 @@ describe("AttentionQueueRow", () => {
     }
   });
 
-  // BLA-180: the review-round cap hands a pending native stage to a user. The
+  // The review-round cap hands a pending native stage to a user. The
   // row must offer that user the stage's own verbs, not information only.
   const userHeldStageItem = (userId = "me", expandedState?: { inlineResolvable?: boolean }) =>
     buildItem({

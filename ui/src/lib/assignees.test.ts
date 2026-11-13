@@ -167,7 +167,7 @@ it.each(["issue.created", "issue.child_created"])("uses a REST %s receipt assign
   expect(suggestedCommentAssigneeValue({ assigneeUserId: "other" }, [], "other", undefined, [event])).toBe("");
 });
 
-describe("pending native review stage held by the viewer (BLA-180)", () => {
+describe("pending native review stage held by the viewer", () => {
   // Shape of a review-cap escalation: the reviewer agent requested changes and
   // the stage was handed to the responsible human.
   const escalatedBy = (actorId: string): ActivityEvent => ({
