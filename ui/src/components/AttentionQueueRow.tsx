@@ -207,7 +207,7 @@ export const AttentionQueueRow = memo(function AttentionQueueRow({
   const renderFooter = ({ compact }: { compact: boolean }) => {
     const showCompact = compactActions.length > 0 && (compact || !expanded);
     // A collapsed native-stage row names the decision it opens instead of a
-    // bare "See more" (BLA-180).
+    // bare "See more".
     const showStageDecision = compact && !expanded && viewerHoldsReviewStage;
     if (!toggle && !showCompact && !showOpen && !showRestore && !showStageDecision) return null;
     return (
@@ -829,7 +829,7 @@ function InlineResolver({
 
   if (item.sourceKind === "review") {
     // A pending native stage held by a user resolves through the participant's
-    // own decision path (BLA-180); the subject IS the issue.
+    // own decision path; the subject IS the issue.
     const reviewStage = readReviewStageMetadata(item);
     if (reviewStage && item.subject.metadata?.reviewAttentionState !== "stalled") {
       return (

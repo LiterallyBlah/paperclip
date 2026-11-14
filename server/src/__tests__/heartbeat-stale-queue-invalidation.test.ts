@@ -2059,7 +2059,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(await settledRun(runId)).toMatchObject({ status: "succeeded" });
     });
 
-    // Rewritten from Oracle's "keeps the dependency gate" test for the owner's choice: the question runs, answer-only.
+    // An addressed question on a dependency-blocked issue runs, in answer-only mode (it no longer waits on the dependency gate).
     it("runs an addressed wake on a dependency-blocked issue, in bounded interaction mode", async () => {
       const f = await seedAddresseeFixture();
       const [blocker] = await db.insert(issues).values({ companyId: f.companyId, title: "Unfinished blocker",

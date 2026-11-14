@@ -71,7 +71,7 @@ function issueWith(participant: { type: "agent" | "user"; agentId?: string; user
   };
 }
 
-describe("IssueReviewStageDecisionPanel (BLA-180)", () => {
+describe("IssueReviewStageDecisionPanel", () => {
   it("puts Approve / Request changes on the task page for the user who holds the stage", () => {
     const el = render(<IssueReviewStageDecisionPanel issue={issueWith({ type: "user", userId: "me" })} currentUserId="me" />);
     const panel = el.querySelector('[data-testid="issue-review-stage-panel"]');
