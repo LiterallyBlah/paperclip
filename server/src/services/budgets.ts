@@ -591,6 +591,18 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
       })
       .returning()
       .then((rows) => rows[0] ?? null);
+    // A hard-stop board approval logs approval.created (published post-commit).
+    if (approval && incident) {
+      await recordActivity({
+        companyId: policy.companyId,
+        actorType: "system",
+        actorId: "budget_service",
+        action: "approval.created",
+        entityType: "approval",
+        entityId: approval.id,
+        details: { type: approval.type, issueIds: [], source: "budget_hard_stop", budgetIncidentId: incident.id, scopeType: policy.scopeType },
+      });
+    }
     return incident ? { incident, created: true } : null;
   }
 

@@ -4590,6 +4590,16 @@ export function agentRoutes(
               requestedConfigurationSnapshot: { adapterType: setupAgent.adapterType, adapterConfig, runtimeConfig, desiredSkills },
             }, decisionNote: null, decidedByUserId: null, decidedAt: null, updatedAt: new Date(),
           });
+          // This repair path creates a pending hire approval too.
+          await logActivity(db, {
+            companyId,
+            actorType: "user",
+            actorId: req.actor.userId,
+            action: "approval.created",
+            entityType: "approval",
+            entityId: approval.id,
+            details: { type: approval.type, issueIds: [], linkedAgentId: setupAgent.id, source: "agent_setup" },
+          });
         }
         res.status(200).json({ agent: redactAgentRowForResponse(setupAgent), approval, idempotent: true });
         return;

@@ -21,6 +21,7 @@ import type { ConnectionSetupPolicy } from "../connections/setup-policy.js";
 import { assertSupportedConnection } from "../connections/setup-policy.js";
 
 import { actorBinding } from "../actor.js";
+import { publishInteractionCreatedPluginEvent } from "../../plugin-decision-events.js";
 import { assertOAuthRedirectConstraints, randomOauthToken, base64UrlSha256 } from "./authorization-constraints.js";
 import type { createPersonalConnectionIdentity } from "../connections/personal-identity.js";
 
@@ -608,6 +609,7 @@ export function createOAuthAuthorizationStart(db: Db, dependencies: Dependencies
         },
       };
       const issueId = input.issueId;
+      let createdInteraction: typeof issueThreadInteractions.$inferSelect | null = null;
       await db.transaction(async tx => {
         await notifyIssueReviewState(tx, { companyId, issueId });
         const [existingInteraction] = await tx
@@ -663,6 +665,7 @@ export function createOAuthAuthorizationStart(db: Db, dependencies: Dependencies
                 payload,
               })
               .returning();
+        if (interaction && !existingInteraction) createdInteraction = interaction;
         if (interaction) {
           await tx
             .update(toolOauthStates)
@@ -670,6 +673,11 @@ export function createOAuthAuthorizationStart(db: Db, dependencies: Dependencies
             .where(eq(toolOauthStates.state, state));
         }
       });
+      if (createdInteraction) await publishInteractionCreatedPluginEvent(
+        createdInteraction,
+        { agentId: binding.actorType === "agent" ? binding.actorId : null },
+        db,
+      );
     }
 
     await db.transaction(async tx => {

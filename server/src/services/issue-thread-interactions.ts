@@ -123,6 +123,7 @@ import {
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
+import { publishInteractionCreatedPluginEvent } from "./plugin-decision-events.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import {
@@ -3071,10 +3072,17 @@ export function issueThreadInteractionService(
       });
 
       const interaction = hydrateInteraction(created) as ConnectionIntentInteraction;
-      if (inserted) emitInteractionCreatedTelemetry({
-        interactionKind: "connection_intent",
-        usedDeprecatedResolverPolicyAlias: false,
-      });
+      if (inserted) {
+        emitInteractionCreatedTelemetry({
+          interactionKind: "connection_intent",
+          usedDeprecatedResolverPolicyAlias: false,
+        });
+        await publishInteractionCreatedPluginEvent(
+          interaction,
+          { agentId: payload.requestingAgentId, runId: input.sourceRunId },
+          db,
+        );
+      }
       return interaction;
     },
     updateConnectionIntentPhase: async (
@@ -4274,6 +4282,7 @@ export function issueThreadInteractionService(
         interactionKind: interaction.kind,
         usedDeprecatedResolverPolicyAlias,
       });
+      await publishInteractionCreatedPluginEvent(interaction, actor, db);
       return interaction;
     },
 

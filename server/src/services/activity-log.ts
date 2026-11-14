@@ -40,6 +40,27 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
 
 let _pluginEventBus: PluginEventBus | null = null;
 
+/**
+ * Observer called for every published activity row and plugin domain event
+ * (`eventType` is null for an activity row without a plugin event). Used by
+ * plugin-decision-events to re-evaluate computed blocker attention.
+ */
+export type PluginDomainActivityObserver = (companyId: string, eventType: string | null) => void;
+let _domainActivityObserver: PluginDomainActivityObserver | null = null;
+
+export function setPluginDomainActivityObserver(fn: PluginDomainActivityObserver | null): void {
+  _domainActivityObserver = typeof fn === "function" ? fn : null;
+}
+
+function notifyDomainActivityObserver(companyId: string, eventType: string | null): void {
+  if (!_domainActivityObserver) return;
+  try {
+    _domainActivityObserver(companyId, eventType);
+  } catch (err) {
+    logger.warn({ err }, "plugin domain activity observer failed");
+  }
+}
+
 /** Wire the plugin event bus so domain events are forwarded to plugins. */
 export function setPluginEventBus(bus: PluginEventBus): void {
   if (_pluginEventBus) {
@@ -49,12 +70,16 @@ export function setPluginEventBus(bus: PluginEventBus): void {
 }
 
 function eventTypeForActivityAction(action: string): PluginEventType | null {
+  // The interaction service publishes this plugin event itself, once per
+  // created row and with the addressee fields; the activity row stays as it is.
+  if (action === "issue.thread_interaction_created") return null;
   if (PLUGIN_EVENT_SET.has(action)) return action as PluginEventType;
   return ACTIVITY_ACTION_TO_PLUGIN_EVENT[action.replaceAll(".", "_")] ?? null;
 }
 
 export function publishPluginDomainEvent(event: PluginEvent): void {
   if (!_pluginEventBus) return;
+  notifyDomainActivityObserver(event.companyId, event.eventType);
   void _pluginEventBus.emit(event).then(({ errors }) => {
     for (const { pluginId, error } of errors) {
       logger.warn({ pluginId, eventType: event.eventType, err: error }, "plugin event handler failed");
@@ -164,6 +189,7 @@ export function publishActivity(publication: ActivityPublication) {
     payload: publication.payload,
   });
   if (publication.pluginEvent) publishPluginDomainEvent(publication.pluginEvent);
+  else notifyDomainActivityObserver(publication.companyId, null);
   } catch (error) {
     finish(true);
     throw error;

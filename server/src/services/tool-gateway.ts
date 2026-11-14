@@ -132,6 +132,7 @@ import type {
   PluginToolDispatcher,
 } from "./plugin-tool-dispatcher.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { publishInteractionCreatedPluginEvent } from "./plugin-decision-events.js";
 import { secretService } from "./secrets.js";
 import { connectionGrantCredentialRef, resolveConnectionGrantSecret } from "./connection-credentials.js";
 import { railwayCommandBudgetMs, createRailwayClient, isRailwayConnection, isRailwayEndpoint, isRailwayToolBlocked, normalizeRailwayToolName, RAILWAY_API_URL, RAILWAY_TOOL_PREFIX, RailwayError } from "./railway.js";
@@ -2696,6 +2697,24 @@ export function createToolGatewayService(
           linkedByAgentId: input.session.agentId,
         })
         .onConflictDoNothing(), { issueIds: [approvalIssueId] });
+      // Same shape as the generic approvals route, plus the action request id
+      // that its approval card also carries (one decision, one key).
+      await logActivity(db, {
+        companyId: input.session.companyId,
+        actorType: input.session.agentId ? "agent" : "system",
+        actorId: input.session.agentId ?? "tool_gateway",
+        agentId: input.session.agentId ?? null,
+        runId: input.session.runId ?? null,
+        action: "approval.created",
+        entityType: "approval",
+        entityId: approval.id,
+        details: {
+          type: approval.type,
+          issueIds: [approvalIssueId],
+          source: "tool_gateway",
+          actionRequestId: actionRequest.id,
+        },
+      });
     }
 
     const interaction = await interactions.create(
@@ -4635,7 +4654,7 @@ export function createToolGatewayService(
         .where(eq(issueThreadInteractions.id, existing.id));
       return;
     }
-    await db.insert(issueThreadInteractions).values({
+    const [createdAuthorizationInteraction] = await db.insert(issueThreadInteractions).values({
       companyId: session.companyId,
       issueId: session.issueId,
       kind: "request_confirmation",
@@ -4658,7 +4677,12 @@ export function createToolGatewayService(
       createdByAgentId: session.agentId,
       addresseeUserId: userId,
       payload,
-    });
+    }).returning();
+    await publishInteractionCreatedPluginEvent(
+      createdAuthorizationInteraction,
+      { agentId: session.agentId, runId: session.runId },
+      db,
+    );
   }
 
   async function resolveConnectionGrant(

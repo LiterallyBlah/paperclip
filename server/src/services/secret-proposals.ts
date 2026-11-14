@@ -20,6 +20,7 @@ import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } f
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import { agentService } from "./agents.js";
 import { logActivity } from "./activity-log.js";
+import { publishInteractionCreatedPluginEvent } from "./plugin-decision-events.js";
 import { normalizeSecretKey, secretService } from "./secrets.js";
 
 const CONFIG_PATH_RE = /^(?:env\.[A-Za-z_][A-Za-z0-9_]*|access\.[A-Za-z_][A-Za-z0-9_]*)$/;
@@ -253,6 +254,11 @@ export function createSecretProposalsService(db: Db) {
         serverOwnedPayload: "secretProposal",
       },
     });
+    await publishInteractionCreatedPluginEvent(
+      interaction,
+      { agentId: proposal.proposedByAgentId, runId: proposal.originRunId },
+      txDb,
+    );
     return linked;
   }
 
