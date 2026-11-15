@@ -177,6 +177,7 @@ function derivePersistedMonitorState(input: {
       notes,
       scheduledBy,
       ...metadata,
+      ...deferredCountFor(fromState, nextCheckAt),
       clearedAt: null,
       clearReason: null,
     };
@@ -210,6 +211,20 @@ function derivePersistedMonitorState(input: {
   return null;
 }
 
+/**
+ * Deferred-fire counts belong to one scheduled check. Keep the count while the
+ * same nextCheckAt is still scheduled; any new schedule starts from zero.
+ */
+function deferredCountFor(
+  state: IssueExecutionMonitorState | null | undefined,
+  nextCheckAt: string,
+): { deferredCount?: number } {
+  if (state?.status !== "scheduled" || !state.deferredCount) return {};
+  const stateTime = parseMonitorDate(state.nextCheckAt)?.getTime();
+  const nextTime = parseMonitorDate(nextCheckAt)?.getTime();
+  return stateTime !== undefined && stateTime === nextTime ? { deferredCount: state.deferredCount } : {};
+}
+
 function buildScheduledMonitorState(
   previous: IssueExecutionMonitorState | null,
   monitor: IssueExecutionMonitorPolicy,
@@ -222,6 +237,7 @@ function buildScheduledMonitorState(
     notes: monitor.notes ?? null,
     scheduledBy: monitor.scheduledBy,
     ...monitorMetadataFromPolicy(monitor),
+    ...deferredCountFor(previous, monitor.nextCheckAt),
     clearedAt: null,
     clearReason: null,
   };
@@ -1201,6 +1217,52 @@ export function buildIssueMonitorTriggeredPatch(input: {
     monitorAttemptCount: nextMonitorState.attemptCount,
     monitorNotes: nextMonitorState.notes,
     monitorScheduledBy: nextMonitorState.scheduledBy,
+  };
+}
+
+/** Consecutive deferred fires already recorded for the issue's current scheduled check. */
+export function issueMonitorDeferredCount(issue: IssueLike): number {
+  const nextCheckAt = isoString(issue.monitorNextCheckAt);
+  if (!nextCheckAt) return 0;
+  return deferredCountFor(parseIssueExecutionState(issue.executionState)?.monitor, nextCheckAt).deferredCount ?? 0;
+}
+
+/**
+ * A scheduled fire that could not dispatch (execution held or dispatch failed)
+ * still consumes an attempt and moves the check forward, so attempt and
+ * timeout bounds keep making progress instead of the same row re-firing.
+ */
+export function buildIssueMonitorDeferredPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy | null;
+  nextCheckAt: Date;
+  deferredCount: number;
+}) {
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({
+    issue: input.issue,
+    state: existingState,
+    policy: input.policy,
+  });
+  const attemptCount = (currentMonitorState?.attemptCount ?? 0) + 1;
+  const nextMonitorState: IssueExecutionMonitorState = {
+    status: "scheduled",
+    lastTriggeredAt: currentMonitorState?.lastTriggeredAt ?? null,
+    notes: currentMonitorState?.notes ?? null,
+    scheduledBy: currentMonitorState?.scheduledBy ?? null,
+    ...monitorMetadataFromState(currentMonitorState),
+    nextCheckAt: input.nextCheckAt.toISOString(),
+    attemptCount,
+    deferredCount: input.deferredCount,
+    clearedAt: null,
+    clearReason: null,
+  };
+
+  return {
+    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+    monitorNextCheckAt: input.nextCheckAt,
+    monitorWakeRequestedAt: null,
+    monitorAttemptCount: attemptCount,
   };
 }
 

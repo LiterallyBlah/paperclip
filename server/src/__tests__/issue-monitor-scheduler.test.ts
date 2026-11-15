@@ -344,23 +344,153 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect((await heartbeat.tickTimers(tickAt)).enqueued).toBe(0);
     expect((await heartbeat.tickTimers(new Date(tickAt.getTime() + 30_000))).enqueued).toBe(0);
     const [waiting] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(waiting.monitorNextCheckAt).toEqual(nextCheckAt);
+    // The held fire counts one attempt and backs off instead of re-firing every tick.
+    expect(waiting.monitorNextCheckAt).toEqual(new Date(tickAt.getTime() + 60_000));
     expect(waiting.monitorWakeRequestedAt).toBeNull();
-    expect(waiting.monitorAttemptCount).toBe(0);
+    expect(waiting.monitorAttemptCount).toBe(1);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
     const diagnostics = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId)))
       .filter(row => row.action === "issue.monitor_deferred");
     expect(diagnostics).toHaveLength(1);
     expect(diagnostics[0]?.details).toMatchObject({ nextCheckAt: nextCheckAt.toISOString(),
-      reason: "execution_reconciliation_required", blockerCause: "legacy_execution_requires_reconciliation", attemptCount: 0 });
+      rescheduledNextCheckAt: new Date(tickAt.getTime() + 60_000).toISOString(), deferredCount: 1,
+      reason: "execution_reconciliation_required", blockerCause: "legacy_execution_requires_reconciliation", attemptCount: 1 });
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold!.id)))[0]?.status).toBe("active");
     await db.update(issueRecoveryActions).set({ status: "resolved", resolvedAt: new Date(),
       evidence: { runId: sourceRunId, executionReconciliation: { action: "continue" } } }).where(eq(issueRecoveryActions.id, hold!.id));
     expect((await heartbeat.tickTimers(new Date(tickAt.getTime() + 60_000))).enqueued).toBe(1);
     expect((await heartbeat.tickTimers(new Date(tickAt.getTime() + 90_000))).enqueued).toBe(0);
     const [triggered] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(triggered.monitorAttemptCount).toBe(1);
+    expect(triggered.monitorAttemptCount).toBe(2);
     expect(triggered.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(triggered.executionState)?.monitor).toMatchObject({ status: "triggered", attemptCount: 2 });
+    expect(parseIssueExecutionState(triggered.executionState)?.monitor?.deferredCount).toBeUndefined();
+  });
+
+  async function holdIssueExecution(input: { companyId: string; agentId: string; issueId: string }) {
+    const sourceRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId: input.companyId, agentId: input.agentId,
+      runtimeMode: "legacy", status: "interrupted", errorCode: "process_lost",
+      finishedAt: new Date(), contextSnapshot: { issueId: input.issueId } });
+    await db.insert(issueRecoveryActions).values({ companyId: input.companyId, sourceIssueId: input.issueId,
+      kind: "active_run_watchdog", status: "active", ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation", fingerprint: sourceRunId,
+      evidence: { runId: sourceRunId }, nextAction: "Inspect the interrupted execution before continuing." });
+  }
+
+  async function readIssue(issueId: string) {
+    return db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+  }
+
+  it("counts and backs off held monitor fires until maxAttempts clears them through recovery", async () => {
+    const fixture = await seedFixture({ monitor: { maxAttempts: 3, recoveryPolicy: "wake_owner" } });
+    const { issueId, agentId, nextCheckAt } = fixture;
+    await holdIssueExecution(fixture);
+    const heartbeat = heartbeatService(db);
+
+    let dueAt = new Date(nextCheckAt.getTime() + 60_000);
+    let previousDelay = 0;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      expect((await heartbeat.tickTimers(dueAt)).enqueued).toBe(0);
+      const issue = await readIssue(issueId);
+      expect(issue.monitorAttemptCount).toBe(attempt);
+      expect(issue.monitorWakeRequestedAt).toBeNull();
+      expect(issue.monitorNextCheckAt!.getTime()).toBeGreaterThan(dueAt.getTime());
+      const delay = issue.monitorNextCheckAt!.getTime() - dueAt.getTime();
+      expect(delay).toBeGreaterThanOrEqual(previousDelay);
+      previousDelay = delay;
+      expect(normalizeIssueExecutionPolicy(issue.executionPolicy)?.monitor?.nextCheckAt)
+        .toBe(issue.monitorNextCheckAt!.toISOString());
+      expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+        status: "scheduled", attemptCount: attempt, nextCheckAt: issue.monitorNextCheckAt!.toISOString(),
+      });
+      // A tick before the backed-off time is a no-op: the row is no longer due every tick.
+      await heartbeat.tickTimers(new Date(dueAt.getTime() + 1_000));
+      expect((await readIssue(issueId)).monitorAttemptCount).toBe(attempt);
+      dueAt = issue.monitorNextCheckAt!;
+    }
+
+    await heartbeat.tickTimers(dueAt);
+    const cleared = await readIssue(issueId);
+    expect(cleared.monitorNextCheckAt).toBeNull();
+    expect(normalizeIssueExecutionPolicy(cleared.executionPolicy)?.monitor ?? null).toBeNull();
+    expect(parseIssueExecutionState(cleared.executionState)?.monitor).toMatchObject({
+      status: "cleared", clearReason: "max_attempts_exhausted",
+    });
+    // The owner recovery wake goes through the unchanged recovery path; the active
+    // execution hold still gates it (coalesced into the hold's skipped request).
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.filter((wake) => wake.status !== "skipped")).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
+    const actions = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).map((row) => row.action);
+    expect(actions.filter((action) => action === "issue.monitor_deferred")).toHaveLength(3);
+    expect(actions).toContain("issue.monitor_exhausted");
+    expect(actions).toContain("issue.monitor_recovery_wake_queued");
+    expect(actions).not.toContain("issue.monitor_triggered");
+  });
+
+  it("bounds held monitor fires without maxAttempts or timeoutAt", async () => {
+    const fixture = await seedFixture();
+    const { issueId, agentId, nextCheckAt } = fixture;
+    await holdIssueExecution(fixture);
+    const heartbeat = heartbeatService(db);
+
+    let dueAt = new Date(nextCheckAt.getTime() + 60_000);
+    let fires = 0;
+    for (; fires < 40; fires += 1) {
+      await heartbeat.tickTimers(dueAt);
+      const issue = await readIssue(issueId);
+      if (!issue.monitorNextCheckAt) break;
+      expect(issue.monitorNextCheckAt.getTime()).toBeGreaterThan(dueAt.getTime());
+      expect(issue.monitorNextCheckAt.getTime() - dueAt.getTime()).toBeLessThanOrEqual(30 * 60_000);
+      dueAt = issue.monitorNextCheckAt;
+    }
+    expect(fires).toBeLessThan(40);
+    const cleared = await readIssue(issueId);
+    expect(cleared.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(cleared.executionState)?.monitor).toMatchObject({
+      status: "cleared", clearReason: "dispatch_deferred_exhausted",
+    });
+    // The owner recovery wake goes through the unchanged recovery path; the active
+    // execution hold still gates it (coalesced into the hold's skipped request).
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.filter((wake) => wake.status !== "skipped")).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
+    const actions = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).map((row) => row.action);
+    expect(actions.filter((action) => action === "issue.monitor_deferred")).toHaveLength(10);
+    expect(actions).toContain("issue.monitor_exhausted");
+    expect(actions).toContain("issue.monitor_recovery_wake_queued");
+    expect(fires).toBe(10);
+  });
+
+  it("does not clobber a monitor replaced while a held fire is being deferred", async () => {
+    const fixture = await seedFixture();
+    const { issueId } = fixture;
+    await holdIssueExecution(fixture);
+    const replacementAt = new Date("2026-04-11T13:30:00.000Z");
+    let replaced = false;
+    const racingDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property !== "transaction") return Reflect.get(target, property, receiver);
+        return async (callback: Parameters<typeof db.transaction>[0]) => {
+          const result = await db.transaction(callback);
+          const row = result as { id?: string; monitorWakeRequestedAt?: Date | null } | null;
+          if (!replaced && row?.id === issueId && row.monitorWakeRequestedAt) {
+            replaced = true;
+            await db.update(issues).set({ monitorNextCheckAt: replacementAt, monitorWakeRequestedAt: null,
+              executionPolicy: { monitor: { nextCheckAt: replacementAt.toISOString(), notes: "New check", scheduledBy: "assignee" } },
+            }).where(eq(issues.id, issueId));
+          }
+          return result;
+        };
+      },
+    });
+    await heartbeatService(racingDb).tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+    expect(replaced).toBe(true);
+    const issue = await readIssue(issueId);
+    expect(issue.monitorNextCheckAt).toEqual(replacementAt);
+    expect(issue.monitorAttemptCount).toBe(0);
+    expect(normalizeIssueExecutionPolicy(issue.executionPolicy)?.monitor?.nextCheckAt).toBe(replacementAt.toISOString());
   });
 
   it("recovers a rejected native monitor call and delivers the corrected schedule once", async () => {

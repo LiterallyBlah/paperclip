@@ -816,6 +816,8 @@ export interface IssueExecutionMonitorState {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  /** Consecutive scheduled fires of this nextCheckAt deferred because execution was held. */
+  deferredCount?: number;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
 }

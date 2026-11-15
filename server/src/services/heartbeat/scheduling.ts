@@ -47,6 +47,8 @@ import {
   buildIssueMonitorClearedPatch,
   parseIssueExecutionState,
   buildIssueMonitorTriggeredPatch,
+  buildIssueMonitorDeferredPatch,
+  issueMonitorDeferredCount,
 } from "../issue-execution-policy.js";
 import { conflict, HttpError, notFound } from "../../errors.js";
 import { EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON } from "./run-state.js";
@@ -119,6 +121,23 @@ export function formatIssueIdentifierLink(
   const prefix = identifier.split("-")[0];
   if (!prefix || !/^[A-Z][A-Z0-9]*-\d+$/.test(identifier)) return identifier;
   return `[${identifier}](/${prefix}/issues/${identifier})`;
+}
+
+/**
+ * A scheduled monitor fire that cannot dispatch (execution held, or a non-client
+ * dispatch failure) counts an attempt and moves nextCheckAt forward by an
+ * exponential backoff (1m, 2m, 4m, ... capped at 30m). maxAttempts/timeoutAt then
+ * clear it through the normal recovery path; without them, the check is cleared
+ * as dispatch_deferred_exhausted after this many consecutive deferred fires
+ * (roughly three hours of held execution).
+ */
+export const ISSUE_MONITOR_DEFERRAL_BASE_DELAY_MS = 60_000;
+export const ISSUE_MONITOR_DEFERRAL_MAX_DELAY_MS = 30 * 60_000;
+export const ISSUE_MONITOR_MAX_DEFERRED_FIRES = 10;
+
+export function issueMonitorDeferralDelayMs(deferredCount: number) {
+  const exponent = Math.max(0, Math.min(deferredCount - 1, 30));
+  return Math.min(ISSUE_MONITOR_DEFERRAL_BASE_DELAY_MS * 2 ** exponent, ISSUE_MONITOR_DEFERRAL_MAX_DELAY_MS);
 }
 
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON =
@@ -253,7 +272,9 @@ export function createHeartbeatScheduling(
     const reason =
       input.clearReason === "timeout_exceeded"
         ? "its timeout was reached"
-        : "its maximum attempt count was reached";
+        : input.clearReason === "dispatch_deferred_exhausted"
+          ? "it could not be dispatched for repeated scheduled checks while the issue's execution was held"
+          : "its maximum attempt count was reached";
     return [
       `Paperclip cleared the scheduled external-service monitor for ${label} because ${reason}.`,
       "",
@@ -593,14 +614,19 @@ export function createHeartbeatScheduling(
       "now" | "actorType" | "actorId" | "agentId" | "runId" | "activitySource">,
     diagnostic: { action: "issue.monitor_deferred" | "issue.monitor_dispatch_failed";
       reason: string; blockerCause?: string; httpStatus?: number },
+    deferral?: { patch: ReturnType<typeof buildIssueMonitorDeferredPatch>; deferredCount: number },
   ) {
     const publications: ActivityPublication[] = [];
+    // Without a deferral (manual triggers, or a wake that was already admitted)
+    // only the claim is released. A scheduled deferral also counts the attempt
+    // and moves the check forward so the same row cannot re-fire every tick.
+    const releasePatch = deferral ? monitorDeferredDispatchPatch(deferral.patch) : { monitorWakeRequestedAt: null };
     try {
       await db.transaction(async (tx) => {
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
         await notifyStatusCardIssueChange(tx, claimed.companyId);
         const released = await tx.update(issues)
-          .set({ monitorWakeRequestedAt: null, updatedAt: input.now })
+          .set({ ...releasePatch, updatedAt: input.now })
           .where(issueMonitorClaimCondition(claimed)).returning({ id: issues.id });
         if (released.length === 0) return;
         // The issue lock serializes diagnostics from competing scheduler instances.
@@ -619,7 +645,13 @@ export function createHeartbeatScheduling(
           agentId: input.agentId, runId: input.runId, action: diagnostic.action,
           entityType: "issue", entityId: claimed.id,
           details: { nextCheckAt: claimed.monitorNextCheckAt!.toISOString(),
-            checkedAt: input.now.toISOString(), attemptCount: claimed.monitorAttemptCount ?? 0,
+            checkedAt: input.now.toISOString(),
+            attemptCount: deferral ? deferral.patch.monitorAttemptCount : claimed.monitorAttemptCount ?? 0,
+            ...(deferral ? {
+              rescheduledNextCheckAt: deferral.patch.monitorNextCheckAt.toISOString(),
+              deferredCount: deferral.deferredCount,
+              maxDeferredFires: ISSUE_MONITOR_MAX_DEFERRED_FIRES,
+            } : {}),
             reason: diagnostic.reason, source: input.activitySource,
             ...(diagnostic.blockerCause ? { blockerCause: diagnostic.blockerCause } : {}),
             ...(diagnostic.httpStatus ? { httpStatus: diagnostic.httpStatus } : {}),
@@ -633,11 +665,77 @@ export function createHeartbeatScheduling(
       await db.transaction(async tx => {
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
         await notifyStatusCardIssueChange(tx, claimed.companyId);
-        await tx.update(issues).set({ monitorWakeRequestedAt: null, updatedAt: input.now })
+        await tx.update(issues).set({ ...releasePatch, updatedAt: input.now })
           .where(issueMonitorClaimCondition(claimed));
       });
       logger.warn({ err, issueId: claimed.id }, "issue monitor diagnostic could not be recorded");
     }
+  }
+
+  function monitorDeferredDispatchPatch(patch: ReturnType<typeof buildIssueMonitorDeferredPatch>) {
+    // Like monitorOnlyDispatchPatch: touch only the monitor parts of policy/state.
+    const nextCheckAtIso = patch.monitorNextCheckAt.toISOString();
+    return {
+      ...patch,
+      executionPolicy: sql`case when ${issues.executionPolicy} -> 'monitor' is not null
+        then jsonb_set(${issues.executionPolicy}, '{monitor,nextCheckAt}', to_jsonb(${nextCheckAtIso}::text))
+        else ${issues.executionPolicy} end`,
+      executionState: sql`jsonb_set(coalesce(${issues.executionState}, ${JSON.stringify(patch.executionState)}::jsonb),
+        '{monitor}', ${JSON.stringify(patch.executionState?.monitor ?? null)}::jsonb)`,
+    };
+  }
+
+  /**
+   * Handle a scheduled fire that did not dispatch. Manual triggers keep the plain
+   * release (they are user-paced and cannot loop). Scheduled fires count an
+   * attempt and back off, or clear through recovery once the deferral bound is hit.
+   */
+  async function deferIssueMonitorFire(
+    claimed: IssueMonitorDispatchRow,
+    input: Parameters<typeof dispatchClaimedIssueMonitor>[1],
+    context: {
+      policy: ReturnType<typeof normalizeIssueExecutionPolicy>;
+      monitor: IssueExecutionMonitorPolicy | null;
+      scheduledAtIso: string;
+      nextAttemptCount: number;
+      recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
+      dispatchAdmitted: boolean;
+    },
+    diagnostic: Parameters<typeof releaseIssueMonitorWithDiagnostic>[2],
+  ) {
+    if (input.activitySource !== "scheduled" || context.dispatchAdmitted) {
+      await releaseIssueMonitorWithDiagnostic(claimed, input, diagnostic);
+      return null;
+    }
+    const deferredCount = issueMonitorDeferredCount(claimed) + 1;
+    if (deferredCount > ISSUE_MONITOR_MAX_DEFERRED_FIRES) {
+      return clearIssueMonitorAndRecover({
+        claimed,
+        policy: context.policy,
+        scheduledAtIso: context.scheduledAtIso,
+        nextAttemptCount: context.nextAttemptCount,
+        clearReason: "dispatch_deferred_exhausted",
+        recoveryPolicy: context.recoveryPolicy,
+        monitor: context.monitor,
+        now: input.now,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        activitySource: input.activitySource,
+      });
+    }
+    let nextCheckAt = new Date(input.now.getTime() + issueMonitorDeferralDelayMs(deferredCount));
+    // Do not sleep past an explicit timeout; the next fire then clears it as timed out.
+    const timeoutAt = parseMonitorDate(context.monitor?.timeoutAt ?? null);
+    if (timeoutAt && timeoutAt.getTime() > input.now.getTime() && timeoutAt.getTime() < nextCheckAt.getTime()) {
+      nextCheckAt = timeoutAt;
+    }
+    await releaseIssueMonitorWithDiagnostic(claimed, input, diagnostic, {
+      patch: buildIssueMonitorDeferredPatch({ issue: claimed, policy: context.policy, nextCheckAt, deferredCount }),
+      deferredCount,
+    });
+    return null;
   }
 
   async function dispatchClaimedIssueMonitor(
@@ -727,6 +825,7 @@ export function createHeartbeatScheduling(
       });
     }
 
+    const deferralContext = { policy, monitor, scheduledAtIso, nextAttemptCount, recoveryPolicy, dispatchAdmitted: false };
     try {
       if (monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
         // Normalized monitor projections redact externalRef. Read the claimed
@@ -784,6 +883,7 @@ export function createHeartbeatScheduling(
           if (scheduled.outcome === "not_scheduled")
             throw conflict(scheduled.reason);
         }
+        deferralContext.dispatchAdmitted = true;
       } else {
         let executionDeferredCause: string | null = null;
         const wake = await enqueueWakeup(targetAgentId, {
@@ -824,11 +924,12 @@ export function createHeartbeatScheduling(
             ([...EXECUTION_RECONCILIATION_CAUSES, "execution_owner_active"] as readonly string[]).includes(executionDeferredCause)
             ? executionDeferredCause : undefined;
           const reason = executionDeferredCause ? "execution_reconciliation_required" : "monitor_dispatch_deferred";
-          await releaseIssueMonitorWithDiagnostic(claimed, input, {
+          const cleared = await deferIssueMonitorFire(claimed, input, deferralContext, {
             action: "issue.monitor_deferred", reason, ...(blockerCause ? { blockerCause } : {}),
           });
-          return { outcome: "skipped" as const, reason };
+          return cleared ?? { outcome: "skipped" as const, reason };
         }
+        deferralContext.dispatchAdmitted = true;
       }
 
       const consumed = await db.transaction(async tx => {
@@ -910,7 +1011,7 @@ export function createHeartbeatScheduling(
           return { outcome: "skipped" as const, reason: err.message };
         }
       }
-      await releaseIssueMonitorWithDiagnostic(claimed, input, {
+      await deferIssueMonitorFire(claimed, input, deferralContext, {
         action: "issue.monitor_dispatch_failed", reason: "monitor_dispatch_failed",
         ...(err instanceof HttpError ? { httpStatus: err.status } : {}),
       });
