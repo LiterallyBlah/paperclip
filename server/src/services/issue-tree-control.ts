@@ -105,6 +105,13 @@ function readPauseSuppressionHoldId(resultJson: Record<string, unknown> | null) 
 const ACTIVE_RUN_STATUSES = ["queued", "running"] as const;
 const DEFAULT_RELEASE_POLICY: IssueTreeHoldReleasePolicy = { strategy: "manual" };
 const MAX_PAUSE_HOLD_ANCESTOR_DEPTH = 100;
+/**
+ * `agent_wakeup_requests.error` written when creating a subtree hold cancels
+ * the tree's unclaimed wakes. Readers match these exact values; do not copy
+ * the strings.
+ */
+export const SUBTREE_PAUSE_HOLD_WAKE_CANCEL_REASON = "Cancelled because an active subtree pause hold was created";
+export const SUBTREE_CANCEL_OPERATION_WAKE_CANCEL_REASON = "Cancelled because a subtree cancel operation was applied";
 export const ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS: ReadonlySet<string> = new Set([
   "issue_commented",
   "issue_reopened_via_comment",

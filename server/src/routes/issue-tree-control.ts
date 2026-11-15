@@ -25,6 +25,10 @@ import {
 } from "../services/index.js";
 import { assertBoard, getAccessibleResource, getActorInfo } from "./authz.js";
 
+import {
+  SUBTREE_CANCEL_OPERATION_WAKE_CANCEL_REASON,
+  SUBTREE_PAUSE_HOLD_WAKE_CANCEL_REASON,
+} from "../services/issue-tree-control.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const TREE_RUN_CANCELLATION_RESPONSE_WAIT_MS = 1_000;
@@ -247,8 +251,8 @@ export function issueTreeControlRoutes(
         root.companyId,
         root.id,
         result.hold.mode === "pause"
-          ? "Cancelled because an active subtree pause hold was created"
-          : "Cancelled because a subtree cancel operation was applied",
+          ? SUBTREE_PAUSE_HOLD_WAKE_CANCEL_REASON
+          : SUBTREE_CANCEL_OPERATION_WAKE_CANCEL_REASON,
       );
       for (const wakeup of cancelledWakeups) {
         await logActivity(db, {
