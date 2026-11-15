@@ -111,7 +111,7 @@ import {
   legacyExecutionNeedsReconciliationWithEvidence,
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
-import { issueTreeControlService } from "../issue-tree-control.js";
+import { issueTreeControlService, SUBTREE_PAUSE_HOLD_WAKE_CANCEL_REASON } from "../issue-tree-control.js";
 import { isExternalChatPresentationContext } from "../heartbeat-run-summary.js";
 import {
   CHAT_CONTROL_RECOVERY_STOP_CODE,
@@ -1102,6 +1102,19 @@ export function recoveryService(
     sql`coalesce(${agentWakeupRequests.payload} -> 'executionWait' ->> 'cause', '') <> ${EXECUTION_STAGE_WAKE_WAIT_CAUSE}`,
   );
 
+  /**
+   * An unclaimed wake that creating a subtree pause hold cancelled with no run.
+   * A pause is temporary and the wake's work was never attempted, so such a
+   * wake is not the participant's latest word on the task. Wakes ended by a
+   * subtree cancel, an operator Stop, a budget or agent cancellation, or any
+   * run keep superseding.
+   */
+  const pauseHoldCancelledWakeSql = () => and(
+    eq(agentWakeupRequests.status, "cancelled"),
+    isNull(agentWakeupRequests.runId),
+    sql`coalesce(${agentWakeupRequests.error}, '') = ${SUBTREE_PAUSE_HOLD_WAKE_CANCEL_REASON}`,
+  );
+
   async function hasActiveExecutionPath(
     companyId: string,
     issueId: string,
@@ -1846,7 +1859,8 @@ export function recoveryService(
    * The current participant's stage wake that an admission gate ended without
    * a run, when that receipt is still the participant's latest word on the
    * task and no run followed it. A later wake parked behind the same gate
-   * without a run does not supersede it. A wake already re-admitted once is
+   * without a run, or cancelled by a subtree pause hold without a run, does
+   * not supersede it. A wake already re-admitted once is
    * never returned again, so one lost wake yields at most one re-admission.
    */
   async function findLostStageParticipantWake(
@@ -1860,7 +1874,7 @@ export function recoveryService(
       eq(agentWakeupRequests.companyId, companyId),
       eq(agentWakeupRequests.agentId, agentId),
       sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
-      not(parkedDeferredWakeSql()!),
+      not(or(parkedDeferredWakeSql(), pauseHoldCancelledWakeSql())!),
     )).orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.createdAt)).limit(1);
     if (!latest || latest.status !== "skipped" || latest.runId ||
         latest.reason !== "execution_reconciliation_required" ||
