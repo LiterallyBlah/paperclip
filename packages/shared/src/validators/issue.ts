@@ -519,6 +519,12 @@ export const issueExecutionMonitorStateSchema = z.object({
     .optional()
     .default(null),
   deferredCount: z.number().int().nonnegative().optional(),
+  maintenanceWait: z.object({
+    holdId: z.string().min(1),
+    originalNextCheckAt: z.string().datetime(),
+    since: z.string().datetime(),
+    heldFireCount: z.number().int().nonnegative(),
+  }).optional(),
   clearedAt: z.string().datetime().nullable(),
   clearReason: z.enum(ISSUE_EXECUTION_MONITOR_CLEAR_REASONS).nullable(),
 });

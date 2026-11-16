@@ -738,6 +738,7 @@ export type {
   IssueRelationIssueSummary,
   IssueExecutionMonitorPolicy,
   IssueExecutionMonitorState,
+  IssueExecutionMonitorMaintenanceWait,
   IssueExecutionPolicy,
   RequiredQualityReview,
   QualityReviewBinding,

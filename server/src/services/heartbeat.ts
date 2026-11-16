@@ -1652,6 +1652,7 @@ export function heartbeatService(
     parseHeartbeatPolicy,
     nextTimerHeartbeatAt,
     claimDueTimerHeartbeat,
+    treeControlSvc,
   });
 
   const {

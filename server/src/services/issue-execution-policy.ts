@@ -4,6 +4,7 @@ import type {
   IssueExecutionMonitorClearReason,
   IssueExecutionMonitorPolicy,
   IssueExecutionMonitorState,
+  IssueExecutionMonitorMaintenanceWait,
   IssueExecutionPolicy,
   IssueExecutionStage,
   IssueExecutionStagePrincipal,
@@ -178,6 +179,7 @@ function derivePersistedMonitorState(input: {
       scheduledBy,
       ...metadata,
       ...deferredCountFor(fromState, nextCheckAt),
+      ...maintenanceWaitFor(fromState, nextCheckAt),
       clearedAt: null,
       clearReason: null,
     };
@@ -219,10 +221,24 @@ function deferredCountFor(
   state: IssueExecutionMonitorState | null | undefined,
   nextCheckAt: string,
 ): { deferredCount?: number } {
-  if (state?.status !== "scheduled" || !state.deferredCount) return {};
+  if (!state?.deferredCount || !isSameScheduledCheck(state, nextCheckAt)) return {};
+  return { deferredCount: state.deferredCount };
+}
+
+/** Like deferredCountFor: a maintenance wait belongs to the check it re-armed. */
+function maintenanceWaitFor(
+  state: IssueExecutionMonitorState | null | undefined,
+  nextCheckAt: string,
+): { maintenanceWait?: IssueExecutionMonitorMaintenanceWait } {
+  if (!state?.maintenanceWait || !isSameScheduledCheck(state, nextCheckAt)) return {};
+  return { maintenanceWait: { ...state.maintenanceWait } };
+}
+
+function isSameScheduledCheck(state: IssueExecutionMonitorState, nextCheckAt: string) {
+  if (state.status !== "scheduled") return false;
   const stateTime = parseMonitorDate(state.nextCheckAt)?.getTime();
   const nextTime = parseMonitorDate(nextCheckAt)?.getTime();
-  return stateTime !== undefined && stateTime === nextTime ? { deferredCount: state.deferredCount } : {};
+  return stateTime !== undefined && stateTime === nextTime;
 }
 
 function buildScheduledMonitorState(
@@ -238,6 +254,7 @@ function buildScheduledMonitorState(
     scheduledBy: monitor.scheduledBy,
     ...monitorMetadataFromPolicy(monitor),
     ...deferredCountFor(previous, monitor.nextCheckAt),
+    ...maintenanceWaitFor(previous, monitor.nextCheckAt),
     clearedAt: null,
     clearReason: null,
   };
@@ -1263,6 +1280,54 @@ export function buildIssueMonitorDeferredPatch(input: {
     monitorNextCheckAt: input.nextCheckAt,
     monitorWakeRequestedAt: null,
     monitorAttemptCount: attemptCount,
+  };
+}
+
+/**
+ * A due fire deferred because an active subtree pause hold covers the issue is
+ * a maintenance wait, not a failed attempt. It keeps the attempt count, the
+ * deferred-fire count and all monitor metadata unchanged, records the original
+ * check time and holding pause hold for diagnostics, and re-arms the check at
+ * nextCheckAt so the issue keeps a future durable wait until the hold ends.
+ */
+export function buildIssueMonitorMaintenanceWaitPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy | null;
+  nextCheckAt: Date;
+  holdId: string;
+  now: Date;
+}) {
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({
+    issue: input.issue,
+    state: existingState,
+    policy: input.policy,
+  });
+  const previousWait = currentMonitorState?.maintenanceWait;
+  const dueAt = isoString(input.issue.monitorNextCheckAt) ?? currentMonitorState?.nextCheckAt ?? input.now.toISOString();
+  const nextMonitorState: IssueExecutionMonitorState = {
+    status: "scheduled",
+    lastTriggeredAt: currentMonitorState?.lastTriggeredAt ?? null,
+    notes: currentMonitorState?.notes ?? null,
+    scheduledBy: currentMonitorState?.scheduledBy ?? null,
+    ...monitorMetadataFromState(currentMonitorState),
+    nextCheckAt: input.nextCheckAt.toISOString(),
+    attemptCount: currentMonitorState?.attemptCount ?? 0,
+    ...(currentMonitorState?.deferredCount ? { deferredCount: currentMonitorState.deferredCount } : {}),
+    maintenanceWait: {
+      holdId: input.holdId,
+      originalNextCheckAt: previousWait?.originalNextCheckAt ?? dueAt,
+      since: previousWait?.since ?? input.now.toISOString(),
+      heldFireCount: (previousWait?.heldFireCount ?? 0) + 1,
+    },
+    clearedAt: null,
+    clearReason: null,
+  };
+
+  return {
+    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+    monitorNextCheckAt: input.nextCheckAt,
+    monitorWakeRequestedAt: null,
   };
 }
 

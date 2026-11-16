@@ -48,6 +48,7 @@ import {
   parseIssueExecutionState,
   buildIssueMonitorTriggeredPatch,
   buildIssueMonitorDeferredPatch,
+  buildIssueMonitorMaintenanceWaitPatch,
   issueMonitorDeferredCount,
 } from "../issue-execution-policy.js";
 import { conflict, HttpError, notFound } from "../../errors.js";
@@ -62,6 +63,7 @@ import { failRunnerGoalAction } from "../runner-goals.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
 import { supportsUnscopedTimerHeartbeat } from "../heartbeat-policy.js";
 import type { Db } from "@paperclipai/db";
+import { issueTreeControlService } from "../issue-tree-control.js";
 import type { issueService } from "../issues.js";
 import type { createHeartbeatQueue } from "./queue.js";
 import type { createHeartbeatRetries, HeartbeatRetryDependencies } from "./retries.js";
@@ -78,6 +80,8 @@ export interface HeartbeatSchedulingDependencies
   issuesSvc: Pick<ReturnType<typeof issueService>, "listReviewAttention" | "create">;
   scheduleBoundedRetryForRun: ReturnType<typeof createHeartbeatRetries>["scheduleBoundedRetryForRun"];
   getSchedulingSuppression: (fresh?: boolean) => Promise<{ suppressed: boolean }>;
+  /** Defaults to the issue tree control service for this database. */
+  treeControlSvc?: Pick<ReturnType<typeof issueTreeControlService>, "getActivePauseHoldGate">;
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -135,6 +139,15 @@ export const ISSUE_MONITOR_DEFERRAL_BASE_DELAY_MS = 60_000;
 export const ISSUE_MONITOR_DEFERRAL_MAX_DELAY_MS = 30 * 60_000;
 export const ISSUE_MONITOR_MAX_DEFERRED_FIRES = 10;
 
+/**
+ * A due fire deferred because an active subtree pause hold covers the issue is a
+ * maintenance wait: it is not counted toward maxAttempts or the deferred-fire
+ * bound, and the check is re-armed this far ahead until the hold is released.
+ * Limits (including a timeoutAt that passes during the hold) are evaluated by
+ * the first fire after release, through the normal path.
+ */
+export const ISSUE_MONITOR_MAINTENANCE_RECHECK_MS = 5 * 60_000;
+
 export function issueMonitorDeferralDelayMs(deferredCount: number) {
   const exponent = Math.max(0, Math.min(deferredCount - 1, 30));
   return Math.min(ISSUE_MONITOR_DEFERRAL_BASE_DELAY_MS * 2 ** exponent, ISSUE_MONITOR_DEFERRAL_MAX_DELAY_MS);
@@ -162,6 +175,7 @@ export function createHeartbeatScheduling(
     nextTimerHeartbeatAt,
     claimDueTimerHeartbeat,
   } = dependencies;
+  const treeControlSvc = dependencies.treeControlSvc ?? issueTreeControlService(db);
 
   const issueMonitorDispatchColumns = {
     id: issues.id,
@@ -672,7 +686,7 @@ export function createHeartbeatScheduling(
     }
   }
 
-  function monitorDeferredDispatchPatch(patch: ReturnType<typeof buildIssueMonitorDeferredPatch>) {
+  function monitorDeferredDispatchPatch<T extends { monitorNextCheckAt: Date; executionState: Record<string, unknown> | null }>(patch: T) {
     // Like monitorOnlyDispatchPatch: touch only the monitor parts of policy/state.
     const nextCheckAtIso = patch.monitorNextCheckAt.toISOString();
     return {
@@ -683,6 +697,77 @@ export function createHeartbeatScheduling(
       executionState: sql`jsonb_set(coalesce(${issues.executionState}, ${JSON.stringify(patch.executionState)}::jsonb),
         '{monitor}', ${JSON.stringify(patch.executionState?.monitor ?? null)}::jsonb)`,
     };
+  }
+
+  /**
+   * Keep a due scheduled check through an active subtree pause hold. The fire is
+   * not counted, the monitor's notes, metadata and counts are kept, and the
+   * check is re-armed a bounded interval ahead so the issue keeps a future
+   * durable wait. The claim condition means an owner change made meanwhile wins.
+   */
+  async function holdIssueMonitorForMaintenance(
+    claimed: IssueMonitorDispatchRow,
+    input: Parameters<typeof dispatchClaimedIssueMonitor>[1],
+    policy: ReturnType<typeof normalizeIssueExecutionPolicy>,
+    hold: { holdId: string; rootIssueId: string },
+  ) {
+    const nextCheckAt = new Date(input.now.getTime() + ISSUE_MONITOR_MAINTENANCE_RECHECK_MS);
+    const patch = buildIssueMonitorMaintenanceWaitPatch({
+      issue: claimed, policy, nextCheckAt, holdId: hold.holdId, now: input.now,
+    });
+    const firstForHold = issueMonitorMaintenanceWaitFor(claimed)?.holdId !== hold.holdId;
+    const publications: ActivityPublication[] = [];
+    try {
+      await db.transaction(async (tx) => {
+        const held = await tx.update(issues)
+          .set({ ...monitorDeferredDispatchPatch(patch), updatedAt: input.now })
+          .where(issueMonitorClaimCondition(claimed)).returning({ id: issues.id });
+        // Record one diagnostic per hold and check, not one per re-check.
+        if (held.length === 0 || !firstForHold) return;
+        const wait = parseIssueExecutionState(patch.executionState)?.monitor?.maintenanceWait;
+        await logActivity(tx as unknown as Db, {
+          companyId: claimed.companyId, actorType: input.actorType, actorId: input.actorId,
+          agentId: input.agentId, runId: input.runId, action: "issue.monitor_deferred",
+          entityType: "issue", entityId: claimed.id,
+          details: {
+            nextCheckAt: claimed.monitorNextCheckAt!.toISOString(),
+            checkedAt: input.now.toISOString(),
+            attemptCount: claimed.monitorAttemptCount ?? 0,
+            rescheduledNextCheckAt: nextCheckAt.toISOString(),
+            reason: "issue_tree_hold_active",
+            counted: false,
+            holdId: hold.holdId,
+            rootIssueId: hold.rootIssueId,
+            originalNextCheckAt: wait?.originalNextCheckAt ?? claimed.monitorNextCheckAt!.toISOString(),
+            source: input.activitySource,
+          },
+        }, publications);
+      });
+      for (const publication of publications) publishActivity(publication);
+    } catch (err) {
+      // Never lose the check: release only the claim, so the still-due fire is
+      // retried (uncounted) on a later tick, and never clobber a replacement.
+      await db.update(issues).set({ monitorWakeRequestedAt: null, updatedAt: input.now })
+        .where(issueMonitorClaimCondition(claimed));
+      logger.warn({ err, issueId: claimed.id }, "issue monitor maintenance wait could not be recorded");
+    }
+    return { outcome: "skipped" as const, reason: "issue_tree_hold_active" };
+  }
+
+  function issueMonitorMaintenanceWaitFor(claimed: IssueMonitorDispatchRow) {
+    const state = parseIssueExecutionState(claimed.executionState)?.monitor;
+    const nextCheckAt = claimed.monitorNextCheckAt?.toISOString();
+    if (!state?.maintenanceWait || state.status !== "scheduled" || !nextCheckAt || !state.nextCheckAt) return null;
+    return new Date(state.nextCheckAt).getTime() === new Date(nextCheckAt).getTime() ? state.maintenanceWait : null;
+  }
+
+  /** Scheduled fires only: manual triggers are user-paced and keep their path. */
+  async function activeMaintenanceHold(
+    claimed: IssueMonitorDispatchRow,
+    input: Parameters<typeof dispatchClaimedIssueMonitor>[1],
+  ) {
+    if (input.activitySource !== "scheduled") return null;
+    return treeControlSvc.getActivePauseHoldGate(claimed.companyId, claimed.id);
   }
 
   /**
@@ -807,6 +892,14 @@ export function createHeartbeatScheduling(
         }
       : {};
 
+    // An active subtree pause hold is a maintenance wait. Check it before the
+    // attempt/timeout limits so a hold never erases the owner's timed intent;
+    // those limits apply at the first fire after release.
+    const maintenanceHold = await activeMaintenanceHold(claimed, input);
+    if (maintenanceHold) {
+      return holdIssueMonitorForMaintenance(claimed, input, policy, maintenanceHold);
+    }
+
     if (clearReason) {
       return clearIssueMonitorAndRecover({
         claimed,
@@ -920,6 +1013,9 @@ export function createHeartbeatScheduling(
           },
         });
         if (!wake) {
+          // A pause hold created after the check above also defers the wake.
+          const lateHold = executionDeferredCause ? null : await activeMaintenanceHold(claimed, input);
+          if (lateHold) return holdIssueMonitorForMaintenance(claimed, input, policy, lateHold);
           const blockerCause = executionDeferredCause &&
             ([...EXECUTION_RECONCILIATION_CAUSES, "execution_owner_active"] as readonly string[]).includes(executionDeferredCause)
             ? executionDeferredCause : undefined;

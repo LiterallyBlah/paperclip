@@ -1140,6 +1140,7 @@ export type {
   IssueRelatedWorkSummary,
   IssueExecutionMonitorPolicy,
   IssueExecutionMonitorState,
+  IssueExecutionMonitorMaintenanceWait,
   IssueRelation,
   IssueRelationIssueSummary,
   IssueExecutionPolicy,

@@ -3954,6 +3954,11 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
     if (!current || current.status === "done" || current.status === "cancelled")
       return "skipped";
+    // Every repair entry path passes here. An active subtree pause hold is a
+    // maintenance wait: schedule no repair wake and no escalation under it.
+    // The next sweep after release evaluates the issue again normally.
+    if (await isAutomaticRecoverySuppressedByPauseHold(db, current.companyId, current.id, treeControlSvc))
+      return "skipped";
 
     const episode = options.legacyEpisode ?? (
       parseObject(parseObject(latestRun?.contextSnapshot).legacyDispositionEpisode).id && latestRun
