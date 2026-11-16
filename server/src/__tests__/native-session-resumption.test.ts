@@ -5,7 +5,10 @@ import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
+import type { PluginEvent } from "@paperclipai/plugin-sdk";
+import { setPluginEventBus } from "../services/activity-log.js";
+import type { PluginEventBus } from "../services/plugin-event-bus.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -110,7 +113,17 @@ describe("P6-25 pre-result native session recovery", () => {
     },
   };
 
+  // Captured for the whole file: an earlier sweep may be the one that blocks a
+  // fixture run, so the capture must exist before any test runs.
+  const pluginEvents: PluginEvent[] = [];
+
   beforeAll(async () => {
+    setPluginEventBus({
+      emit: async (event: PluginEvent) => {
+        pluginEvents.push(event);
+        return { errors: [] };
+      },
+    } as unknown as PluginEventBus);
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-native-resume-");
     db = createDb(temporary.connectionString);
     await db.insert(companies).values({ id: companyId, name: "Native resume", issuePrefix: "NRR" });
@@ -536,6 +549,39 @@ describe("P6-25 pre-result native session recovery", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, missingCheckpointRunId))).resolves.toEqual([
       expect.objectContaining({ cause: "native_session_interrupted", wakePolicy: null }),
     ]);
+    // The board block is a status change: it is audited and reaches plugins
+    // as a standard issue.updated transition.
+    const [recoveryAction] = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, missingCheckpointRunId));
+    await expect(db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, missingCheckpointRunId),
+      eq(activityLog.action, "issue.updated"),
+    ))).resolves.toEqual([
+      expect.objectContaining({
+        actorType: "system",
+        details: expect.objectContaining({
+          status: "blocked",
+          _previous: { status: "in_progress" },
+          recoveryActionId: recoveryAction!.id,
+          recoveryOwnerType: "board",
+        }),
+      }),
+    ]);
+    expect(pluginEvents.filter(event =>
+      event.eventType === "issue.updated" && event.entityId === missingCheckpointRunId)).toEqual([
+      expect.objectContaining({
+        companyId,
+        entityType: "issue",
+        payload: expect.objectContaining({
+          status: "blocked",
+          _previous: { status: "in_progress" },
+          recoveryActionId: recoveryAction!.id,
+        }),
+      }),
+    ]);
+    // Cancelled and exhausted runs are not blocked and emit no status change.
+    expect(pluginEvents.filter(event =>
+      event.entityId === cancelledRunId || event.entityId === exhaustedRunId)).toEqual([]);
   });
 
   it("does not mistake the pre-first-attempt observed coordinator for an orphan", async () => {
