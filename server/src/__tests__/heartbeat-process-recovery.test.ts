@@ -26,6 +26,21 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { createHash, randomUUID } from "node:crypto";
 import { LEGACY_DISPOSITION_SUPPRESSION_KEY, isSuppressedLegacyDispositionDispatch, recordLegacyWorkspaceRestoreFailure, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { issueService } from "../services/issues.js";
+import { setPluginEventBus } from "../services/activity-log.js";
+import type { PluginEventBus } from "../services/plugin-event-bus.js";
+import type { PluginEvent } from "@paperclipai/plugin-sdk";
+
+/** Capture plugin domain events published after this call. */
+function capturePluginEvents(): PluginEvent[] {
+  const events: PluginEvent[] = [];
+  setPluginEventBus({
+    emit: async (event: PluginEvent) => {
+      events.push(event);
+      return { errors: [] };
+    },
+  } as unknown as PluginEventBus);
+  return events;
+}
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { JsonRpcCallError } from "@paperclipai/plugin-sdk";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
@@ -7179,6 +7194,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("escalates an exhausted failed successful-run handoff without using generic continuation recovery first", async () => {
+    const pluginEvents = capturePluginEvents();
     const { companyId, agentId, runId, issueId } =
       await seedStrandedIssueFixture({
         status: "in_progress",
@@ -7301,6 +7317,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         (event) => event.action === "issue.successful_run_handoff_escalated",
       ),
     ).toBe(true);
+    // The escalation is a status change, so plugins see a standard issue.updated.
+    expect(pluginEvents).toContainEqual(expect.objectContaining({
+      eventType: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      payload: expect.objectContaining({
+        status: "blocked",
+        _previous: { status: "in_progress" },
+      }),
+    }));
   });
 
   it("retries an interrupted corrective successful-run handoff instead of escalating it", async () => {
@@ -8254,6 +8280,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("escalates exhausted source-owner repair to the board without a substitute wake", async () => {
+    const pluginEvents = capturePluginEvents();
     const { companyId, agentId, runId, issueId } =
       await seedStrandedIssueFixture({
         status: "in_progress",
@@ -8351,6 +8378,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(snapshot).toEqual({ kind: "disposition_repair_escalated", actionId: action!.id, assigneeAgentId: agentId, attemptCount: 5, maxAttempts: 5, reason: "unchanged_source_state_exhausted" });
     expect(substituteWakes).toHaveLength(0);
     expect(sourceAttemptSix).toHaveLength(0);
+
+    // The board escalation is recorded as an activity row and reaches plugins
+    // as a standard issue.updated status transition.
+    const escalationActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.disposition_repair_escalated"),
+      ));
+    expect(escalationActivity).toHaveLength(1);
+    expect(escalationActivity[0]!.details).toMatchObject({
+      status: "blocked",
+      previousStatus: "in_progress",
+      _previous: { status: "in_progress" },
+      recoveryActionId: action!.id,
+      recoveryOwnerType: "board",
+    });
+    const statusEvents = pluginEvents.filter(event =>
+      event.eventType === "issue.updated" && event.entityId === issueId);
+    expect(statusEvents).toHaveLength(1);
+    expect(statusEvents[0]).toMatchObject({
+      companyId,
+      entityType: "issue",
+      actorType: "system",
+      payload: expect.objectContaining({
+        status: "blocked",
+        _previous: { status: "in_progress" },
+        recoveryActionId: action!.id,
+      }),
+    });
   });
 
   it("routes a non-invokable source owner to recovery without reassigning the source", async () => {

@@ -50,6 +50,7 @@ import {
 } from "./status-decision-committer.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueService } from "../issues.js";
+import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { isNewTerminalRunFailure, reportRunFailure } from "../run-failure-report.js";
 import { resumeNativeWorkspaceFinalization, recordNativeWorkspaceFinalizationFailure } from "./native-workspace-finalizer.js";
@@ -153,6 +154,7 @@ export async function claimNativeSessionResumptions(input: {
     let terminalRunToEmit: typeof heartbeatRuns.$inferSelect | null = null;
     let claimFailed = false;
     let claimedAttempt = 0;
+    let activityPublications: ActivityPublication[] = [];
     const claimed = await input.db.transaction(async (tx) => {
       await tx.execute(sql`select set_config('statement_timeout', '10000', true), set_config('lock_timeout', '2000', true)`);
       const [issue] = await tx.select().from(issues).where(and(
@@ -282,7 +284,7 @@ export async function claimNativeSessionResumptions(input: {
           { status: "blocked" },
           tx,
         );
-        await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
+        const recoveryAction = await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
           companyId: row.run.companyId,
           sourceIssueId: row.coordinator.issueId,
           kind: "active_run_watchdog",
@@ -303,6 +305,26 @@ export async function claimNativeSessionResumptions(input: {
           maxAttempts: 3,
           supersedeOnIdentityChange: true,
         });
+        await logActivity(tx as unknown as Db, {
+          companyId: row.run.companyId,
+          actorType: "system",
+          actorId: "native-finalization",
+          agentId: null,
+          runId: row.run.id,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier,
+            status: "blocked",
+            previousStatus: issue.status,
+            _previous: { status: issue.status },
+            source: "native_finalization.ambiguous_session_state",
+            failureCode,
+            recoveryActionId: recoveryAction.id,
+            recoveryOwnerType: "board",
+          },
+        }, activityPublications);
         return false;
       }
 
@@ -337,12 +359,14 @@ export async function claimNativeSessionResumptions(input: {
       claimFailed = true;
       input.onError?.(error);
       terminalRunToEmit = null;
+      activityPublications = [];
       logger.warn({ err: error, companyId: candidate.companyId, runId: candidate.runId },
         "failed to claim native session recovery candidate");
       return false;
     });
     // Telemetry is best-effort background work; it must not delay claiming
     // the remaining candidates in this loop, so fire it and do not await it.
+    for (const publication of activityPublications) publishActivity(publication);
     if (terminalRunToEmit) {
       void emitAgentTaskRun(input.db, terminalRunToEmit);
       void reportRunFailure(input.db, terminalRunToEmit);

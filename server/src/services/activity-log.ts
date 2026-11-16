@@ -30,6 +30,12 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
   budget_soft_threshold_crossed: "budget.incident.opened",
   budget_hard_threshold_crossed: "budget.incident.opened",
   budget_incident_resolved: "budget.incident.resolved",
+  // Recovery escalations that move an issue into `blocked` keep their own
+  // audit action name, but they are issue status changes and must reach
+  // plugins as `issue.updated` like any other status transition.
+  issue_disposition_repair_escalated: "issue.updated",
+  issue_successful_run_handoff_escalated: "issue.updated",
+  issue_review_path_recovery_exhausted: "issue.updated",
 };
 
 let _pluginEventBus: PluginEventBus | null = null;
