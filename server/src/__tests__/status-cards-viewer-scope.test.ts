@@ -372,6 +372,35 @@ describeEmbeddedPostgres("status card viewer scope", () => {
     expect(Object.keys(written.fingerprint ?? {})).not.toContain(privateIssue.id);
   });
 
+  it("does not diff a stale stored fingerprint entry the summarizer cannot read into the generation task", async () => {
+    // Cards written before summarizer scoping hold an unscoped fingerprint.
+    const fixture = await seedFixture();
+    const { privateIssue } = fixture;
+    const card = await seedCard(fixture);
+    await db.update(statusCards).set({ refreshPolicy: defaultStatusCardRefreshPolicy }).where(eq(statusCards.id, card.id));
+    const service = statusCardService(db);
+    const refresh = await service.requestRefresh(card.id, { trigger: "manual" });
+    expect(refresh.enqueued).toBe(true);
+    expectNoPrivate(refresh.changes, privateIssue);
+    const generationIssue = await db.select().from(issues)
+      .where(eq(issues.id, refresh.generatingIssue!.id)).then((rows) => rows[0]!);
+    expectNoPrivate(generationIssue.description, privateIssue);
+    const ledger = await db.select().from(statusCardUpdates)
+      .where(eq(statusCardUpdates.generationIssueId, generationIssue.id));
+    expect(ledger).toHaveLength(1);
+    expectNoPrivate(ledger[0]!.changes, privateIssue);
+  });
+
+  it("keeps the previous summary in generation when the summarizer can read every stored issue", async () => {
+    const fixture = await seedFixture({ summarizerIsProjectMember: true });
+    const card = await seedCard(fixture);
+    await db.update(statusCards).set({ refreshPolicy: defaultStatusCardRefreshPolicy }).where(eq(statusCards.id, card.id));
+    const refresh = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
+    const generationIssue = await db.select().from(issues)
+      .where(eq(issues.id, refresh.generatingIssue!.id)).then((rows) => rows[0]!);
+    expect(generationIssue.description).toContain(`Status: ${OPEN_TITLE}`);
+  });
+
   it("keeps private-project issues in generation when the summarizer is a project member", async () => {
     const fixture = await seedFixture({ summarizerIsProjectMember: true });
     const { openIssue, privateIssue } = fixture;

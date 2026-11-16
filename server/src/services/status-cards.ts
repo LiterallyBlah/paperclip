@@ -728,12 +728,21 @@ export function statusCardService(
       (agentId) => ({ agentId, error: null }),
       (error: unknown) => ({ agentId: null, error }),
     );
-    const snapshot = await executeQueries(
-      card,
-      summarizer.agentId ? await summarizerReadOptions(card.companyId, summarizer.agentId) : {},
-    );
+    const summarizerScope = summarizer.agentId ? await summarizerReadOptions(card.companyId, summarizer.agentId) : {};
+    const snapshot = await executeQueries(card, summarizerScope);
     const fingerprint = buildStatusCardFingerprint(snapshot);
-    const allChanges = diffStatusCardFingerprint(card.fingerprint as StatusCardFingerprint | null, fingerprint);
+    // The stored fingerprint may predate summarizer scoping (or the summarizer
+    // may since have lost access). Diff only against entries the summarizer can
+    // read, so a "removed" change never carries an unreadable issue's
+    // identifier or title into the generation task, the ledger or the response.
+    const storedRefs = await scopeCardIssueRefs(card, summarizerScope);
+    const storedFingerprint = storedRefs.fingerprint;
+    // If the stored state names an issue the summarizer cannot read, the previous
+    // summary was written from unscoped data and may name it too: withhold it.
+    const storedRefsRedacted =
+      Object.keys(storedFingerprint ?? {}).length !== Object.keys(card.fingerprint ?? {}).length
+      || storedRefs.mentionedIssueIds.length !== (card.mentionedIssueIds ?? []).length;
+    const allChanges = diffStatusCardFingerprint(storedFingerprint as StatusCardFingerprint | null, fingerprint);
     const changes = filterStatusCardChanges(allChanges, card.refreshPolicy);
     const trigger = input.trigger ?? "manual";
     const forceRun = trigger === "manual" || trigger === "restore";
@@ -792,7 +801,7 @@ export function statusCardService(
     });
     if (!summarizer.agentId) throw summarizer.error;
     const summarizerAgentId = summarizer.agentId;
-    const previousSummary = card.documentId
+    const previousSummary = card.documentId && !storedRefsRedacted
       ? await db.select().from(documents).where(eq(documents.id, card.documentId)).then((rows) => rows[0]?.latestBody ?? null)
       : null;
     const fingerprintHash = statusCardFingerprintHash(fingerprint);
