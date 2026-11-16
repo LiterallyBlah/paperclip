@@ -22,6 +22,7 @@ import { companySearchQuerySchema, STATUS_CARD_AGENT_MAX_CARDS } from "@papercli
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { readBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
+import { issueReadSqlCondition } from "./authorization.js";
 import { builtInAgentService } from "./built-in-agents.js";
 import { companySearchService } from "./company-search.js";
 import { issueService } from "./issues.js";
@@ -47,6 +48,7 @@ type StatusCardRow = typeof statusCards.$inferSelect;
 type StatusCardReadOptions = { issueReadCondition?: SQL<boolean> };
 
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function promptHash(prompt: string) {
   return createHash("sha256").update(prompt).digest("hex");
@@ -173,10 +175,47 @@ export function statusCardService(
     }
   }
 
+  /**
+   * The subset of `issueIds` the viewer may read, or `null` when no read
+   * condition applies (trusted internal callers). Non-UUID ids never match.
+   */
+  async function readableIssueIds(
+    companyId: string,
+    issueIds: Iterable<string>,
+    options: StatusCardReadOptions,
+  ): Promise<Set<string> | null> {
+    if (!options.issueReadCondition) return null;
+    const candidates = [...new Set(issueIds)].filter((id) => UUID_PATTERN.test(id));
+    if (candidates.length === 0) return new Set();
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, candidates), options.issueReadCondition));
+    return new Set(rows.map((row) => row.id));
+  }
+
+  /** Drop stored fingerprint entries and mentions the viewer cannot read. */
+  async function scopeCardIssueRefs(card: StatusCardRow, options: StatusCardReadOptions) {
+    const fingerprint = card.fingerprint ?? null;
+    const mentioned = card.mentionedIssueIds ?? [];
+    const readable = await readableIssueIds(
+      card.companyId,
+      [...Object.keys(fingerprint ?? {}), ...mentioned],
+      options,
+    );
+    if (!readable) return { fingerprint, mentionedIssueIds: mentioned };
+    return {
+      fingerprint: fingerprint
+        ? Object.fromEntries(Object.entries(fingerprint).filter(([issueId]) => readable.has(issueId)))
+        : null,
+      mentionedIssueIds: mentioned.filter((issueId) => readable.has(issueId)),
+    };
+  }
+
   async function hydrate(card: StatusCardRow, options: StatusCardReadOptions = {}) {
     const dayStart = new Date();
     dayStart.setUTCHours(0, 0, 0, 0);
-    const [document, today, watchedIssues] = await Promise.all([
+    const [document, today, watchedIssues, issueRefs] = await Promise.all([
       card.documentId
         ? db.select({ latestBody: documents.latestBody })
           .from(documents)
@@ -191,10 +230,13 @@ export function statusCardService(
         .where(and(eq(statusCardUpdates.cardId, card.id), gte(statusCardUpdates.startedAt, dayStart)))
         .then((rows) => rows[0] ?? { tokens: 0, costCents: 0 }),
       readWatchedIssueVisibility(card, options),
+      scopeCardIssueRefs(card, options),
     ]);
 
     return {
       ...card,
+      fingerprint: issueRefs.fingerprint,
+      mentionedIssueIds: issueRefs.mentionedIssueIds,
       summaryBody: watchedIssues?.privacyRedacted ? null : document?.latestBody ?? null,
       ...(watchedIssues === undefined ? {} : {
         watchedIssueCount: watchedIssues.count,
@@ -330,9 +372,28 @@ export function statusCardService(
     return db.select().from(statusCardUpdates).where(eq(statusCardUpdates.cardId, cardId)).orderBy(desc(statusCardUpdates.startedAt));
   }
 
-  async function listSummaryRevisions(card: Pick<StatusCardRow, "companyId" | "documentId">) {
+  /**
+   * The update ledger as one viewer may see it: change entries for issues the
+   * viewer cannot read are dropped, and the Summarizer-written change summary
+   * is withheld whenever the card's summary is redacted for that viewer.
+   */
+  async function listVisibleUpdates(card: StatusCardRow, options: StatusCardReadOptions = {}) {
+    const rows = await listUpdates(card.id);
+    if (!options.issueReadCondition) return rows;
+    const [visibility, readable] = await Promise.all([
+      readWatchedIssueVisibility(card, options),
+      readableIssueIds(card.companyId, rows.flatMap((row) => (row.changes ?? []).map((change) => change.issueId)), options),
+    ]);
+    return rows.map((row) => ({
+      ...row,
+      changes: (row.changes ?? []).filter((change) => readable?.has(change.issueId) ?? true),
+      changeSummary: visibility?.privacyRedacted ? null : row.changeSummary,
+    }));
+  }
+
+  async function listSummaryRevisions(card: StatusCardRow, options: StatusCardReadOptions = {}) {
     if (!card.documentId) return [];
-    return db
+    const revisions = await db
       .select({
         id: documentRevisions.id,
         revisionNumber: documentRevisions.revisionNumber,
@@ -344,6 +405,23 @@ export function statusCardService(
       .from(documentRevisions)
       .where(and(eq(documentRevisions.documentId, card.documentId), eq(documentRevisions.companyId, card.companyId)))
       .orderBy(desc(documentRevisions.revisionNumber));
+    if (!options.issueReadCondition) return revisions;
+    // Same rule as the hydrated summaryBody: a viewer who cannot read every
+    // watched issue sees neither revision bodies nor their change summaries
+    // (the Summarizer writes the same text into the update ledger).
+    const visibility = await readWatchedIssueVisibility(card, options);
+    if (!visibility?.privacyRedacted) return revisions;
+    return revisions.map((revision) => ({ ...revision, body: null, changeSummary: null }));
+  }
+
+  /**
+   * The read scope of the agent that runs a card's generation tasks. Every
+   * issue placed in a generation task, or joined through summary mentions,
+   * must pass this condition so the Summarizer never receives an issue it
+   * could not read itself.
+   */
+  async function summarizerReadOptions(companyId: string, agentId: string): Promise<StatusCardReadOptions> {
+    return { issueReadCondition: await issueReadSqlCondition(db, { type: "agent", agentId, companyId }) };
   }
 
   /**
@@ -561,7 +639,7 @@ export function statusCardService(
    * Unknown identifiers and foreign-company links drop out here, so a summary
    * cannot join arbitrary ids to the watched set.
    */
-  async function resolveMentionedIssueIds(companyId: string, markdown: string) {
+  async function resolveMentionedIssueIds(companyId: string, markdown: string, options: StatusCardReadOptions = {}) {
     const mentions = extractIssueMentions(markdown);
     const conditions = [
       ...(mentions.identifiers.length > 0 ? [inArray(issues.identifier, mentions.identifiers)] : []),
@@ -571,7 +649,7 @@ export function statusCardService(
     const rows = await db
       .select({ id: issues.id })
       .from(issues)
-      .where(and(eq(issues.companyId, companyId), or(...conditions)))
+      .where(and(eq(issues.companyId, companyId), or(...conditions), options.issueReadCondition ?? sql<boolean>`true`))
       .limit(STATUS_CARD_MAX_MENTIONED_ISSUES);
     return rows.map((row) => row.id).sort();
   }
@@ -642,7 +720,18 @@ export function statusCardService(
     }
 
     const now = input.now ?? new Date();
-    const snapshot = await executeQueries(card);
+    // The snapshot feeds the generation task, so it is built in the summarizer's
+    // read scope. Without a resolvable summarizer no task can be created; the
+    // snapshot then only drives the no-run counters below (as before) and the
+    // resolution error is rethrown before any generation task is built.
+    const summarizer = await resolveSummarizerAgentId(card).then(
+      (agentId) => ({ agentId, error: null }),
+      (error: unknown) => ({ agentId: null, error }),
+    );
+    const snapshot = await executeQueries(
+      card,
+      summarizer.agentId ? await summarizerReadOptions(card.companyId, summarizer.agentId) : {},
+    );
     const fingerprint = buildStatusCardFingerprint(snapshot);
     const allChanges = diffStatusCardFingerprint(card.fingerprint as StatusCardFingerprint | null, fingerprint);
     const changes = filterStatusCardChanges(allChanges, card.refreshPolicy);
@@ -701,7 +790,8 @@ export function statusCardService(
       configurationChanged: card.lastUpdateRunKind === null && Boolean(card.lastGeneratedAt),
       restoreRefresh: trigger === "restore",
     });
-    const summarizerAgentId = await resolveSummarizerAgentId(card);
+    if (!summarizer.agentId) throw summarizer.error;
+    const summarizerAgentId = summarizer.agentId;
     const previousSummary = card.documentId
       ? await db.select().from(documents).where(eq(documents.id, card.documentId)).then((rows) => rows[0]?.latestBody ?? null)
       : null;
@@ -813,11 +903,14 @@ export function statusCardService(
       const payloadFingerprint = payload?.operation === "update" && payload.fingerprint && typeof payload.fingerprint === "object"
         ? payload.fingerprint as StatusCardFingerprint
         : null;
-      const mentionedIssueIds = await resolveMentionedIssueIds(current.companyId, input.markdown);
+      // assertSummarizerWriter pinned the writer to the card's summarizer, so
+      // its read scope bounds both the mentions and the watched membership.
+      const writerScope = await summarizerReadOptions(current.companyId, actor.agentId!);
+      const mentionedIssueIds = await resolveMentionedIssueIds(current.companyId, input.markdown, writerScope);
       // Current watched membership: compiled-query matches plus the issues this
       // summary mentions.
       const watchedNow = buildStatusCardFingerprint(
-        await executeQueries({ ...current, mentionedIssueIds }),
+        await executeQueries({ ...current, mentionedIssueIds }, writerScope),
       );
       let snapshot: StatusCardFingerprint;
       if (payloadFingerprint) {
@@ -941,5 +1034,5 @@ export function statusCardService(
     }));
   }
 
-  return { list, getById, hydrate, create, update, remove, listUpdates, listSummaryRevisions, listMentionedIssues, requestCompile, requestRefresh, tickDueStatusCards, writeQuery, writeSummary, dryRun };
+  return { list, getById, hydrate, create, update, remove, listUpdates, listVisibleUpdates, listSummaryRevisions, readableIssueIds, listMentionedIssues, requestCompile, requestRefresh, tickDueStatusCards, writeQuery, writeSummary, dryRun };
 }
