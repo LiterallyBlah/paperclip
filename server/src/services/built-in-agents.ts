@@ -5,9 +5,9 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readPaperclipSkillSyncPreference, writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
-import { and, desc, eq, ne } from "drizzle-orm";
+import { and, asc, desc, eq, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, builtInManagedResources, companies, issueThreadInteractions, issues, routines, routineTriggers } from "@paperclipai/db";
+import { activityLog, agents, builtInManagedResources, companies, companyMemberships, issueThreadInteractions, issues, routineRevisions, routines, routineTriggers } from "@paperclipai/db";
 import { agentHarnessType, agentRunner, syncRoutineVariablesWithTemplate, type AgentRunnerChoice } from "@paperclipai/shared";
 import type { Agent, Approval, CompanySkill, PermissionKey, Routine, RoutineTrigger, RoutineVariable } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
@@ -489,6 +489,97 @@ const ROOT_AGENT_DEFAULT_CHANGE_GRANTS: PermissionKey[] = ["agents:configure", "
 const BUILT_IN_AGENT_DEFAULT_GRANTS: Record<string, PermissionKey[]> = {
   "reflection-coach": ["agents:suggest-changes", "skills:suggest-changes"],
 };
+
+const BUILT_IN_BUNDLES_ACTOR_ID = "built-in-bundles";
+
+// A bundle routine's responsible user is the principal whose authority its
+// scheduled runs inherit, so it is chosen only from the company's own
+// configuration: the company default responsible user when that user is an
+// active member, else the earliest active owner. The requesting user, the
+// synthetic bundle marker and non-members are never selected. Returns null when
+// no such user exists, so the caller defers instead of failing half-way.
+async function resolveBundleRoutineResponsibleUserId(db: Db, companyId: string): Promise<string | null> {
+  const company = await db
+    .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
+    .from(companies)
+    .where(eq(companies.id, companyId))
+    .then((rows) => rows[0] ?? null);
+  const defaultUserId = company?.defaultResponsibleUserId?.trim() || null;
+  if (defaultUserId && defaultUserId !== BUILT_IN_BUNDLES_ACTOR_ID) {
+    const member = await db
+      .select({ id: companyMemberships.id })
+      .from(companyMemberships)
+      .where(and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, defaultUserId),
+        eq(companyMemberships.status, "active"),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (member) return defaultUserId;
+  }
+  const owner = await db
+    .select({ userId: companyMemberships.principalId })
+    .from(companyMemberships)
+    .where(and(
+      eq(companyMemberships.companyId, companyId),
+      eq(companyMemberships.principalType, "user"),
+      eq(companyMemberships.status, "active"),
+      eq(companyMemberships.membershipRole, "owner"),
+      ne(companyMemberships.principalId, BUILT_IN_BUNDLES_ACTOR_ID),
+    ))
+    .orderBy(asc(companyMemberships.createdAt), asc(companyMemberships.id))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  return owner?.userId ?? null;
+}
+
+async function requireBundleRoutineResponsibleUserId(db: Db, companyId: string) {
+  const responsibleUserId = await resolveBundleRoutineResponsibleUserId(db, companyId);
+  if (!responsibleUserId) throw unprocessable("Built-in routine requires a responsible user");
+  return responsibleUserId;
+}
+
+function hasLegacyBundleResponsibleUser(routine: { responsibleUserId?: string | null }) {
+  return routine.responsibleUserId === BUILT_IN_BUNDLES_ACTOR_ID;
+}
+
+async function repairLegacyBundleRoutineResponsibleUser(
+  db: Db,
+  routine: { id: string; companyId: string },
+  candidateUserId: string | null,
+) {
+  await db.transaction(async (tx) => {
+    if (candidateUserId) {
+      await tx
+        .update(routines)
+        .set({ responsibleUserId: candidateUserId, updatedAt: new Date() })
+        .where(and(
+          eq(routines.companyId, routine.companyId),
+          eq(routines.id, routine.id),
+          eq(routines.responsibleUserId, BUILT_IN_BUNDLES_ACTOR_ID),
+        ));
+    }
+    const [current] = await tx
+      .select({ responsibleUserId: routines.responsibleUserId })
+      .from(routines)
+      .where(and(eq(routines.companyId, routine.companyId), eq(routines.id, routine.id)));
+    const owner = current?.responsibleUserId ?? null;
+    if (!owner || owner === BUILT_IN_BUNDLES_ACTOR_ID) return;
+    await tx
+      .update(routineRevisions)
+      .set({
+        responsibleUserId: owner,
+        snapshot: sql`jsonb_set("snapshot", '{routine,responsibleUserId}', to_jsonb(${owner}::text))`,
+      })
+      .where(and(
+        eq(routineRevisions.companyId, routine.companyId),
+        eq(routineRevisions.routineId, routine.id),
+        eq(routineRevisions.responsibleUserId, BUILT_IN_BUNDLES_ACTOR_ID),
+      ));
+  });
+}
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1393,7 +1484,12 @@ export function builtInAgentService(db: Db) {
     };
   }
 
-  async function requireBundleRoutine(companyId: string, key: string, routineKey: string) {
+  async function requireBundleRoutine(
+    companyId: string,
+    key: string,
+    routineKey: string,
+    options: { requireResponsibleUser?: boolean } = {},
+  ) {
     const definition = requireBuiltInAgentDefinition(key);
     if (!definition.bundle || definition.bundle.routine.routineKey !== routineKey) {
       throw notFound("Built-in routine not found");
@@ -1403,6 +1499,13 @@ export function builtInAgentService(db: Db) {
     if (!agent) throw notFound("Built-in agent is not provisioned");
     const current = await getRoutineByBinding(companyId, definition);
     if (!current.routine) throw notFound("Built-in routine not found");
+    const requireResponsibleUser = options.requireResponsibleUser ?? true;
+    const candidateUserId = hasLegacyBundleResponsibleUser(current.routine)
+      ? requireResponsibleUser
+        ? await requireBundleRoutineResponsibleUserId(db, companyId)
+        : await resolveBundleRoutineResponsibleUserId(db, companyId)
+      : null;
+    await repairLegacyBundleRoutineResponsibleUser(db, current.routine, candidateUserId);
     const schedule = current.triggers.find((trigger) => trigger.kind === "schedule") ?? null;
     return { definition, agent, routine: current.routine, triggers: current.triggers, schedule };
   }
@@ -1414,9 +1517,15 @@ export function builtInAgentService(db: Db) {
     return resumed as Agent;
   }
 
-  async function createOrResetRoutine(agent: Agent, definition: BuiltInAgentDefinition, existing: Routine | null, mode: "reconcile" | "reset") {
+  async function createOrResetRoutine(
+    agent: Agent,
+    definition: BuiltInAgentDefinition,
+    existing: Routine | null,
+    mode: "reconcile" | "reset",
+    responsibleUserId: string | null,
+  ) {
     const routine = definition.bundle!.routine;
-    const actor = { agentId: null, userId: "built-in-bundles" };
+    const actor = { agentId: null, userId: null, actorResponsibleUserId: responsibleUserId };
     const nextRoutine = existing
       ? await routineSvc.update(existing.id, {
         title: routine.title,
@@ -1474,7 +1583,7 @@ export function builtInAgentService(db: Db) {
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: "system",
-      actorId: "built-in-bundles",
+      actorId: BUILT_IN_BUNDLES_ACTOR_ID,
       action: mode === "reset" ? "built_in_agent.routine_reset" : "built_in_agent.routine_reconciled",
       entityType: "routine",
       entityId: nextRoutine.id,
@@ -1487,10 +1596,42 @@ export function builtInAgentService(db: Db) {
     return nextRoutine;
   }
 
-  async function materializeRoutine(agent: Agent, definition: BuiltInAgentDefinition, mode: "reconcile" | "reset") {
+  async function materializeRoutine(
+    agent: Agent,
+    definition: BuiltInAgentDefinition,
+    mode: "reconcile" | "reset",
+  ) {
     const bundle = definition.bundle!;
     const stock = routineDefaultsHash(bundle.routine, bundle.routine.triggers);
     const { binding, routine, triggers } = await getRoutineByBinding(agent.companyId, definition);
+    const responsibleUserId = !routine || hasLegacyBundleResponsibleUser(routine)
+      ? await resolveBundleRoutineResponsibleUserId(db, agent.companyId)
+      : null;
+    if (!routine && !responsibleUserId) {
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: BUILT_IN_BUNDLES_ACTOR_ID,
+        action: "built_in_agent.routine_deferred",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          key: definition.key,
+          routineKey: bundle.routine.routineKey,
+          reason: "no_responsible_user",
+        },
+      });
+      return withRoutineControls(stockState({
+        resourceKind: "routine",
+        resourceKey: bundle.routine.routineKey,
+        resourceId: null,
+        stockVersion: bundle.stockVersion,
+        latestStockHash: stock,
+        currentHash: null,
+        bindingStockHash: binding?.stockHash ?? null,
+      }), { routine: null, triggers: [], proposal: await pendingUpdateProposal(agent) });
+    }
+    if (routine) await repairLegacyBundleRoutineResponsibleUser(db, routine, responsibleUserId);
     const currentHash = routine ? routineDefaultsHash({
       title: routine.title,
       description: routine.description ?? "",
@@ -1508,12 +1649,32 @@ export function builtInAgentService(db: Db) {
       currentHash,
       bindingStockHash: binding?.stockHash ?? null,
     });
-    const shouldWrite =
+    // A routine still owned by the bundle marker cannot be rewritten until the
+    // company has a user who can own it; defer the stock write instead of
+    // failing part-way through the bundle reconcile.
+    const ownerDeferred = routine !== null && hasLegacyBundleResponsibleUser(routine) && !responsibleUserId;
+    if (ownerDeferred) {
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: BUILT_IN_BUNDLES_ACTOR_ID,
+        action: "built_in_agent.routine_deferred",
+        entityType: "routine",
+        entityId: routine.id,
+        details: {
+          key: definition.key,
+          routineKey: bundle.routine.routineKey,
+          reason: "no_responsible_user",
+        },
+      });
+    }
+    const shouldWrite = !ownerDeferred && (
       mode === "reset"
       || currentState.stockStatus === "missing"
-      || currentState.stockStatus === "stock_update_available";
+      || currentState.stockStatus === "stock_update_available"
+    );
     const nextRoutine = shouldWrite
-      ? await createOrResetRoutine(agent, definition, routine, mode)
+      ? await createOrResetRoutine(agent, definition, routine, mode, responsibleUserId)
       : routine!;
     await upsertManagedResourceBinding({
       companyId: agent.companyId,
@@ -2042,7 +2203,12 @@ export function builtInAgentService(db: Db) {
     enabled: boolean,
     actor: { agentId?: string | null; userId?: string | null; runId?: string | null } = {},
   ) {
-    const { definition, agent, routine, schedule } = await requireBundleRoutine(companyId, key, routineKey);
+    const { definition, agent, routine, schedule } = await requireBundleRoutine(
+      companyId,
+      key,
+      routineKey,
+      { requireResponsibleUser: enabled },
+    );
     if (!schedule) throw notFound("Built-in routine schedule not found");
     if (enabled) {
       await ensureBuiltInAgentAssignable(agent);

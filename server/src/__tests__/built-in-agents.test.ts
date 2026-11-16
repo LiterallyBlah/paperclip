@@ -26,6 +26,7 @@ import {
   issueThreadInteractions,
   issues,
   principalPermissionGrants,
+  routineRevisions,
   routines,
   routineTriggers,
 } from "@paperclipai/db";
@@ -48,6 +49,7 @@ import {
 } from "../services/built-in-agents.ts";
 import { readBuiltInAgentMarker, withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.ts";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
+import { routineService } from "../services/routines.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -211,6 +213,14 @@ describeEmbeddedPostgres("built-in agents", () => {
       issuePrefix: issuePrefix(companyId),
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: options.requireApproval ?? true,
+    });
+    // The default responsible user is a real, active company member.
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "member",
     });
     return companyId;
   }
@@ -760,6 +770,318 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(coachGrantKeys).toEqual(expect.arrayContaining(["agents:suggest-changes", "skills:suggest-changes"]));
     expect(coachGrantKeys).not.toContain("agents:configure");
     expect(coachGrantKeys).not.toContain("skills:create");
+  });
+
+  // --- BLA-942: built-in bundle routines are owned by a real company member ---
+  // Fork backport of upstream paperclipai/paperclip#20129 (code only). The
+  // owner is the company default responsible user when that user is an active
+  // member, else the earliest active owner; never the requesting user, never
+  // the "built-in-bundles" marker, never a non-member.
+
+  const BUNDLE_MARKER = "built-in-bundles";
+  const COACH = "reflection-coach";
+  const COACH_ROUTINE = "recent-agent-reflection";
+
+  async function addMembership(
+    companyId: string,
+    principalId: string,
+    options: { role?: string; status?: string; createdAt?: Date } = {},
+  ) {
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId,
+      status: options.status ?? "active",
+      membershipRole: options.role ?? "member",
+      ...(options.createdAt ? { createdAt: options.createdAt } : {}),
+    });
+  }
+
+  async function seedOwnedCompany(options: { defaultResponsibleUserId?: string | null } = {}) {
+    const companyId = await seedCompany({ requireApproval: false });
+    if (options.defaultResponsibleUserId !== undefined) {
+      await db.update(companies)
+        .set({ defaultResponsibleUserId: options.defaultResponsibleUserId })
+        .where(eq(companies.id, companyId));
+    }
+    return companyId;
+  }
+
+  async function bundleRoutine(companyId: string) {
+    const rows = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    expect(rows).toHaveLength(1);
+    return rows[0]!;
+  }
+
+  async function markBundleRoutine(companyId: string, patch: Partial<typeof routines.$inferInsert> = {}) {
+    const installed = await bundleRoutine(companyId);
+    await db.update(routines)
+      .set({ responsibleUserId: BUNDLE_MARKER, ...patch })
+      .where(eq(routines.id, installed.id));
+    await db.update(routineRevisions)
+      .set({
+        responsibleUserId: BUNDLE_MARKER,
+        snapshot: sql`jsonb_set("snapshot", '{routine,responsibleUserId}', to_jsonb(${BUNDLE_MARKER}::text))`,
+      })
+      .where(eq(routineRevisions.routineId, installed.id));
+    return installed;
+  }
+
+  async function expectRoutineOwnedBy(routineId: string, responsibleUserId: string) {
+    const [routine] = await db.select().from(routines).where(eq(routines.id, routineId));
+    expect(routine!.responsibleUserId).toBe(responsibleUserId);
+    const revisions = await db.select().from(routineRevisions).where(eq(routineRevisions.routineId, routineId));
+    expect(revisions.length).toBeGreaterThan(0);
+    for (const revision of revisions) {
+      expect(revision.responsibleUserId).toBe(responsibleUserId);
+      expect((revision.snapshot as { routine?: { responsibleUserId?: string | null } }).routine?.responsibleUserId)
+        .toBe(responsibleUserId);
+    }
+    return routine!;
+  }
+
+  async function cleanupRoutineRuns(companyId: string) {
+    await db.delete(routineRuns).where(eq(routineRuns.companyId, companyId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+  }
+
+  // Fire the bundle routine's schedule through the real scheduler and return
+  // the responsible user recorded on the routine run and its execution issue.
+  async function dispatchBundleSchedule(companyId: string) {
+    const routine = await bundleRoutine(companyId);
+    const [schedule] = await db.select().from(routineTriggers).where(and(
+      eq(routineTriggers.routineId, routine.id),
+      eq(routineTriggers.kind, "schedule"),
+    ));
+    expect(schedule!.enabled).toBe(true);
+    const due = new Date("2020-01-01T00:00:00.000Z");
+    await db.update(routineTriggers).set({ nextRunAt: due }).where(eq(routineTriggers.id, schedule!.id));
+    const wakeups: unknown[] = [];
+    const scheduler = routineService(db, {
+      heartbeat: {
+        wakeup: async (agentId: string, opts: unknown) => {
+          wakeups.push({ agentId, opts });
+          return null;
+        },
+      } as never,
+      runtimeEnv: {},
+    });
+    expect(await scheduler.tickScheduledTriggers(new Date())).toEqual({ triggered: 1 });
+    const [routineRun] = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+    expect(routineRun).toMatchObject({ source: "schedule", status: "issue_created" });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, routineRun!.linkedIssueId!));
+    return { routineRun: routineRun!, issue: issue! };
+  }
+
+  it("reproduction: a scheduled bundle routine dispatch carries a real company member, never the built-in-bundles marker", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH, {}, { createdByUserId: "enabling-user" });
+    await builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "board-user" });
+    try {
+      const { routineRun, issue } = await dispatchBundleSchedule(companyId);
+      expect(issue.responsibleUserId).not.toBe(BUNDLE_MARKER);
+      expect(issue.responsibleUserId).toBe("responsible-user");
+      expect(routineRun.responsibleUserId).toBe("responsible-user");
+
+      const routine = await expectRoutineOwnedBy(routineRun.routineId, "responsible-user");
+      expect(routine.createdByUserId).toBeNull();
+    } finally {
+      await cleanupRoutineRuns(companyId);
+    }
+  });
+
+  it("falls back to the earliest active owner when the company default user is not an active member", async () => {
+    const companyId = await seedOwnedCompany({ defaultResponsibleUserId: "departed-user" });
+    await addMembership(companyId, "departed-user", { status: "suspended" });
+    await addMembership(companyId, "suspended-owner", { role: "owner", status: "suspended", createdAt: new Date("2020-01-01T00:00:00Z") });
+    await addMembership(companyId, "early-member", { role: "member", createdAt: new Date("2020-01-02T00:00:00Z") });
+    await addMembership(companyId, "first-owner", { role: "owner", createdAt: new Date("2020-01-03T00:00:00Z") });
+    await addMembership(companyId, "second-owner", { role: "owner", createdAt: new Date("2020-01-04T00:00:00Z") });
+
+    await builtInAgentService(db).ensure(companyId, COACH, {}, { createdByUserId: "enabling-user" });
+
+    await expectRoutineOwnedBy((await bundleRoutine(companyId)).id, "first-owner");
+  });
+
+  it("falls back to the earliest active owner when the company has no default user", async () => {
+    const companyId = await seedOwnedCompany({ defaultResponsibleUserId: null });
+    await addMembership(companyId, "only-owner", { role: "owner" });
+
+    await builtInAgentService(db).ensure(companyId, COACH);
+
+    await expectRoutineOwnedBy((await bundleRoutine(companyId)).id, "only-owner");
+  });
+
+  it("never selects the built-in-bundles marker, even when it is configured as the company default", async () => {
+    const companyId = await seedOwnedCompany({ defaultResponsibleUserId: BUNDLE_MARKER });
+    await addMembership(companyId, BUNDLE_MARKER, { role: "owner", createdAt: new Date("2020-01-01T00:00:00Z") });
+    await addMembership(companyId, "real-owner", { role: "owner", createdAt: new Date("2020-01-02T00:00:00Z") });
+
+    await builtInAgentService(db).ensure(companyId, COACH);
+
+    await expectRoutineOwnedBy((await bundleRoutine(companyId)).id, "real-owner");
+  });
+
+  it("repairs a marked routine and all its revisions on reconcile, keeps operator edits, and the next scheduled dispatch carries a real member", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    await builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "responsible-user" });
+    const installed = await markBundleRoutine(companyId, { title: "Operator-customized title" });
+
+    await builtIns.ensure(companyId, COACH);
+
+    const repaired = await expectRoutineOwnedBy(installed.id, "responsible-user");
+    expect(repaired.title).toBe("Operator-customized title");
+    const repairs = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "built_in_agent.routine_reconciled"),
+    ));
+    for (const entry of repairs) expect(entry.actorId).toBe(BUNDLE_MARKER);
+    try {
+      const { routineRun, issue } = await dispatchBundleSchedule(companyId);
+      expect(routineRun.responsibleUserId).toBe("responsible-user");
+      expect(issue.responsibleUserId).toBe("responsible-user");
+    } finally {
+      await cleanupRoutineRuns(companyId);
+    }
+  });
+
+  it("repairs a marked routine during startup reconcile", async () => {
+    const companyId = await seedOwnedCompany();
+    await builtInAgentService(db).ensure(companyId, COACH);
+    const installed = await markBundleRoutine(companyId);
+
+    await reconcileBuiltInAgentsOnStartup(db);
+
+    await expectRoutineOwnedBy(installed.id, "responsible-user");
+  });
+
+  it("repairs a marked routine on reset instead of re-persisting the marker", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    const installed = await markBundleRoutine(companyId, { title: "Operator-customized title" });
+
+    await builtIns.reset(companyId, COACH, { resources: ["routine"] }, instructionOperator);
+
+    const reset = await expectRoutineOwnedBy(installed.id, "responsible-user");
+    expect(reset.title).toBe("Review recent agent trajectories for coaching proposals");
+    const resets = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "built_in_agent.routine_reset"),
+    ));
+    expect(resets.length).toBeGreaterThan(0);
+    for (const entry of resets) expect(entry.actorId).toBe(BUNDLE_MARKER);
+  });
+
+  it("repairs a marked routine to the company owner, not the requester, when its schedule is enabled", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    const installed = await markBundleRoutine(companyId);
+
+    await builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "board-user" });
+
+    await expectRoutineOwnedBy(installed.id, "responsible-user");
+  });
+
+  it("repairs marked revisions of a routine whose owner was already fixed, without changing that owner", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    const installed = await markBundleRoutine(companyId, { responsibleUserId: "operator-pick" });
+
+    await builtIns.ensure(companyId, COACH);
+
+    await expectRoutineOwnedBy(installed.id, "operator-pick");
+  });
+
+  it("keeps a manual board-user run on the runner while repairing the marked owner", async () => {
+    const companyId = await seedOwnedCompany();
+    await addMembership(companyId, "operator-user");
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    const installed = await markBundleRoutine(companyId);
+
+    await lifecycleWorker.stop();
+    lifecycleWorker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "pending" });
+    try {
+      const run = await builtIns.runRoutine(companyId, COACH, COACH_ROUTINE, { userId: "operator-user" });
+      expect(run.status).toBe("issue_created");
+      await expectRoutineOwnedBy(installed.id, "responsible-user");
+      const [routineRun] = await db.select().from(routineRuns).where(eq(routineRuns.companyId, companyId));
+      expect(routineRun!.responsibleUserId).toBe("operator-user");
+      const [createdIssue] = await db.select().from(issues).where(eq(issues.id, routineRun!.linkedIssueId!));
+      expect(createdIssue!.responsibleUserId).toBe("operator-user");
+    } finally {
+      await lifecycleWorker.stop();
+      await cleanupRoutineRuns(companyId);
+      lifecycleWorker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
+    }
+  });
+
+  it("defers a new bundle routine when the company has no user to own it, then materializes it once an owner exists", async () => {
+    const companyId = await seedOwnedCompany({ defaultResponsibleUserId: null });
+    const builtIns = builtInAgentService(db);
+
+    const deferred = await builtIns.ensure(companyId, COACH, {}, { createdByUserId: "enabling-user" });
+    expect(deferred.agentId).toBeTruthy();
+    expect(deferred.resources.find((resource) => resource.resourceKind === "skill")).toMatchObject({
+      stockStatus: "stock_current",
+    });
+    expect(deferred.resources.find((resource) => resource.resourceKind === "routine")).toMatchObject({
+      resourceId: null,
+      stockStatus: "missing",
+    });
+    expect(await db.select().from(routines).where(eq(routines.companyId, companyId))).toHaveLength(0);
+    const deferrals = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "built_in_agent.routine_deferred"),
+    ));
+    expect(deferrals).toEqual([
+      expect.objectContaining({
+        actorId: BUNDLE_MARKER,
+        entityId: deferred.agentId,
+        details: expect.objectContaining({ reason: "no_responsible_user" }),
+      }),
+    ]);
+
+    await addMembership(companyId, "new-owner", { role: "owner" });
+    const materialized = await builtIns.ensure(companyId, COACH);
+    expect(materialized.resources.find((resource) => resource.resourceKind === "routine")).toMatchObject({
+      stockStatus: "stock_current",
+    });
+    await expectRoutineOwnedBy((await bundleRoutine(companyId)).id, "new-owner");
+  });
+
+  it("defers, without a partial write, a marked routine when no user can own it, and refuses to enable it", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    await builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "responsible-user" });
+    const installed = await markBundleRoutine(companyId, { title: "Operator-customized title" });
+    await db.update(companies).set({ defaultResponsibleUserId: null }).where(eq(companies.id, companyId));
+    await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));
+
+    await builtIns.reset(companyId, COACH, { resources: ["routine"] }, instructionOperator);
+    const untouched = await expectRoutineOwnedBy(installed.id, BUNDLE_MARKER);
+    expect(untouched.title).toBe("Operator-customized title");
+    const deferrals = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "built_in_agent.routine_deferred"),
+    ));
+    expect(deferrals).toEqual([
+      expect.objectContaining({ entityId: installed.id, details: expect.objectContaining({ reason: "no_responsible_user" }) }),
+    ]);
+
+    // Enabling needs an owner: it is refused before any write.
+    await expect(
+      builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "board-user" }),
+    ).rejects.toMatchObject({ status: 422 });
+    await expectRoutineOwnedBy(installed.id, BUNDLE_MARKER);
   });
 
   it("recreates missing managed resource bindings idempotently during concurrent reconcile", async () => {
