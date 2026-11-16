@@ -723,6 +723,7 @@ export type {
   IssueRelationIssueSummary,
   IssueExecutionMonitorPolicy,
   IssueExecutionMonitorState,
+  IssueExecutionMonitorMaintenanceWait,
   IssueExecutionPolicy,
   IssueExecutionState,
   IssueExecutionStage,
