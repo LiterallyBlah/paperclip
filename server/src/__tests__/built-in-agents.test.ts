@@ -10,7 +10,6 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
-  agentRuntimeState,
   heartbeatRuns,
   agentWakeupRequests,
   routineRuns,
@@ -843,13 +842,25 @@ describeEmbeddedPostgres("built-in agents", () => {
   }
 
   async function cleanupRoutineRuns(companyId: string) {
-    // Real heartbeat wakes run fire-and-forget; wait for their writes to land
-    // before deleting, so nothing references the agent after this test.
-    await heartbeatService(db).drainActiveRunExecutions();
-    await db.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, companyId));
     await db.delete(routineRuns).where(eq(routineRuns.companyId, companyId));
     await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
     await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+  }
+
+  // Real heartbeat runs write events, runtime state and other run-linked rows
+  // fire-and-forget. Drain them, then truncate the run tables with CASCADE so
+  // no run-linked row (whatever table it lands in) still references the agent.
+  async function drainAndTruncateRealRuns() {
+    await heartbeatService(db).drainActiveRunExecutions();
+    await db.execute(sql.raw(`
+      TRUNCATE TABLE
+        "heartbeat_run_events",
+        "heartbeat_runs",
+        "routine_runs",
+        "agent_wakeup_requests",
+        "agent_runtime_state"
+      CASCADE
+    `));
   }
 
   // Fire the bundle routine's schedule through the real scheduler and return
@@ -1047,7 +1058,8 @@ describeEmbeddedPostgres("built-in agents", () => {
       expect(manualRuns.length).toBeGreaterThan(0);
       for (const run of manualRuns) await expectActiveMember(companyId, run.responsibleUserId);
       await expectRoutineOwnedBy(installed.id, "responsible-user");
-      await cleanupRoutineRuns(companyId);
+      await heartbeatService(db).drainActiveRunExecutions();
+      const manualRunIds = new Set((await heartbeatRunsFor(companyId)).map((run) => run.id));
       await db.update(issues).set({ status: "done" }).where(eq(issues.companyId, companyId));
 
       // Scheduled dispatch through the real scheduler and real heartbeat.
@@ -1058,12 +1070,12 @@ describeEmbeddedPostgres("built-in agents", () => {
       await db.update(routineTriggers).set({ nextRunAt: new Date("2020-01-01T00:00:00.000Z") })
         .where(eq(routineTriggers.id, schedule!.id));
       expect(await routineService(db, { runtimeEnv: {} }).tickScheduledTriggers(new Date())).toEqual({ triggered: 1 });
-      const scheduledRuns = await heartbeatRunsFor(companyId);
+      const scheduledRuns = (await heartbeatRunsFor(companyId)).filter((run) => !manualRunIds.has(run.id));
       expect(scheduledRuns.length).toBeGreaterThan(0);
       for (const run of scheduledRuns) await expectActiveMember(companyId, run.responsibleUserId);
     } finally {
       await lifecycleWorker.stop();
-      await cleanupRoutineRuns(companyId);
+      await drainAndTruncateRealRuns();
       lifecycleWorker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
     }
   });
