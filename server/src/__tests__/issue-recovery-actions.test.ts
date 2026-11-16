@@ -44,6 +44,9 @@ import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { issueService } from "../services/issues.js";
+import { setPluginEventBus } from "../services/activity-log.js";
+import type { PluginEventBus } from "../services/plugin-event-bus.js";
+import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import { caseHandoffService } from "../services/case-handoffs.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
@@ -1217,6 +1220,64 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const secondResult = await recovery.reconcileStrandedAssignedIssues();
     expect(secondResult).toMatchObject({ providerQuotaMonitored: 0, skipped: 1 });
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+  });
+
+  it("audits a provider-quota wait block as a standard issue.updated status change", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const pluginEvents: PluginEvent[] = [];
+    setPluginEventBus({
+      emit: async (event: PluginEvent) => {
+        pluginEvents.push(event);
+        return { errors: [] };
+      },
+    } as unknown as PluginEventBus);
+    const runId = randomUUID();
+    const [latestRun] = await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "You've hit your usage limit for GPT-5. Try again at 12:00 AM (UTC).",
+      errorCode: "provider_quota",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssue.id },
+    }).returning();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: latestRun!,
+      recoveryCause: "provider_quota",
+    });
+
+    expect(updated?.status).toBe("blocked");
+    const [action] = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({ cause: "provider_quota", ownerType: "system" });
+    const statusRows = await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, sourceIssue.id),
+      eq(activityLog.action, "issue.updated"),
+    ));
+    expect(statusRows).toEqual([
+      expect.objectContaining({
+        details: expect.objectContaining({
+          status: "blocked",
+          _previous: { status: "in_progress" },
+          source: "recovery.reconcile_provider_quota_wait",
+          recoveryActionId: action!.id,
+        }),
+      }),
+    ]);
+    expect(pluginEvents.filter(event =>
+      event.eventType === "issue.updated" && event.entityId === sourceIssue.id)).toEqual([
+      expect.objectContaining({
+        companyId,
+        payload: expect.objectContaining({ status: "blocked", _previous: { status: "in_progress" } }),
+      }),
+    ]);
   });
 
   it("schedules another provider-quota monitor after a prior quota monitor fired", async () => {
