@@ -146,8 +146,18 @@ describeEmbeddedPostgres("companyService", () => {
     expect(afterReconcileRows.filter((row) => readBuiltInAgentMarker(row.metadata))).toHaveLength(0);
 
     // The Reflection Coach remains available to enable on demand, and enabling
-    // it materializes its bundled skill + paused routine.
-    const enabled = await builtInAgentService(db).ensure(created.id, "reflection-coach");
+    // it materializes its bundled skill + paused routine. The routine is owned
+    // by the company's owner, not by the enabling user or the bundle marker.
+    await db.insert(companyMemberships).values({
+      companyId: created.id,
+      principalType: "user",
+      principalId: "company-owner",
+      status: "active",
+      membershipRole: "owner",
+    });
+    const enabled = await builtInAgentService(db).ensure(created.id, "reflection-coach", {}, {
+      createdByUserId: "enabling-user",
+    });
     expect(enabled.agent).toMatchObject({
       name: "Reflection Coach",
       status: "paused",
@@ -174,6 +184,7 @@ describeEmbeddedPostgres("companyService", () => {
       assigneeAgentId: enabled.agentId,
       originKind: "built_in_agent_bundle",
       originId: "reflection-coach:recent-agent-reflection",
+      responsibleUserId: "company-owner",
     });
     const [trigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.routineId, routine!.id));
     expect(trigger).toMatchObject({

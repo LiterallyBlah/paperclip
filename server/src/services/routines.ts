@@ -157,6 +157,8 @@ async function resolveRoutineResponsibleUserId(db: Db, companyId: string, actorU
 type Actor = {
   agentId?: string | null;
   userId?: string | null;
+  // Responsible user to record on a created routine when no user is the actor
+  // (e.g. built-in bundle provisioning). Never used as the audit actor.
   actorResponsibleUserId?: string | null;
   runId?: string | null;
 };
