@@ -999,23 +999,62 @@ describeEmbeddedPostgres("built-in agents", () => {
     await expectRoutineOwnedBy(installed.id, "operator-pick");
   });
 
-  it("keeps a manual board-user run on the runner while repairing the marked owner", async () => {
+  // Seed-level check: the heartbeat run that executes the routine issue must
+  // carry a real active company member. The heartbeat resolves it through
+  // `getRoutineEnvForExecutionIssue`, which (while the dispatch transaction
+  // is still open) falls back to the routine row, so a marked routine leaks
+  // the marker into the run even for a manual board-user run.
+  async function heartbeatRunsFor(companyId: string) {
+    const issueIds = (await db.select({ id: issues.id }).from(issues).where(eq(issues.companyId, companyId)))
+      .map((row) => row.id);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    return runs.filter((run) => issueIds.includes(String((run.contextSnapshot as { issueId?: unknown } | null)?.issueId ?? "")));
+  }
+
+  async function expectActiveMember(companyId: string, userId: string | null) {
+    expect(userId).not.toBe(BUNDLE_MARKER);
+    const [membership] = await db.select().from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, companyId),
+      eq(companyMemberships.principalType, "user"),
+      eq(companyMemberships.principalId, userId ?? ""),
+      eq(companyMemberships.status, "active"),
+    ));
+    expect(membership, `heartbeat run responsible user ${userId} is an active member`).toBeDefined();
+  }
+
+  it("seeds both a scheduled and a manual board-user heartbeat run with a real company member after repair", async () => {
     const companyId = await seedOwnedCompany();
     await addMembership(companyId, "operator-user");
     const builtIns = builtInAgentService(db);
     await builtIns.ensure(companyId, COACH);
+    await builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "operator-user" });
     const installed = await markBundleRoutine(companyId);
 
     await lifecycleWorker.stop();
     lifecycleWorker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "pending" });
     try {
-      const run = await builtIns.runRoutine(companyId, COACH, COACH_ROUTINE, { userId: "operator-user" });
-      expect(run.status).toBe("issue_created");
+      // Manual board-user run: the route path repairs the routine, then the
+      // heartbeat run must not inherit the marker from the routine row.
+      const manual = await builtIns.runRoutine(companyId, COACH, COACH_ROUTINE, { userId: "operator-user" });
+      expect(manual.status).toBe("issue_created");
+      const manualRuns = await heartbeatRunsFor(companyId);
+      expect(manualRuns.length).toBeGreaterThan(0);
+      for (const run of manualRuns) await expectActiveMember(companyId, run.responsibleUserId);
       await expectRoutineOwnedBy(installed.id, "responsible-user");
-      const [routineRun] = await db.select().from(routineRuns).where(eq(routineRuns.companyId, companyId));
-      expect(routineRun!.responsibleUserId).toBe("operator-user");
-      const [createdIssue] = await db.select().from(issues).where(eq(issues.id, routineRun!.linkedIssueId!));
-      expect(createdIssue!.responsibleUserId).toBe("operator-user");
+      await cleanupRoutineRuns(companyId);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.companyId, companyId));
+
+      // Scheduled dispatch through the real scheduler and real heartbeat.
+      const [schedule] = await db.select().from(routineTriggers).where(and(
+        eq(routineTriggers.routineId, installed.id),
+        eq(routineTriggers.kind, "schedule"),
+      ));
+      await db.update(routineTriggers).set({ nextRunAt: new Date("2020-01-01T00:00:00.000Z") })
+        .where(eq(routineTriggers.id, schedule!.id));
+      expect(await routineService(db, { runtimeEnv: {} }).tickScheduledTriggers(new Date())).toEqual({ triggered: 1 });
+      const scheduledRuns = await heartbeatRunsFor(companyId);
+      expect(scheduledRuns.length).toBeGreaterThan(0);
+      for (const run of scheduledRuns) await expectActiveMember(companyId, run.responsibleUserId);
     } finally {
       await lifecycleWorker.stop();
       await cleanupRoutineRuns(companyId);
