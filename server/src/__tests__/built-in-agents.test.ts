@@ -10,6 +10,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
+  agentRuntimeState,
   heartbeatRuns,
   agentWakeupRequests,
   routineRuns,
@@ -50,6 +51,7 @@ import {
 import { readBuiltInAgentMarker, withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.ts";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
 import { routineService } from "../services/routines.ts";
+import { heartbeatService } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -841,6 +843,10 @@ describeEmbeddedPostgres("built-in agents", () => {
   }
 
   async function cleanupRoutineRuns(companyId: string) {
+    // Real heartbeat wakes run fire-and-forget; wait for their writes to land
+    // before deleting, so nothing references the agent after this test.
+    await heartbeatService(db).drainActiveRunExecutions();
+    await db.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, companyId));
     await db.delete(routineRuns).where(eq(routineRuns.companyId, companyId));
     await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
     await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
