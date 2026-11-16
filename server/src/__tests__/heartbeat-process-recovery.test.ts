@@ -8093,6 +8093,67 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  async function releaseFixturePauseHolds(companyId: string) {
+    await db.update(issueTreeHolds).set({ status: "released", releasedAt: new Date(), updatedAt: new Date() })
+      .where(eq(issueTreeHolds.companyId, companyId));
+  }
+
+  async function dispositionRepairWakes(agentId: string) {
+    return (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)))
+      .filter((wake) => wake.reason === "issue_disposition_repair" && wake.status !== "skipped");
+  }
+
+  it("does not escalate a non-invokable owner's disposition repair under a pause hold and evaluates it after release", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      activePauseHold: true,
+    });
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+
+    const held = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(held.escalated).toBe(0);
+    expect(held.dispositionRepairRequeued).toBe(0);
+    expect(await selectRecoveryActionForIssue(companyId, issueId)).toBeFalsy();
+    expect(await selectRecoveryIssueById(issueId)).toMatchObject({ status: "in_progress", assigneeAgentId: agentId });
+
+    await releaseFixturePauseHolds(companyId);
+    const released = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(released.escalated).toBe(1);
+    expect(await selectRecoveryActionForIssue(companyId, issueId)).toMatchObject({
+      kind: "deliberate_wait_without_target", ownerType: "board", resolutionNote: "owner_not_invokable",
+    });
+  });
+
+  it("schedules no deliberate-wait disposition repair under a pause hold and repairs after release", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+      activePauseHold: true,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const held = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(held.dispositionRepairRequeued).toBe(0);
+    expect(held.escalated).toBe(0);
+    expect(await selectRecoveryActionForIssue(companyId, issueId)).toBeFalsy();
+    expect(await dispositionRepairWakes(agentId)).toHaveLength(0);
+
+    await releaseFixturePauseHolds(companyId);
+    const released = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(released.dispositionRepairRequeued).toBe(1);
+    expect(await selectRecoveryActionForIssue(companyId, issueId)).toMatchObject({
+      kind: "deliberate_wait_without_target", status: "active", ownerAgentId: agentId, attemptCount: 1,
+    });
+    expect(await dispositionRepairWakes(agentId)).toHaveLength(1);
+  });
+
   it("keeps a legacy agent-owned recovery action readable without scheduling another takeover wake", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

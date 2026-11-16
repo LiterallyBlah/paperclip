@@ -746,6 +746,17 @@ export interface IssueExecutionPolicy {
   maxReviewRounds?: number | null;
 }
 
+export interface IssueExecutionMonitorMaintenanceWait {
+  /** The pause hold that deferred the most recent held fire. */
+  holdId: string;
+  /** The check time that was due when the hold first deferred it. */
+  originalNextCheckAt: string;
+  /** When the first held fire of this check was deferred. */
+  since: string;
+  /** Uncounted held fires recorded for this check. */
+  heldFireCount: number;
+}
+
 export interface IssueExecutionMonitorState {
   status: IssueExecutionMonitorStateStatus;
   nextCheckAt: string | null;
@@ -761,6 +772,12 @@ export interface IssueExecutionMonitorState {
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
   /** Consecutive scheduled fires of this nextCheckAt deferred because execution was held. */
   deferredCount?: number;
+  /**
+   * Present while due fires of this check are deferred because an active subtree
+   * pause hold covers the issue. Held fires are not counted toward attempts or
+   * the deferred-fire bound; the check is re-armed until the hold is released.
+   */
+  maintenanceWait?: IssueExecutionMonitorMaintenanceWait;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
 }

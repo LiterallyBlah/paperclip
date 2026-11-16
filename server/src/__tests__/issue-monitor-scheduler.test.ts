@@ -20,6 +20,7 @@ import {
   issueRecoveryActions,
   issueDocuments,
   issues,
+  issueTreeHolds,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
 import {
@@ -112,6 +113,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(activityLog);
     await db.delete(environmentLeases);
     await db.delete(workspaceRuntimeServices);
+    await db.delete(issueTreeHolds);
     await db.delete(issues);
     await db.delete(costEvents);
     await db.delete(heartbeatRuns);
@@ -473,6 +475,267 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(issue.monitorNextCheckAt).toEqual(replacementAt);
     expect(issue.monitorAttemptCount).toBe(0);
     expect(normalizeIssueExecutionPolicy(issue.executionPolicy)?.monitor?.nextCheckAt).toBe(replacementAt.toISOString());
+  });
+
+  async function createPauseHold(companyId: string, rootIssueId: string) {
+    const [hold] = await db.insert(issueTreeHolds).values({ companyId, rootIssueId, mode: "pause", status: "active",
+      reason: "maintenance window", releasePolicy: { strategy: "manual" } }).returning();
+    return hold!;
+  }
+
+  async function releasePauseHold(holdId: string) {
+    await db.update(issueTreeHolds).set({ status: "released", releasedAt: new Date(), updatedAt: new Date() })
+      .where(eq(issueTreeHolds.id, holdId));
+  }
+
+  async function nonSkippedMonitorWakes(agentId: string) {
+    return (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)))
+      .filter((wake) => wake.status !== "skipped" && wake.reason === "issue_monitor_due");
+  }
+
+  async function heldMonitorDiagnostics(issueId: string) {
+    return (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId)))
+      .filter((row) => row.action === "issue.monitor_deferred" &&
+        (row.details as { reason?: string } | null)?.reason === "issue_tree_hold_active");
+  }
+
+  it("keeps a monitor through a long pause hold as an uncounted maintenance wait and fires it after release", async () => {
+    const fixture = await seedFixture({ monitorAttemptCount: 1, monitor: { maxAttempts: 3, kind: "external_service",
+      serviceName: "deploy-api", externalRef: "deploy-123" } });
+    const { companyId, issueId, agentId, nextCheckAt } = fixture;
+    const hold = await createPauseHold(companyId, issueId);
+    const heartbeat = heartbeatService(db);
+
+    let dueAt = new Date(nextCheckAt.getTime() + 1_000);
+    // Well past both maxAttempts (3) and the deferred-fire bound (10).
+    for (let fire = 1; fire <= 15; fire += 1) {
+      expect((await heartbeat.tickTimers(dueAt)).enqueued).toBe(0);
+      const issue = await readIssue(issueId);
+      expect(issue.monitorAttemptCount).toBe(1);
+      expect(issue.monitorWakeRequestedAt).toBeNull();
+      expect(issue.monitorNextCheckAt!.getTime()).toBe(dueAt.getTime() + 5 * 60_000);
+      const policyMonitor = normalizeIssueExecutionPolicy(issue.executionPolicy)?.monitor;
+      expect(policyMonitor).toMatchObject({ nextCheckAt: issue.monitorNextCheckAt!.toISOString(), notes: "Check deploy",
+        kind: "external_service", serviceName: "deploy-api", maxAttempts: 3 });
+      expect((issue.executionPolicy as { monitor?: { externalRef?: string } }).monitor?.externalRef).toBe("deploy-123");
+      const state = parseIssueExecutionState(issue.executionState)?.monitor;
+      expect(state).toMatchObject({ status: "scheduled", attemptCount: 1, notes: "Check deploy", maxAttempts: 3,
+        nextCheckAt: issue.monitorNextCheckAt!.toISOString(),
+        maintenanceWait: { holdId: hold.id, originalNextCheckAt: nextCheckAt.toISOString(), heldFireCount: fire } });
+      expect(state?.deferredCount).toBeUndefined();
+      // Not due again until the bounded re-check.
+      await heartbeat.tickTimers(new Date(dueAt.getTime() + 60_000));
+      expect((await readIssue(issueId)).monitorNextCheckAt).toEqual(issue.monitorNextCheckAt);
+      dueAt = issue.monitorNextCheckAt!;
+    }
+    expect(await nonSkippedMonitorWakes(agentId)).toHaveLength(0);
+    expect(await heldMonitorDiagnostics(issueId)).toHaveLength(1);
+    expect((await heldMonitorDiagnostics(issueId))[0]?.details).toMatchObject({ holdId: hold.id, counted: false,
+      originalNextCheckAt: nextCheckAt.toISOString(), attemptCount: 1 });
+
+    await releasePauseHold(hold.id);
+    expect((await heartbeat.tickTimers(dueAt)).enqueued).toBe(1);
+    expect((await heartbeat.tickTimers(new Date(dueAt.getTime() + 30_000))).enqueued).toBe(0);
+    const triggered = await readIssue(issueId);
+    expect(triggered.monitorAttemptCount).toBe(2);
+    expect(triggered.monitorNextCheckAt).toBeNull();
+    const triggeredState = parseIssueExecutionState(triggered.executionState)?.monitor;
+    expect(triggeredState).toMatchObject({ status: "triggered", attemptCount: 2, notes: "Check deploy" });
+    expect(triggeredState?.maintenanceWait).toBeUndefined();
+    expect(await nonSkippedMonitorWakes(agentId)).toHaveLength(1);
+  });
+
+  it("applies a timeout that passed during a pause hold only at the first fire after release", async () => {
+    const { companyId, issueId, agentId, nextCheckAt } = await seedFixture({
+      monitor: { timeoutAt: "2026-04-11T12:40:00.000Z", recoveryPolicy: "wake_owner" },
+    });
+    const hold = await createPauseHold(companyId, issueId);
+    const heartbeat = heartbeatService(db);
+    let dueAt = new Date(nextCheckAt.getTime() + 1_000);
+    for (let fire = 0; fire < 4; fire += 1) {
+      await heartbeat.tickTimers(dueAt);
+      dueAt = (await readIssue(issueId)).monitorNextCheckAt!;
+    }
+    // The timeout passed while held: the monitor is kept, and no recovery wake was made.
+    expect(dueAt.getTime()).toBeGreaterThan(new Date("2026-04-11T12:40:00.000Z").getTime());
+    expect(parseIssueExecutionState((await readIssue(issueId)).executionState)?.monitor?.status).toBe("scheduled");
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)))
+      .filter((wake) => wake.status !== "skipped")).toHaveLength(0);
+
+    await releasePauseHold(hold.id);
+    await heartbeat.tickTimers(dueAt);
+    const cleared = await readIssue(issueId);
+    expect(cleared.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(cleared.executionState)?.monitor).toMatchObject({
+      status: "cleared", clearReason: "timeout_exceeded", attemptCount: 0,
+    });
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.filter((wake) => wake.reason === "issue_monitor_recovery")).toHaveLength(1);
+  });
+
+  it("keeps attempts counted by an execution-reconciliation deferral when a pause hold starts mid-backoff", async () => {
+    const fixture = await seedFixture();
+    const { companyId, issueId, nextCheckAt } = fixture;
+    await holdIssueExecution(fixture);
+    const heartbeat = heartbeatService(db);
+    let dueAt = new Date(nextCheckAt.getTime() + 60_000);
+    for (let fire = 0; fire < 2; fire += 1) {
+      await heartbeat.tickTimers(dueAt);
+      dueAt = (await readIssue(issueId)).monitorNextCheckAt!;
+    }
+    const backedOff = await readIssue(issueId);
+    expect(backedOff.monitorAttemptCount).toBe(2);
+    expect(parseIssueExecutionState(backedOff.executionState)?.monitor?.deferredCount).toBe(2);
+
+    const hold = await createPauseHold(companyId, issueId);
+    for (let fire = 0; fire < 12; fire += 1) {
+      await heartbeat.tickTimers(dueAt);
+      const issue = await readIssue(issueId);
+      expect(issue.monitorAttemptCount).toBe(2);
+      expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+        status: "scheduled", attemptCount: 2, deferredCount: 2, maintenanceWait: { heldFireCount: fire + 1 },
+      });
+      dueAt = issue.monitorNextCheckAt!;
+    }
+
+    // The execution hold remains: after the pause hold ends, counting resumes from the kept counts.
+    await releasePauseHold(hold.id);
+    await heartbeat.tickTimers(dueAt);
+    const resumed = await readIssue(issueId);
+    expect(resumed.monitorAttemptCount).toBe(3);
+    const resumedState = parseIssueExecutionState(resumed.executionState)?.monitor;
+    expect(resumedState).toMatchObject({ status: "scheduled", attemptCount: 3, deferredCount: 3 });
+    expect(resumedState?.maintenanceWait).toBeUndefined();
+  });
+
+  it("lets an owner replacement or clear made during a pause hold win over the maintenance wait", async () => {
+    const { companyId, issueId, agentId } = await seedFixture();
+    await createPauseHold(companyId, issueId);
+    const replacementAt = new Date("2026-04-11T13:30:00.000Z");
+    let replaced = false;
+    const racingDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property !== "transaction") return Reflect.get(target, property, receiver);
+        return async (callback: Parameters<typeof db.transaction>[0]) => {
+          const result = await db.transaction(callback);
+          const row = result as { id?: string; monitorWakeRequestedAt?: Date | null } | null;
+          if (!replaced && row?.id === issueId && row.monitorWakeRequestedAt) {
+            replaced = true;
+            await db.update(issues).set({ monitorNextCheckAt: replacementAt, monitorWakeRequestedAt: null,
+              executionPolicy: { monitor: { nextCheckAt: replacementAt.toISOString(), notes: "New check", scheduledBy: "assignee" } },
+            }).where(eq(issues.id, issueId));
+          }
+          return result;
+        };
+      },
+    });
+    await heartbeatService(racingDb).tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+    expect(replaced).toBe(true);
+    const issue = await readIssue(issueId);
+    expect(issue.monitorNextCheckAt).toEqual(replacementAt);
+    expect(issue.monitorAttemptCount).toBe(0);
+    expect(normalizeIssueExecutionPolicy(issue.executionPolicy)?.monitor).toMatchObject({
+      nextCheckAt: replacementAt.toISOString(), notes: "New check" });
+    expect(parseIssueExecutionState(issue.executionState)?.monitor?.maintenanceWait).toBeUndefined();
+
+    // The owner then clears the monitor during the hold; later ticks do not restore it.
+    await db.update(issues).set({ monitorNextCheckAt: null, monitorWakeRequestedAt: null, executionPolicy: null })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.tickTimers(new Date(replacementAt.getTime() + 1_000));
+    await heartbeat.tickTimers(new Date(replacementAt.getTime() + 10 * 60_000));
+    const cleared = await readIssue(issueId);
+    expect(cleared.monitorNextCheckAt).toBeNull();
+    expect(cleared.executionPolicy).toBeNull();
+    expect(await nonSkippedMonitorWakes(agentId)).toHaveLength(0);
+  });
+
+  it("keeps the wait while another overlapping pause hold still covers the issue", async () => {
+    const { companyId, issueId, agentId, nextCheckAt } = await seedFixture();
+    const parentId = randomUUID();
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, issueId));
+    await db.insert(issues).values({ id: parentId, companyId, title: "Maintenance parent", status: "in_progress",
+      priority: "medium", issueNumber: 2, identifier: `${issueRow!.identifier!.split("-")[0]}-2` });
+    await db.update(issues).set({ parentId }).where(eq(issues.id, issueId));
+    const preExisting = await createPauseHold(companyId, parentId);
+    const heartbeat = heartbeatService(db);
+    await heartbeat.tickTimers(new Date(nextCheckAt.getTime() + 1_000));
+    const ownHold = await createPauseHold(companyId, issueId);
+    let dueAt = (await readIssue(issueId)).monitorNextCheckAt!;
+    await heartbeat.tickTimers(dueAt);
+    dueAt = (await readIssue(issueId)).monitorNextCheckAt!;
+
+    await releasePauseHold(ownHold.id);
+    await heartbeat.tickTimers(dueAt);
+    const stillHeld = await readIssue(issueId);
+    expect(stillHeld.monitorAttemptCount).toBe(0);
+    expect(stillHeld.monitorNextCheckAt!.getTime()).toBe(dueAt.getTime() + 5 * 60_000);
+    expect(parseIssueExecutionState(stillHeld.executionState)?.monitor?.maintenanceWait).toMatchObject({
+      holdId: preExisting.id, originalNextCheckAt: nextCheckAt.toISOString(), heldFireCount: 3 });
+    expect(await nonSkippedMonitorWakes(agentId)).toHaveLength(0);
+    const [untouched] = await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.id, preExisting.id));
+    expect(untouched).toMatchObject({ status: "active", releasedAt: null, updatedAt: preExisting.updatedAt });
+
+    await releasePauseHold(preExisting.id);
+    expect((await heartbeat.tickTimers(stillHeld.monitorNextCheckAt!)).enqueued).toBe(1);
+    expect(await nonSkippedMonitorWakes(agentId)).toHaveLength(1);
+  });
+
+  it("neither duplicates nor loses the wake when a pause hold is released around a held fire", async () => {
+    const { companyId, issueId, agentId, nextCheckAt } = await seedFixture();
+    const hold = await createPauseHold(companyId, issueId);
+    // Release lands after the held fire was recorded: the re-armed check fires once.
+    let transactions = 0;
+    const releasingDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property !== "transaction") return Reflect.get(target, property, receiver);
+        return async (callback: Parameters<typeof db.transaction>[0]) => {
+          const result = await db.transaction(callback);
+          transactions += 1;
+          if (transactions === 2) await releasePauseHold(hold.id);
+          return result;
+        };
+      },
+    });
+    const dueAt = new Date(nextCheckAt.getTime() + 1_000);
+    expect((await heartbeatService(releasingDb).tickTimers(dueAt)).enqueued).toBe(0);
+    const rearmed = await readIssue(issueId);
+    expect(rearmed.monitorNextCheckAt!.getTime()).toBe(dueAt.getTime() + 5 * 60_000);
+    expect(rearmed.monitorAttemptCount).toBe(0);
+    const heartbeat = heartbeatService(db);
+    expect((await heartbeat.tickTimers(rearmed.monitorNextCheckAt!)).enqueued).toBe(1);
+    expect((await heartbeat.tickTimers(new Date(rearmed.monitorNextCheckAt!.getTime() + 60_000))).enqueued).toBe(0);
+    expect(await nonSkippedMonitorWakes(agentId)).toHaveLength(1);
+    expect((await readIssue(issueId)).monitorAttemptCount).toBe(1);
+  });
+
+  it("keeps the due check when recording a maintenance wait is interrupted", async () => {
+    const { companyId, issueId, agentId, nextCheckAt } = await seedFixture();
+    const hold = await createPauseHold(companyId, issueId);
+    let transactions = 0;
+    const failingDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property !== "transaction") return Reflect.get(target, property, receiver);
+        return async (callback: Parameters<typeof db.transaction>[0]) => {
+          transactions += 1;
+          if (transactions === 2) throw new Error("simulated interruption");
+          return db.transaction(callback);
+        };
+      },
+    });
+    const dueAt = new Date(nextCheckAt.getTime() + 1_000);
+    await heartbeatService(failingDb).tickTimers(dueAt);
+    const kept = await readIssue(issueId);
+    expect(kept.monitorNextCheckAt).toEqual(nextCheckAt);
+    expect(kept.monitorWakeRequestedAt).toBeNull();
+    expect(kept.monitorAttemptCount).toBe(0);
+    const heartbeat = heartbeatService(db);
+    await heartbeat.tickTimers(new Date(dueAt.getTime() + 1_000));
+    expect(parseIssueExecutionState((await readIssue(issueId)).executionState)?.monitor?.maintenanceWait)
+      .toMatchObject({ holdId: hold.id, originalNextCheckAt: nextCheckAt.toISOString(), heldFireCount: 1 });
+    await releasePauseHold(hold.id);
+    expect((await heartbeat.tickTimers((await readIssue(issueId)).monitorNextCheckAt!)).enqueued).toBe(1);
+    expect(await nonSkippedMonitorWakes(agentId)).toHaveLength(1);
   });
 
   it("recovers a rejected native monitor call and delivers the corrected schedule once", async () => {

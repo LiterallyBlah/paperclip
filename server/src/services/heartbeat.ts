@@ -1536,6 +1536,7 @@ export function heartbeatService(
     groupAgentOrgRowsByCompany,
     parseHeartbeatPolicy,
     claimDueTimerHeartbeat,
+    treeControlSvc,
   });
 
   const {
