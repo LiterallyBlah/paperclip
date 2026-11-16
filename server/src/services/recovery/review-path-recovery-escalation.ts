@@ -124,7 +124,18 @@ export async function escalateExhaustedIssueReviewPathRecovery(
       action: "issue.review_path_recovery_exhausted",
       entityType: "issue",
       entityId: issueId,
-      details: { recoveryActionId: recoveryAction.id, commentId: comment.id, consumedPathRef, recoveryAttempt: 1, maxRecoveryAttempts: 1 },
+      details: {
+        identifier: issue.identifier,
+        status: "blocked",
+        previousStatus: "in_review",
+        _previous: { status: "in_review" },
+        recoveryActionId: recoveryAction.id,
+        recoveryOwnerType: "board",
+        commentId: comment.id,
+        consumedPathRef,
+        recoveryAttempt: 1,
+        maxRecoveryAttempts: 1,
+      },
     }, publications);
     return recoveryAction;
   });
