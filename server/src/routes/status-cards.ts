@@ -83,6 +83,29 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
     }
   }
 
+  async function viewerScope(req: Request) {
+    return { issueReadCondition: await issueReadSqlCondition(db, req.actor) };
+  }
+
+  /**
+   * Mutation responses carry the card row and, for refresh, the computed
+   * change list. Both pass through the caller's read scope like GET does.
+   */
+  async function scopeMutationResult<T extends { card: Parameters<typeof service.hydrate>[0]; changes?: Array<{ issueId: string }> }>(
+    req: Request,
+    result: T,
+  ) {
+    const scope = await viewerScope(req);
+    const card = await service.hydrate(result.card, scope);
+    if (!result.changes) return { ...result, card };
+    const readable = await service.readableIssueIds(result.card.companyId, result.changes.map((change) => change.issueId), scope);
+    return {
+      ...result,
+      card,
+      changes: result.changes.filter((change) => readable?.has(change.issueId) ?? true),
+    };
+  }
+
   async function logMutation(req: Request, companyId: string, action: string, cardId: string, details?: Record<string, unknown>) {
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -219,7 +242,8 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
       fields: Object.keys(req.body),
       archived: Boolean(updated.archivedAt),
     });
-    res.json(withHref(publicCard(compile?.card ?? restore?.card ?? updated), await companyIssuePrefix(card.companyId)));
+    res.json(withHref(publicCard(await service.hydrate(compile?.card ?? restore?.card ?? updated, await viewerScope(req))),
+      await companyIssuePrefix(card.companyId)));
   });
 
   router.delete("/status-cards/:id", async (req, res) => {
@@ -236,14 +260,14 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
     await assertStatusCardsEnabled();
     const card = await getAccessibleResource(req, res, service.getById(req.params.id as string), "Status card not found");
     if (!card) return;
-    res.json(await service.listUpdates(card.id));
+    res.json(await service.listVisibleUpdates(card, await viewerScope(req)));
   });
 
   router.get("/status-cards/:id/summary-revisions", async (req, res) => {
     await assertStatusCardsEnabled();
     const card = await getAccessibleResource(req, res, service.getById(req.params.id as string), "Status card not found");
     if (!card) return;
-    res.json(await service.listSummaryRevisions(card));
+    res.json(await service.listSummaryRevisions(card, await viewerScope(req)));
   });
 
   router.post("/status-cards/:id/recompile", async (req, res) => {
@@ -256,7 +280,8 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
       generatingIssueId: result.generatingIssue.id,
       alreadyGenerating: result.alreadyGenerating,
     });
-    res.status(result.alreadyGenerating ? 200 : 202).json({ ...result, card: publicCard(result.card) });
+    const scoped = await scopeMutationResult(req, result);
+    res.status(result.alreadyGenerating ? 200 : 202).json({ ...scoped, card: publicCard(scoped.card) });
   });
 
   router.post("/status-cards/:id/refresh", validate(refreshStatusCardSchema), async (req, res) => {
@@ -271,7 +296,8 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
       alreadyGenerating: result.alreadyGenerating,
       enqueued: result.enqueued,
     });
-    res.status(result.enqueued && !result.alreadyGenerating ? 202 : 200).json({ ...result, card: publicCard(result.card) });
+    const scoped = await scopeMutationResult(req, result);
+    res.status(result.enqueued && !result.alreadyGenerating ? 202 : 200).json({ ...scoped, card: publicCard(scoped.card) });
   });
 
   router.get("/status-cards/:id/dry-run", async (req, res) => {
