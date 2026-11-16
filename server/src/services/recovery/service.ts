@@ -1795,6 +1795,7 @@ export function recoveryService(
             source: "recovery.native_blocked_wait",
             status: "blocked",
             previousStatus: "in_progress",
+            _previous: { status: "in_progress" },
             latestRunId: source.id,
             nativeResultId: proof.resultId,
             completionContractId: proof.contractId,
@@ -2938,6 +2939,7 @@ export function recoveryService(
         identifier: input.issue.identifier,
         status: "blocked",
         previousStatus: input.previousStatus,
+        _previous: { status: input.previousStatus },
         source: "recovery.reconcile_stranded_recovery_issue",
         latestRunId: input.latestRun?.id ?? null,
         latestRunStatus: input.latestRun?.status ?? null,
@@ -3119,6 +3121,7 @@ export function recoveryService(
         identifier: issue.identifier,
         status: "blocked",
         previousStatus: issue.status,
+        _previous: { status: issue.status },
         source: "recovery.reconcile_continuation_waiting_on_review",
         blockedByIssueIds,
       },
@@ -3793,6 +3796,7 @@ export function recoveryService(
         identifier: input.issue.identifier,
         status: "blocked",
         previousStatus: input.issue.status,
+        _previous: { status: input.issue.status },
         sourceStateFingerprint: input.fingerprint,
         attemptCount: input.attemptCount,
         maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
@@ -4161,7 +4165,33 @@ export function recoveryService(
       companyGuard: input.issue.companyId,
     }, tx, publications, postCommitActions);
     if (!updated) return null;
-    if (isProviderQuotaWait) return updated;
+    if (isProviderQuotaWait) {
+      // The quota wait keeps its own monitor and notice, but the status
+      // change still belongs in the audit trail like every other transition.
+      await logActivity(tx as unknown as Db, {
+        companyId: input.issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: input.latestRun?.id ?? null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: input.issue.id,
+        details: {
+          identifier: input.issue.identifier,
+          status: "blocked",
+          previousStatus: input.previousStatus,
+          _previous: { status: input.previousStatus },
+          source: "recovery.reconcile_provider_quota_wait",
+          recoveryCause,
+          latestRunId: input.latestRun?.id ?? null,
+          recoveryActionId: recoveryAction.id,
+          returnOwnerAgentId: recoveryAction.returnOwnerAgentId,
+          blockerIssueIds: blockerIds,
+        },
+      }, publications);
+      return updated;
+    }
     const sourceAssigneePreserved =
       updated.assigneeAgentId === input.issue.assigneeAgentId &&
       updated.assigneeUserId === input.issue.assigneeUserId;
@@ -4319,6 +4349,7 @@ export function recoveryService(
         identifier: input.issue.identifier,
         status: "blocked",
         previousStatus: input.previousStatus,
+        _previous: { status: input.previousStatus },
         source:
           input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
             ? "recovery.reconcile_successful_run_handoff_missing_state"
