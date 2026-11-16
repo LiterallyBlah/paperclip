@@ -73,6 +73,9 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { attentionService } from "../services/attention.ts";
 import { issueService } from "../services/issues.ts";
 import { escalateExhaustedIssueReviewPathRecovery } from "../services/recovery/review-path-recovery-escalation.ts";
+import { setPluginEventBus } from "../services/activity-log.ts";
+import type { PluginEventBus } from "../services/plugin-event-bus.ts";
+import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import { runningProcesses } from "../adapters/index.ts";
 import {
   buildIssueBlockersResolvedWakeStateKey,
@@ -537,6 +540,13 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       companyId, agentId, issueId, status: "failed",
       contextSnapshot: { issueId, wakeReason: "issue_review_path_lost", reviewPathRecoveryAttempt: 1 },
     }).returning();
+    const pluginEvents: PluginEvent[] = [];
+    setPluginEventBus({
+      emit: async (event: PluginEvent) => {
+        pluginEvents.push(event);
+        return { errors: [] };
+      },
+    } as unknown as PluginEventBus);
     const results = await Promise.all([
       escalateExhaustedIssueReviewPathRecovery(db, { run, issueId }),
       escalateExhaustedIssueReviewPathRecovery(db, { run, issueId }),
@@ -545,7 +555,21 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
     expect(await db.select().from(issueComments)).toHaveLength(1);
     expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
-    expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.review_path_recovery_exhausted"))).toHaveLength(1);
+    const exhausted = await db.select().from(activityLog).where(eq(activityLog.action, "issue.review_path_recovery_exhausted"));
+    expect(exhausted).toHaveLength(1);
+    expect(exhausted[0]!.details).toMatchObject({
+      status: "blocked",
+      _previous: { status: "in_review" },
+      recoveryOwnerType: "board",
+    });
+    // The board escalation reaches plugins once, as a standard status change.
+    expect(pluginEvents.filter(event => event.eventType === "issue.updated" && event.entityId === issueId)).toEqual([
+      expect.objectContaining({
+        companyId,
+        entityType: "issue",
+        payload: expect.objectContaining({ status: "blocked", _previous: { status: "in_review" } }),
+      }),
+    ]);
   });
 
   it.each(["restart", "transaction_failure", "due_monitor", "claimed_monitor", "expired_monitor", "exhausted_monitor", "disabled_monitor"] as const)("reconciles a committed review repair after %s with a one-connection pool", async (gap) => {
