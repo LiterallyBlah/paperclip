@@ -29,7 +29,7 @@ import { CONTROLLER_LEASE_LOST_FAILURE_CODE, LegacyControllerLeaseLostError } fr
 import { REVIEWED_CHAT_BINDING_NOT_READY, ReviewedChatBindingNotReadyError, reviewedChatBindingDenialResultJson } from "../reviewed-chat-binding-diagnostics.js";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { isConversation, settleConversationTurn } from "../agent-conversations.js";
-import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
+import { isHermesGatewayTransientBadRequest, legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import { isWorkspaceGitScanError } from "../workspace-git-operation-scheduler.js";
 import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
@@ -949,6 +949,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
         );
       }
+      let gatewayTransientRetryExhausted = false;
       if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
         const policy = parseMaxTurnContinuationPolicy(agent);
         if (policy.enabled && policy.maxAttempts > 0) {
@@ -975,7 +976,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         outcome === "failed" &&
         readTransientRecoveryContractFromRun(livenessRun)
       ) {
-        await scheduleBoundedRetryForRun(livenessRun, agent);
+        const transientRetry = await scheduleBoundedRetryForRun(livenessRun, agent);
+        // A transient gateway 400 that spent its bounded retries fails like
+        // any finished run: no generic continuation that would restart the
+        // budget, and no hold. The next genuine event wakes the agent.
+        gatewayTransientRetryExhausted = transientRetry.outcome === "retry_exhausted" &&
+          isHermesGatewayTransientBadRequest(livenessRun);
       } else if (
         outcome === "failed" &&
         !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
@@ -992,7 +998,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       );
       const conversationSettled = await settleConversationTurn(db, livenessRun);
       await releaseIssueExecutionAndPromote(livenessRun, {
-        suppressImmediateRecovery: conversationSettled ||
+        suppressImmediateRecovery: conversationSettled || gatewayTransientRetryExhausted ||
           readNonEmptyString(
             parseObject(livenessRun.contextSnapshot).goalControlRequestId,
           ) !== null ||

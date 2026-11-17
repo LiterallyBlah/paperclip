@@ -18,6 +18,7 @@ import {
   hasConversationContinuationPolicy,
 } from "../conversation-continuation.js";
 import {
+  isHermesGatewayTransientBadRequest,
   isSuppressedLegacyDispositionDispatch,
   legacyExecutionNeedsReconciliationWithEvidence,
 } from "../legacy-execution-recovery.js";
@@ -276,7 +277,8 @@ function resolveCodexTransientFallbackMode(
 }
 
 export function readHeartbeatRunErrorFamily(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson"> &
+    Partial<Pick<typeof heartbeatRuns.$inferSelect, "error">>,
 ) {
   const resultJson = parseObject(run.resultJson);
   const persistedFamily = readNonEmptyString(resultJson.errorFamily);
@@ -292,6 +294,7 @@ export function readHeartbeatRunErrorFamily(
   ) {
     return "transient_upstream";
   }
+  if (isHermesGatewayTransientBadRequest(run)) return "transient_upstream";
   return null;
 }
 
@@ -312,7 +315,8 @@ function readTransientRetryNotBeforeFromRun(
 }
 
 export function readTransientRecoveryContractFromRun(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson"> &
+    Partial<Pick<typeof heartbeatRuns.$inferSelect, "error">>,
 ) {
   const errorFamily = readHeartbeatRunErrorFamily(run);
   return errorFamily === "transient_upstream" ||
