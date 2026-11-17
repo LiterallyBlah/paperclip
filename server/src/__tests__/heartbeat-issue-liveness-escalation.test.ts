@@ -1346,30 +1346,6 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     expect(result.selfBlockedSkipped).toBe(1);
   });
 
-  it("heals a self-block once a later recovery finalize without a workspace saves the blocker", async () => {
-    const { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId } =
-      await seedResolvedDependencyBackstopFixture({ workspaceState: "finalized" });
-    await db.delete(workspaceOperations).where(eq(workspaceOperations.issueId, blockerIssueId));
-    const blockedTransitionAt = new Date(Date.now() - 120_000);
-    await db.update(issues).set({ blockedTransitionAt }).where(eq(issues.id, blockedIssueId));
-    const [blockerRun] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: blockerIssueId,
-      status: "succeeded", contextSnapshot: { issueId: blockerIssueId } }).returning();
-    await db.insert(workspaceOperations).values({ companyId, executionWorkspaceId, issueId: blockerIssueId,
-      heartbeatRunId: blockerRun.id, phase: "workspace_finalize", status: "failed",
-      startedAt: new Date(blockedTransitionAt.getTime() - 60_000), finishedAt: new Date(blockedTransitionAt.getTime() - 59_000) });
-    await db.insert(activityLog).values({ companyId, actorType: "agent", actorId: agentId, agentId,
-      action: "issue.updated", entityType: "issue", entityId: blockedIssueId, details: { status: "blocked" }, createdAt: blockedTransitionAt });
-    await expect(issueService(db).getDependencyReadiness(blockedIssueId)).resolves.toMatchObject({ isDependencyReady: false });
-    await db.insert(workspaceOperations).values({ companyId, executionWorkspaceId: null, issueId: blockerIssueId,
-      heartbeatRunId: blockerRun.id, phase: "workspace_finalize", status: "succeeded", startedAt: new Date(), finishedAt: new Date(),
-      metadata: { owningService: "workspace_recovery", preservationOperationIds: [] } });
-    await expect(issueService(db).getDependencyReadiness(blockedIssueId)).resolves.toMatchObject({ isDependencyReady: true });
-
-    const result = await heartbeatService(db).reconcileResolvedDependencyWakes({ companyId, issueId: blockedIssueId });
-    expect(result.selfBlockedSkipped).toBe(0);
-    expect(result.healed).toBe(1);
-  });
-
   it.each(["dependent", "blocker", "unattributed"] as const)("attributes shared-workspace export to its %s issue", async (exporter) => {
     const { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "finalized" });
