@@ -10465,6 +10465,7 @@ export function issueRoutes(
           }
         }
 
+        const reconciliationAdmission: { continuationAgentId?: string } = {};
         if (
           sourceIssueStatus === "todo" &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
@@ -10479,6 +10480,8 @@ export function issueRoutes(
               activeRecoveryAction.evidence.runId ??
               activeRecoveryAction.evidence.sourceRunId,
             decision: executionReconciliation,
+            recoveryAction: activeRecoveryAction,
+            admission: reconciliationAdmission,
           });
         } else if (executionReconciliation) {
           throw conflict(
@@ -10541,6 +10544,9 @@ export function issueRoutes(
             actor.actorId,
             chatRetry
               ? { kind: "chat_failed_run_retry", actionId: chatRetry.actionId }
+              : undefined,
+            reconciliationAdmission.continuationAgentId
+              ? { continuationAgentId: reconciliationAdmission.continuationAgentId }
               : undefined,
           );
         }
