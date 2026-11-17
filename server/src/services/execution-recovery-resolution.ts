@@ -39,6 +39,10 @@ export async function validateExecutionReconciliation(input: {
   decision: ExecutionReconciliation | undefined;
   /** Board-only source repair: never authorize a continuation of this run. */
   workspaceRepairOnly?: boolean;
+  /** The recovery action being reconciled; its evidence names a reviewer source. */
+  recoveryAction?: Pick<typeof issueRecoveryActions.$inferSelect, "evidence"> | null;
+  /** Out-parameter: the agent the continuation must wake, when it is not the action's return owner. */
+  admission?: { continuationAgentId?: string };
 }) {
   const { db, companyId, issueId, agentId, decision } = input;
   if (!decision || decision.runId !== input.sourceRunId || (!agentId && !input.workspaceRepairOnly)) {
@@ -67,6 +71,21 @@ export async function validateExecutionReconciliation(input: {
     review?.status === "pending" &&
     review.currentParticipant?.type === "agent" &&
     review.currentParticipant.agentId === run?.agentId;
+  // A reviewer's changes-requested verdict hands the task back to its
+  // executor; the reviewer's own source run is then held. The executor named
+  // as the review's return assignee may continue from that source.
+  const handBack = task && run ? parseIssueExecutionState(task.executionState) : null;
+  const isReviewerHandBack = Boolean(
+    run && task && agentId &&
+    input.recoveryAction?.evidence?.reviewParticipantAgentId === run.agentId &&
+    handBack?.status === "changes_requested" &&
+    handBack.lastDecisionOutcome === "changes_requested" &&
+    handBack.returnAssignee?.type === "agent" &&
+    handBack.returnAssignee.agentId === task.assigneeAgentId &&
+    handBack.returnAssignee.agentId === agentId &&
+    agentId !== run.agentId &&
+    !["done", "cancelled"].includes(task.status),
+  );
   const retainedWorkspace = hasRequiredWorkspaceRecovery(run?.resultJson);
   const repairOnly = input.workspaceRepairOnly === true && retainedWorkspace;
   const terminalRepairSource = ["failed", "interrupted", "timed_out", "cancelled"].includes(run?.status ?? "") ||
@@ -75,7 +94,7 @@ export async function validateExecutionReconciliation(input: {
     (input.workspaceRepairOnly && !retainedWorkspace) ||
     !run ||
     !task ||
-    (!repairOnly && (task.assigneeAgentId !== agentId || (run.agentId !== agentId && !isCurrentReviewer))) ||
+    (!repairOnly && (task.assigneeAgentId !== agentId || (run.agentId !== agentId && !isCurrentReviewer && !isReviewerHandBack))) ||
     (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== issueId ||
     !terminalRepairSource
   ) {
@@ -163,6 +182,7 @@ export async function validateExecutionReconciliation(input: {
     summary: null,
     exposeLowTrustRaw: false,
   });
+  if (isReviewerHandBack && input.admission) input.admission.continuationAgentId = agentId!;
   return run;
 }
 
@@ -176,7 +196,7 @@ export async function markExecutionReconciliation(
   decision: ExecutionReconciliation,
   actorId: string,
   deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
-  options?: { workspaceRepairOnly?: boolean },
+  options?: { workspaceRepairOnly?: boolean; continuationAgentId?: string },
 ) {
   if (options?.workspaceRepairOnly && (deliveryOwner || !hasRequiredWorkspaceRecovery(action.evidence))) {
     throw conflict("Workspace repair must target the retained source without a continuation owner.");
@@ -231,6 +251,7 @@ export async function markExecutionReconciliation(
           },
           continuationDelivery: options?.workspaceRepairOnly ? "not_requested" : deliveryOwner ? "delegated" : "pending",
           ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
+          ...(options?.continuationAgentId ? { continuationAgentId: options.continuationAgentId } : {}),
         },
       })
       .where(
@@ -260,7 +281,10 @@ export async function deliverReconciledExecutions(
     try {
       const decision = action.evidence.executionReconciliation as
         ExecutionReconciliation | undefined;
-      if (!decision || !action.returnOwnerAgentId) continue;
+      const recordedContinuationAgentId = action.evidence.continuationAgentId;
+      const continuationAgentId = typeof recordedContinuationAgentId === "string"
+        ? recordedContinuationAgentId : action.returnOwnerAgentId;
+      if (!decision || !continuationAgentId) continue;
       const pendingDecision = and(
         eq(issueRecoveryActions.companyId, action.companyId),
         eq(issueRecoveryActions.id, action.id),
@@ -279,7 +303,7 @@ export async function deliverReconciledExecutions(
         );
       if (
         !task ||
-        task.assigneeAgentId !== action.returnOwnerAgentId ||
+        task.assigneeAgentId !== continuationAgentId ||
         ["done", "cancelled"].includes(task.status)
       ) {
         await db
@@ -290,7 +314,7 @@ export async function deliverReconciledExecutions(
           .where(pendingDecision);
         continue;
       }
-      const run = await wake(action.returnOwnerAgentId, {
+      const run = await wake(continuationAgentId, {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_recovery_action_restored",
@@ -318,7 +342,7 @@ export async function deliverReconciledExecutions(
               and(
                 eq(heartbeatRuns.companyId, action.companyId),
                 eq(heartbeatRuns.id, run.id),
-                eq(heartbeatRuns.agentId, action.returnOwnerAgentId!),
+                eq(heartbeatRuns.agentId, continuationAgentId),
                 sql`${heartbeatRuns.contextSnapshot}->>'recoveryActionId' = ${action.id}`,
                 sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' = ${decision.runId}`,
               ),
