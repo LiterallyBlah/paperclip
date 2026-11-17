@@ -1165,6 +1165,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // existing execution hold leaves its saved wakes to that hold.
           await releaseIssueExecutionAndPromote(run, {
             suppressImmediateRecovery: true, deferredPostCommitEffects,
+          }).catch((err) => {
+            logger.warn({ err, runId: run.id, issueId }, "claimQueuedRun: new owner's wake will be promoted by recovery");
           });
         }
         logger.info(
