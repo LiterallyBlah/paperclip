@@ -1229,10 +1229,8 @@ export function recoveryService(
     if (newlyCompletedBlocker.length > 0) return false;
     const newlyFinalizedBlocker = await db.select({ id: workspaceOperations.id }).from(workspaceOperations)
       .innerJoin(issues, and(eq(issues.companyId, companyId), inArray(issues.id, blockerIssueIds),
-        eq(workspaceOperations.issueId, issues.id),
-        or(eq(issues.executionWorkspaceId, workspaceOperations.executionWorkspaceId),
-          and(isNull(workspaceOperations.executionWorkspaceId),
-            sql`${workspaceOperations.metadata}->>'owningService' = 'workspace_recovery'`))))
+        eq(issues.executionWorkspaceId, workspaceOperations.executionWorkspaceId),
+        eq(workspaceOperations.issueId, issues.id)))
       .where(and(eq(workspaceOperations.companyId, companyId), eq(workspaceOperations.phase, "workspace_finalize"),
         eq(workspaceOperations.status, "succeeded"), gt(workspaceOperations.finishedAt, blockedTransitionAt)))
       .limit(1);
