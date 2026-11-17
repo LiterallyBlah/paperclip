@@ -9,7 +9,7 @@ import { claimedAdapterType, hasConversationContinuationPolicy } from "./convers
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { activityLog, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
@@ -75,12 +75,50 @@ export function legacyExecutionNeedsReconciliation(
   );
 }
 
+export const HERMES_GATEWAY_RUN_FAILED_CODE = "hermes_gateway_run_failed";
+
+/** A Hermes gateway run that ended `failed` because the gateway's upstream
+ * request was answered with HTTP 400. Observed as transient: the same task
+ * succeeds on a later run. Only this class is retried automatically. */
+export function isHermesGatewayTransientBadRequest(
+  run: Pick<Run, "errorCode"> & Partial<Pick<Run, "error">>,
+): boolean {
+  return run.errorCode === HERMES_GATEWAY_RUN_FAILED_CODE &&
+    typeof run.error === "string" && /\bHTTP 400\b/.test(run.error);
+}
+
+/** Activity under the run's agent that a fresh attempt repeats without a
+ * second effect: the run's own environment lease and repeatable reads. */
+const GATEWAY_RETRY_REPEATABLE_ACTIONS = [
+  "environment.lease_acquired", "environment.lease_released",
+  "tool_gateway.discovery", "issue.checked_out", "issue.read_marked",
+];
+
+/** The transient gateway failure is safe to start again only when Paperclip
+ * holds no record that the failed attempt changed anything: no comment by the
+ * run and no agent activity other than repeatable reads. Any recorded effect,
+ * or a workspace that still needs restoring, keeps today's reconciliation. */
+async function isEffectFreeGatewayTransientFailure(db: Db, run: Run): Promise<boolean> {
+  if (run.runtimeMode === "native" || run.status !== "failed" || !isHermesGatewayTransientBadRequest(run)) return false;
+  if (run.resultJson?.workspaceRestoreFailure || hasRequiredWorkspaceRecovery(run.resultJson)) return false;
+  const [comment] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, run.companyId),
+    or(eq(issueComments.createdByRunId, run.id), eq(issueComments.derivedCreatedByRunId, run.id)))).limit(1);
+  if (comment) return false;
+  const [effect] = await db.select({ id: activityLog.id }).from(activityLog).where(and(
+    eq(activityLog.companyId, run.companyId), eq(activityLog.runId, run.id), eq(activityLog.actorType, "agent"),
+    sql`${activityLog.action} not in (${sql.join(GATEWAY_RETRY_REPEATABLE_ACTIONS.map(action => sql`${action}`), sql`, `)})`,
+  )).limit(1);
+  return !effect;
+}
+
 /** Admission-wait receipts are only exempt after retained execution evidence agrees.
  * The synchronous classifier stays conservative for callers without a DB proof. */
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
   return await hasUnrestoredRemoteWorkspace(db, run) ||
     (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
-      && !(await isPreDispatchExecutionWaitVerified(db, run)));
+      && !(await isPreDispatchExecutionWaitVerified(db, run))
+      && !(await isEffectFreeGatewayTransientFailure(db, run)));
 }
 
 /** Persist the failed legacy run, owned lock release and operator decision together. */
