@@ -3292,6 +3292,34 @@ describe("issue thread interaction routes", () => {
     });
   }
 
+  it("keeps refusing a run-less task bridge key resolution on its own bridge-created issue (BLA-1757)", async () => {
+    const bridgeKeyId = "99999999-9999-4999-8999-999999999999";
+    stubCrossIssueResolution({
+      kind: "request_confirmation",
+      payload: { version: 1, prompt: "Proceed?" },
+    });
+    mockIssueService.getById.mockReset().mockResolvedValue(createIssue({
+      status: "todo",
+      originKind: "task_bridge",
+      originId: bridgeKeyId,
+    }));
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      source: "agent_key",
+      keyId: bridgeKeyId,
+      keyScope: { kind: "task_bridge", parentIssueId: OTHER_ISSUE_ID },
+    });
+
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-cross-request_confirmation/accept`)
+      .send({});
+
+    expect(res.status).not.toBe(200);
+    expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
+  });
+
   it.each(CROSS_ISSUE_RESOLUTION_ROUTES)(
     "charges one shared cross-issue observation for an allowed $route",
     async ({ route, kind, body, payload, service }) => {
