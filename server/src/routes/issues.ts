@@ -3792,10 +3792,32 @@ export function issueRoutes(
   async function assertCrossIssueInfluenceWithinRunCap(
     req: Request,
     res: Response,
-    issue: { id: string; identifier?: string | null; companyId: string },
+    issue: {
+      id: string;
+      identifier?: string | null;
+      companyId: string;
+      originKind?: string | null;
+      originId?: string | null;
+    },
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
+    // A run-less task_bridge key (for example an external alert service) may
+    // comment on the one issue that the same key created. Access to that issue
+    // was already decided by decideTaskBridgeAccess; the comment is not a
+    // cross-issue influence, so there is no run budget to charge. Every other
+    // run-less agent write, and any run-less bridge write to another issue,
+    // keeps the run-context refusal below.
+    if (
+      kind === "comment" &&
+      !req.actor.runId &&
+      isTaskBridgeKeyActor(req) &&
+      typeof req.actor.keyId === "string" &&
+      req.actor.keyId.length > 0 &&
+      issue.originKind === "task_bridge" &&
+      issue.originId === req.actor.keyId
+    )
+      return true;
     if (!req.actor.agentId || !req.actor.runId)
       throw crossIssueInfluenceRunContextError();
 
