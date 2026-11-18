@@ -4252,6 +4252,18 @@ export function agentRoutes(
     res.json(await agentIdentityService(db).getPublicIdentity(agent.companyId, agent.id));
   });
 
+  // Board-only: agent bearer tokens, including the agent's own, are refused.
+  router.post("/agents/:id/identity/rotate", async (req, res) => {
+    assertBoard(req);
+    const agent = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
+    if (!agent) return;
+    await assertBoardCanManageAgentsForCompany(req, agent.companyId);
+    const actor = getActorInfo(req);
+    res.json(await agentIdentityService(db).rotateAgentIdentity(agent.companyId, agent.id, {
+      actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId, runId: actor.runId,
+    }));
+  });
+
   router.get("/agents/:id", async (req, res) => {
     const id = req.params.id as string;
     const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");

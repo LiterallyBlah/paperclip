@@ -2373,6 +2373,20 @@ describe("effective run session config freshness", () => {
     expect(unmanagedFirst.fingerprint).not.toBe(unmanagedNext.fingerprint);
   });
 
+  it("replaces a warm session before its next turn when the agent identity key changes", async () => {
+    const before = await buildSessionConfigMetadata({ agentIdentityKeyId: "sha256:synthetic-before" });
+    const same = await buildSessionConfigMetadata({ agentIdentityKeyId: "sha256:synthetic-before" });
+    const rotated = await buildSessionConfigMetadata({ agentIdentityKeyId: "sha256:synthetic-after" });
+    expect(resolveTaskSessionConfigFreshness({
+      hasTaskSession: true, configuredModel: "gpt-5.4-mini",
+      taskSessionParams: sessionParamsWithConfigMetadata(before), configMetadata: same,
+    }).reset).toBe(false);
+    expect(resolveTaskSessionConfigFreshness({
+      hasTaskSession: true, configuredModel: "gpt-5.4-mini",
+      taskSessionParams: sessionParamsWithConfigMetadata(before), configMetadata: rotated,
+    })).toMatchObject({ reset: true, changedCategories: ["adapter"] });
+  });
+
   it("resets when effective adapter config changes after model/profile/env resolution", async () => {
     const base = await buildSessionConfigMetadata();
     const next = await buildSessionConfigMetadata({

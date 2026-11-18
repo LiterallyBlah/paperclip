@@ -3757,6 +3757,26 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/agents/{id}/identity/rotate",
+  tags: ["agents"],
+  summary: "Replace an agent's existing signing identity with a new Ed25519 pair (board only); returns the new public identity",
+  description: "Requires a board actor with agent-management access. Agent tokens are refused. Never provisions a missing identity (404). Running processes keep the previous key until they end; new runs receive the new key.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(z.object({
+      algorithm: z.literal("Ed25519"),
+      keyId: z.string(),
+      publicKeyPem: z.string(),
+      createdAt: z.string().datetime(),
+    })),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
   method: "patch",
   path: "/api/agents/{id}",
   tags: ["agents"],

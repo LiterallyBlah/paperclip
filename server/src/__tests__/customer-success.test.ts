@@ -108,6 +108,11 @@ describe("customer-success read authority", () => {
       runId,
       keyId: key.keyId,
     });
+    // A rotation while this run is still active: authority reports the
+    // agent's current (new) key id for the same run.
+    const rotated = await agentIdentityService(db).rotateAgentIdentity(companyId, agentId, { actorType: "user", actorId: "board" });
+    expect(rotated.keyId).not.toBe(key.keyId);
+    expect(await customerSuccessRunAuthority(db, bearer)).toMatchObject({ runId, active: true, keyId: rotated.keyId });
     await expect(customerSuccessRunAuthority(db, "ordinary-api-key")).rejects.toThrow(
       "managed-run",
     );
