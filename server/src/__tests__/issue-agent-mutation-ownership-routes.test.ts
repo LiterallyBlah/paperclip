@@ -835,6 +835,98 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.list).not.toHaveBeenCalled();
   });
 
+  describe("run-less task bridge key comments (BLA-1757)", () => {
+    const bridgeKeyId = "99999999-9999-4999-8999-999999999999";
+    const otherBridgeKeyId = "88888888-8888-4888-8888-888888888888";
+
+    function runLessBridgeActor() {
+      return peerActor({
+        runId: undefined,
+        keyId: bridgeKeyId,
+        keyScope: { kind: "task_bridge", parentIssueId: "77777777-7777-4777-8777-777777777777" },
+      });
+    }
+
+    it("lets a run-less bridge key comment on the issue the same key created", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "todo",
+        assigneeAgentId: null,
+        originKind: "task_bridge",
+        originId: bridgeKeyId,
+      }));
+
+      const res = await request(await createApp(runLessBridgeActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Alert delivered." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockObserveCrossIssueInfluence).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        issueId,
+        "Alert delivered.",
+        expect.any(Object),
+        expect.any(Object),
+        expect.any(Object),
+      );
+    });
+
+    it.each([
+      ["another bridge key", { originKind: "task_bridge", originId: otherBridgeKeyId }],
+      ["no bridge origin", { originKind: "manual", originId: bridgeKeyId }],
+      ["no origin at all", {}],
+    ] as const)(
+      "keeps the run-context refusal for a run-less bridge key comment on an issue from %s",
+      async (_label, origin) => {
+        mockIssueService.getById.mockResolvedValue(makeIssue({
+          status: "todo",
+          assigneeAgentId: null,
+          ...origin,
+        }));
+
+        const res = await request(await createApp(runLessBridgeActor()))
+          .post(`/api/issues/${issueId}/comments`)
+          .send({ body: "Alert delivered." });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body.details).toEqual({ code: "cross_issue_influence_run_context_required" });
+        expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      },
+    );
+
+    it("keeps the run-context refusal for a run-less ordinary agent key comment", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "todo",
+        assigneeAgentId: null,
+        originKind: "task_bridge",
+        originId: bridgeKeyId,
+      }));
+
+      const res = await request(await createApp(peerActor({ runId: undefined, keyId: bridgeKeyId })))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Not a bridge key." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toEqual({ code: "cross_issue_influence_run_context_required" });
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("leaves a run-less bridge key update on its own issue refused", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "todo",
+        assigneeAgentId: null,
+        originKind: "task_bridge",
+        originId: bridgeKeyId,
+      }));
+
+      const res = await request(await createApp(runLessBridgeActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Renamed by the bridge" });
+
+      expect([401, 403]).toContain(res.status);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
   it("uses the company-scope fast path on the issue list route", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
       if (input.action === "company_scope:read") {
