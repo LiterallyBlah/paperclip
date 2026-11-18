@@ -45,6 +45,7 @@ type Db = ReturnType<typeof createDb>;
 
 const PRIVATE_TITLE = "Synthetic restricted item";
 const OPEN_TITLE = "Synthetic open item";
+const CARD_OWNER = "synthetic-owner";
 const NON_MEMBER = "synthetic-non-member";
 const MEMBER = "synthetic-member";
 
@@ -132,18 +133,27 @@ describeEmbeddedPostgres("status card viewer scope", () => {
         status: "active",
       });
     }
+    // The card creator is the generation tasks' responsible user (BLA-1487 B1).
+    // It is an active owner who can read every fixture issue, so these tests
+    // isolate the Summarizer's own scope; status-cards-privacy-residuals covers
+    // the narrowing by the responsible user.
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: CARD_OWNER,
+      membershipRole: "owner",
+      status: "active",
+    });
     const privateProject = await db.insert(projects).values({
       companyId: company.id,
       name: "Synthetic private project",
       visibility: "private",
       status: "in_progress",
     }).returning().then((rows) => rows[0]!);
-    await db.insert(projectAccessMembers).values({
-      companyId: company.id,
-      projectId: privateProject.id,
-      subjectType: "user",
-      subjectId: MEMBER,
-    });
+    await db.insert(projectAccessMembers).values([
+      { companyId: company.id, projectId: privateProject.id, subjectType: "user", subjectId: MEMBER },
+      { companyId: company.id, projectId: privateProject.id, subjectType: "user", subjectId: CARD_OWNER },
+    ]);
     if (options.summarizerIsProjectMember) {
       await db.insert(projectAccessMembers).values({
         companyId: company.id,
@@ -391,14 +401,43 @@ describeEmbeddedPostgres("status card viewer scope", () => {
     expectNoPrivate(ledger[0]!.changes, privateIssue);
   });
 
+  /** Link the seeded summary to an earlier generation task acting for `userId`. */
+  async function linkLastSummaryTo(fixture: Awaited<ReturnType<typeof seedFixture>>, cardId: string, userId: string | null) {
+    const prior = await db.insert(issues).values({
+      companyId: fixture.company.id,
+      title: "Synthetic earlier generation task",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: fixture.summarizer.id,
+      responsibleUserId: userId,
+    }).returning().then((rows) => rows[0]!);
+    await db.update(statusCardUpdates).set({ generationIssueId: prior.id }).where(eq(statusCardUpdates.cardId, cardId));
+  }
+
   it("keeps the previous summary in generation when the summarizer can read every stored issue", async () => {
     const fixture = await seedFixture({ summarizerIsProjectMember: true });
     const card = await seedCard(fixture);
+    await linkLastSummaryTo(fixture, card.id, CARD_OWNER);
     await db.update(statusCards).set({ refreshPolicy: defaultStatusCardRefreshPolicy }).where(eq(statusCards.id, card.id));
     const refresh = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
     const generationIssue = await db.select().from(issues)
       .where(eq(issues.id, refresh.generatingIssue!.id)).then((rows) => rows[0]!);
+    expect(generationIssue.responsibleUserId).toBe(CARD_OWNER);
     expect(generationIssue.description).toContain(`Status: ${OPEN_TITLE}`);
+  });
+
+  it("withholds the previous summary when it was written for a different (or unknown) user", async () => {
+    for (const writtenFor of [NON_MEMBER, null]) {
+      const fixture = await seedFixture({ summarizerIsProjectMember: true });
+      const card = await seedCard(fixture);
+      await linkLastSummaryTo(fixture, card.id, writtenFor);
+      await db.update(statusCards).set({ refreshPolicy: defaultStatusCardRefreshPolicy }).where(eq(statusCards.id, card.id));
+      const refresh = await statusCardService(db).requestRefresh(card.id, { trigger: "manual" });
+      const generationIssue = await db.select().from(issues)
+        .where(eq(issues.id, refresh.generatingIssue!.id)).then((rows) => rows[0]!);
+      expect(generationIssue.responsibleUserId).toBe(CARD_OWNER);
+      expect(generationIssue.description).not.toContain(`Status: ${OPEN_TITLE}`);
+    }
   });
 
   it("keeps private-project issues in generation when the summarizer is a project member", async () => {

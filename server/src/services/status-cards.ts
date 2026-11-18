@@ -5,6 +5,7 @@ import { and, desc, eq, gt, gte, inArray, isNotNull, isNull, lte, ne, or, sql, t
 import {
   agents,
   companies,
+  companyMemberships,
   costEvents,
   documentRevisions,
   documents,
@@ -494,8 +495,66 @@ export function statusCardService(
    * must pass this condition so the Summarizer never receives an issue it
    * could not read itself.
    */
-  async function summarizerReadOptions(companyId: string, agentId: string, queryDb: Db = db): Promise<StatusCardReadOptions> {
-    return { issueReadCondition: await issueReadSqlCondition(queryDb, { type: "agent", agentId, companyId }) };
+  async function summarizerReadOptions(
+    companyId: string, agentId: string, onBehalfOfUserId: string, queryDb: Db = db,
+  ): Promise<StatusCardReadOptions> {
+    // The run that works a generation task carries an on-behalf user (agent_jwt
+    // `onBehalfOfUserId`), and the authorization layer intersects the agent's
+    // read with that user's. The payload must be built in the same scope.
+    return {
+      issueReadCondition: await issueReadSqlCondition(queryDb, { type: "agent", agentId, companyId, onBehalfOfUserId }),
+    };
+  }
+
+  async function isActiveCompanyUser(companyId: string, userId: string) {
+    return db
+      .select({ id: companyMemberships.id })
+      .from(companyMemberships)
+      .where(and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, userId),
+        eq(companyMemberships.status, "active"),
+      ))
+      .limit(1)
+      .then((rows) => rows.length > 0);
+  }
+
+  /**
+   * B1 (BLA-1487): the one user a card's generation runs act for. It becomes
+   * the generation task's `responsibleUserId`, so the Summarizer's run resolves
+   * to it (heartbeat run preparation reads the task's responsible user), and
+   * that user is the task's only implicit private reader. The payload is built
+   * in the Summarizer-on-behalf-of-this-user scope, so the user sees only issues
+   * they can already read. Order: the card's creator, then the company default
+   * responsible user, then the oldest active owner, each only while it is an
+   * active member (an inactive user would make the intersected read false).
+   */
+  async function resolveGenerationUserId(card: StatusCardRow): Promise<string> {
+    const company = await db
+      .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
+      .from(companies)
+      .where(eq(companies.id, card.companyId))
+      .then((rows) => rows[0] ?? null);
+    const owner = await db
+      .select({ userId: companyMemberships.principalId })
+      .from(companyMemberships)
+      .where(and(
+        eq(companyMemberships.companyId, card.companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.status, "active"),
+        eq(companyMemberships.membershipRole, "owner"),
+      ))
+      .orderBy(companyMemberships.createdAt, companyMemberships.id)
+      .limit(1)
+      .then((rows) => rows[0]?.userId ?? null);
+    const candidates = [card.createdByUserId, company?.defaultResponsibleUserId?.trim() || null, owner];
+    for (const userId of candidates) {
+      if (userId && await isActiveCompanyUser(card.companyId, userId)) return userId;
+    }
+    throw unprocessable("Status card has no active responsible user for generation", {
+      code: "status_card_responsible_user_unresolved",
+    });
   }
 
   /**
@@ -538,6 +597,7 @@ export function statusCardService(
     input: {
       title: string;
       assigneeAgentId: string;
+      responsibleUserId: string;
       createdByAgentId: string | null;
       hiddenAt: Date;
       idempotencyKey: string;
@@ -553,6 +613,8 @@ export function statusCardService(
       assigneeAgentId: input.assigneeAgentId,
       createdByAgentId: input.createdByAgentId,
       createdByUserId: null,
+      responsibleUserId: input.responsibleUserId,
+      trustExplicitResponsibleUserId: true,
       hiddenAt: input.hiddenAt,
       idempotencyKey: input.idempotencyKey,
       onDeduplicated: (reason) => {
@@ -566,6 +628,7 @@ export function statusCardService(
       finalize: async (description: string) => {
         const updated = await issuesSvc().update(created.id, {
           ...(reopen ? { status: "todo", assigneeAgentId: input.assigneeAgentId } : {}),
+          responsibleUserId: input.responsibleUserId,
           visibility: "private",
           description,
         });
@@ -580,6 +643,7 @@ export function statusCardService(
     if (!card) throw notFound("Status card not found");
     if (card.archivedAt) throw unprocessable("Archived status cards cannot be compiled");
     const summarizerAgentId = await resolveSummarizerAgentId(card);
+    const responsibleUserId = await resolveGenerationUserId(card);
 
     const hash = promptHash(card.interestPrompt);
     if (card.generatingIssueId) {
@@ -603,6 +667,7 @@ export function statusCardService(
     const { created, deduplicated, finalize } = await createGenerationIssue(card, {
       title: `Compile status card: ${card.title ?? card.interestPrompt.slice(0, 80)}`,
       assigneeAgentId: summarizerAgentId,
+      responsibleUserId,
       createdByAgentId: actor.agentId,
       hiddenAt: createdAt,
       idempotencyKey: `status-card-compile:private:${card.id}:${hash}`,
@@ -887,7 +952,15 @@ export function statusCardService(
       (agentId) => ({ agentId, error: null }),
       (error: unknown) => ({ agentId: null, error }),
     );
-    const summarizerScope = summarizer.agentId ? await summarizerReadOptions(card.companyId, summarizer.agentId) : {};
+    // Without a resolvable generation user the Summarizer's run could read
+    // nothing; that error is likewise rethrown before any task is built.
+    const generationUser = await resolveGenerationUserId(card).then(
+      (userId) => ({ userId, error: null }),
+      (error: unknown) => ({ userId: null, error }),
+    );
+    const summarizerScope = summarizer.agentId && generationUser.userId
+      ? await summarizerReadOptions(card.companyId, summarizer.agentId, generationUser.userId)
+      : {};
     let membershipAt: Date | null = null;
     const snapshot = await executeQueries(
       card,
@@ -972,14 +1045,28 @@ export function statusCardService(
       restoreRefresh: trigger === "restore",
     });
     if (!summarizer.agentId) throw summarizer.error;
+    if (!generationUser.userId) throw generationUser.error;
     const summarizerAgentId = summarizer.agentId;
-    const previousSummary = card.documentId && !storedRefsRedacted
+    const responsibleUserId = generationUser.userId;
+    // The previous summary is free text, so the stored-refs check above cannot
+    // bound it alone: pass it on only when the last summary was written by a
+    // generation run acting for this same user. Otherwise (including every
+    // summary written before generation tasks carried a responsible user) it
+    // could describe issues this task's responsible user cannot read.
+    const lastSummaryWrite = history.find((row) => row.kind !== "compile" && row.status === "ok" && row.generationIssueId);
+    const lastSummaryUserId = lastSummaryWrite?.generationIssueId
+      ? await db.select({ responsibleUserId: issues.responsibleUserId }).from(issues)
+        .where(and(eq(issues.id, lastSummaryWrite.generationIssueId), eq(issues.companyId, card.companyId)))
+        .then((rows) => rows[0]?.responsibleUserId ?? null)
+      : null;
+    const previousSummary = card.documentId && !storedRefsRedacted && lastSummaryUserId === responsibleUserId
       ? await db.select().from(documents).where(eq(documents.id, card.documentId)).then((rows) => rows[0]?.latestBody ?? null)
       : null;
     const fingerprintHash = statusCardFingerprintHash(fingerprint);
     const { created, deduplicated, finalize } = await createGenerationIssue(card, {
       title: `${kind === "full" ? "Rebuild" : "Update"} status card: ${card.title ?? card.interestPrompt.slice(0, 80)}`,
       assigneeAgentId: summarizerAgentId,
+      responsibleUserId,
       createdByAgentId: input.actor?.agentId ?? null,
       hiddenAt: now,
       // Claim ownership is revision-scoped too. A superseded refresh may cancel
@@ -1126,7 +1213,11 @@ export function statusCardService(
         : null;
       // assertSummarizerWriter pinned the writer to the card's summarizer, so
       // its read scope bounds both the mentions and the watched membership.
-      const writerScope = await summarizerReadOptions(current.companyId, actor.agentId!, tx as unknown as Db);
+      // The run acts for the generation task's responsible user, so the
+      // writer's scope is the same Summarizer-on-behalf-of-that-user read.
+      const writerScope = generationIssue.responsibleUserId
+        ? await summarizerReadOptions(current.companyId, actor.agentId!, generationIssue.responsibleUserId, tx as unknown as Db)
+        : { issueReadCondition: sql<boolean>`false` };
       const mentionedIssueIds = await resolveMentionedIssueIds(current.companyId, input.markdown, writerScope);
       // Current watched membership: compiled-query matches plus the issues this
       // summary mentions.

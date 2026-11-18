@@ -2,10 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   activityLog,
   agents,
+  authUsers,
   companies,
   companyMemberships,
   costEvents,
@@ -40,8 +41,11 @@ import {
 // Synthetic fixtures only (BLA-1007 R1/R2/N2). A card covers one open issue and
 // one issue inside a private project. MEMBER is a member of that project,
 // NON_MEMBER is not; both are active company operators allowed to manage cards.
-// The Summarizer is a project member, so its generation tasks really do hold
-// the private title: R1 proves only the Summarizer can read them.
+// The Summarizer is a project member. Its runs act on behalf of the generation
+// task's responsible user U (the card's creator, else the company default
+// responsible user, else the owner), and the authorization layer intersects
+// the Summarizer's read with U's. So a task holds the private title only when
+// U can read it too, and R1 proves only the Summarizer and U read the task.
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -71,8 +75,39 @@ function boardActor(companyId: string, userId: string): Express.Request["actor"]
   };
 }
 
-function agentActor(companyId: string, agentId: string, runId: string | null): Express.Request["actor"] {
-  return { type: "agent", companyId, agentId, runId, source: "agent_jwt" };
+/** A Summarizer request as agent_jwt really sends it (middleware/auth.ts):
+ * the run's responsible user as `onBehalfOfUserId`, with that user's active
+ * memberships (empty when the user does not exist). */
+async function agentActor(
+  db: Db,
+  companyId: string,
+  agentId: string,
+  runId: string | null,
+  onBehalfOfUserId: string,
+): Promise<Express.Request["actor"]> {
+  const user = await db.select({ id: authUsers.id }).from(authUsers)
+    .where(eq(authUsers.id, onBehalfOfUserId)).then((rows) => rows[0] ?? null);
+  const memberships = user
+    ? await db.select({
+      companyId: companyMemberships.companyId,
+      membershipRole: companyMemberships.membershipRole,
+      status: companyMemberships.status,
+    }).from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, companyId),
+      eq(companyMemberships.principalType, "user"),
+      eq(companyMemberships.principalId, onBehalfOfUserId),
+      eq(companyMemberships.status, "active"),
+    ))
+    : [];
+  return {
+    type: "agent",
+    companyId,
+    agentId,
+    runId,
+    source: "agent_jwt",
+    onBehalfOfUserId,
+    onBehalfOfMemberships: memberships,
+  } as Express.Request["actor"];
 }
 
 type WakeCall = Parameters<IssueAssignmentWakeupDeps["wakeup"]>;
@@ -124,6 +159,7 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companies);
+    await db.delete(authUsers);
   });
 
   afterAll(async () => {
@@ -146,6 +182,13 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
       metadata: withBuiltInAgentMarker(null, { key: "summarizer", featureKeys: ["summarizer"] }),
     }).returning().then((rows) => rows[0]!);
     for (const principalId of [NON_MEMBER, MEMBER]) {
+      await db.insert(authUsers).values({
+        id: principalId,
+        name: principalId,
+        email: `${principalId}-${randomUUID()}@example.test`,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }).onConflictDoNothing();
       await db.insert(companyMemberships).values({
         companyId: company.id,
         principalType: "user",
@@ -218,7 +261,8 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
     });
     const card = await db.insert(statusCards).values({
       companyId: company.id,
-      createdByUserId: "synthetic-owner",
+      // Cards are created by an active operator; MEMBER by default.
+      createdByUserId: MEMBER,
       interestPrompt: "Synthetic scope prompt",
       documentId: document.id,
       queries: [VALID_QUERY],
@@ -253,17 +297,31 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
     expect(json).not.toContain(PRIVATE_TITLE);
   }
 
+  /** The user the Summarizer's run acts for: the task's responsible user,
+   * which is what heartbeat run preparation resolves for this task. */
+  async function generationRunUser(generationIssueId: string) {
+    const row = await db.select({ responsibleUserId: issues.responsibleUserId })
+      .from(issues).where(eq(issues.id, generationIssueId)).then((rows) => rows[0]!);
+    expect(row.responsibleUserId).toBeTruthy();
+    return row.responsibleUserId!;
+  }
+
   async function startSummarizerRun(fixture: Fixture, generationIssueId: string) {
+    const responsibleUserId = await generationRunUser(generationIssueId);
     const run = await db.insert(heartbeatRuns)
-      .values({ companyId: fixture.company.id, agentId: fixture.summarizer.id, status: "running" })
+      .values({ companyId: fixture.company.id, agentId: fixture.summarizer.id, status: "running", responsibleUserId })
       .returning().then((rows) => rows[0]!);
     await db.update(issues).set({ checkoutRunId: run.id }).where(eq(issues.id, generationIssueId));
-    return createApp(db, agentActor(fixture.company.id, fixture.summarizer.id, run.id));
+    return createApp(db, await agentActor(db, fixture.company.id, fixture.summarizer.id, run.id, responsibleUserId));
+  }
+
+  async function summarizerReadApp(fixture: Fixture, generationIssueId: string) {
+    return createApp(db, await agentActor(db, fixture.company.id, fixture.summarizer.id, null, await generationRunUser(generationIssueId)));
   }
 
   // ---------------------------------------------------------------- R1
 
-  it("R1: a manual refresh creates a generation task only the Summarizer can read, and the response omits its payload", async () => {
+  it("R1: a manual refresh creates a generation task only the Summarizer and its responsible user can read, and the response omits its payload", async () => {
     const fixture = await seedFixture();
     const { privateIssue, summarizer } = fixture;
     const card = await seedCard(fixture);
@@ -279,26 +337,85 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
 
     const generationIssueId = refreshed.body.generatingIssue.id as string;
     const row = await db.select().from(issues).where(eq(issues.id, generationIssueId)).then((rows) => rows[0]!);
-    // The task really carries Summarizer-scoped private data...
+    // The task really carries private data (the card's creator MEMBER can read
+    // the private issue, and so can the Summarizer)...
     expect(row.description).toContain(PRIVATE_TITLE);
-    // ...so it is private, has no creating user (an implicit reader), and is
-    // assigned to the Summarizer.
-    expect(row).toMatchObject({ visibility: "private", createdByUserId: null, assigneeAgentId: summarizer.id });
+    // ...so it is private, has no creating user, its one implicit user reader
+    // is the card's creator (the run's on-behalf user), and it is assigned to
+    // the Summarizer. The refreshing NON_MEMBER gains nothing.
+    expect(row).toMatchObject({
+      visibility: "private",
+      createdByUserId: null,
+      responsibleUserId: MEMBER,
+      assigneeAgentId: summarizer.id,
+    });
 
     // The manual path still wakes the Summarizer for this task.
     expect(wakes).toHaveLength(1);
     expect(JSON.stringify(wakes[0])).toContain(generationIssueId);
 
-    // Direct read by id: the non-member and the project member are refused;
-    // only the Summarizer reads it.
-    for (const app of [fixture.apps.nonMember, fixture.apps.member]) {
-      const denied = await readIssue(app, generationIssueId);
-      expect([403, 404]).toContain(denied.status);
-      expect(JSON.stringify(denied.body)).not.toContain(PRIVATE_TITLE);
-    }
-    const summarizerRead = await readIssue(createApp(db, agentActor(fixture.company.id, summarizer.id, null)), generationIssueId);
+    // Direct read by id: the non-member is refused. The Summarizer, acting on
+    // behalf of the task's responsible user as its real run does (B1), reads it.
+    const denied = await readIssue(fixture.apps.nonMember, generationIssueId);
+    expect([403, 404]).toContain(denied.status);
+    expect(JSON.stringify(denied.body)).not.toContain(PRIVATE_TITLE);
+    const summarizerRead = await readIssue(await summarizerReadApp(fixture, generationIssueId), generationIssueId);
     expect(summarizerRead.status).toBe(200);
     expect(summarizerRead.body.description).toContain(PRIVATE_TITLE);
+    // The Summarizer acting for a different user is refused (no wider set).
+    const otherUser = await readIssue(createApp(db, await agentActor(db, fixture.company.id, summarizer.id, null, NON_MEMBER)), generationIssueId);
+    expect([403, 404]).toContain(otherUser.status);
+  });
+
+  it("R1/B1: the payload is built in the Summarizer-on-behalf-of-U scope, so U sees only what U can already read", async () => {
+    const fixture = await seedFixture();
+    const { privateIssue, openIssue, summarizer, apps } = fixture;
+    // A card created by NON_MEMBER, who cannot read the private issue.
+    const card = await seedCard(fixture, { createdByUserId: NON_MEMBER });
+
+    const refreshed = await request(apps.member).post(`/api/status-cards/${card.id}/refresh`).send({ full: true });
+    expect(refreshed.status).toBe(202);
+    const generationIssueId = refreshed.body.generatingIssue.id as string;
+    const row = await db.select().from(issues).where(eq(issues.id, generationIssueId)).then((rows) => rows[0]!);
+    expect(row).toMatchObject({ visibility: "private", responsibleUserId: NON_MEMBER, assigneeAgentId: summarizer.id });
+    // The Summarizer alone could read the private issue, but the run acts for
+    // NON_MEMBER, so the payload holds only the open issue.
+    expect(row.description).toContain(OPEN_TITLE);
+    expect(row.description).toContain(openIssue.identifier!);
+    expect(row.description).not.toContain(PRIVATE_TITLE);
+    expect(row.description).not.toContain(privateIssue.id);
+    expect(row.description).not.toContain(privateIssue.identifier!);
+
+    // NON_MEMBER, the responsible user, reads the task but finds nothing new.
+    const asOwner = await readIssue(apps.nonMember, generationIssueId);
+    expect(asOwner.status).toBe(200);
+    expectNoPrivatePayload(asOwner.body, privateIssue);
+    // MEMBER (not the responsible user) is refused even though it can read the
+    // private issue; the Summarizer's run (for NON_MEMBER) reads the task.
+    expect([403, 404]).toContain((await readIssue(apps.member, generationIssueId)).status);
+    expect((await readIssue(await summarizerReadApp(fixture, generationIssueId), generationIssueId)).status).toBe(200);
+  });
+
+  it("R1/B1: with no card creator the company default responsible user is used, and with no active user nothing is created", async () => {
+    const fixture = await seedFixture();
+    const { company, privateIssue } = fixture;
+    await db.update(companies).set({ defaultResponsibleUserId: NON_MEMBER }).where(eq(companies.id, company.id));
+    const card = await seedCard(fixture, { createdByUserId: null });
+    const refreshed = await request(fixture.apps.member).post(`/api/status-cards/${card.id}/refresh`).send({ full: true });
+    expect(refreshed.status).toBe(202);
+    const row = await db.select().from(issues)
+      .where(eq(issues.id, refreshed.body.generatingIssue.id)).then((rows) => rows[0]!);
+    expect(row).toMatchObject({ visibility: "private", responsibleUserId: NON_MEMBER });
+    expect(row.description).not.toContain(PRIVATE_TITLE);
+    expect(row.description).not.toContain(privateIssue.identifier!);
+
+    // An inactive creator and an inactive default: no candidate, fail closed.
+    await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.companyId, company.id));
+    const orphan = await seedCard(fixture, { createdByUserId: MEMBER });
+    const issueCount = (await db.select({ id: issues.id }).from(issues)).length;
+    await expect(statusCardService(db).requestRefresh(orphan.id, { full: true }))
+      .rejects.toMatchObject({ status: 422 });
+    expect((await db.select({ id: issues.id }).from(issues)).length).toBe(issueCount);
   });
 
   it("R1: a member refresh response and the recompile response also omit the generation payload", async () => {
@@ -319,11 +436,15 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
       .toEqual(["assigneeAgentId", "id", "identifier", "status", "title"]);
     const compileRow = await db.select().from(issues)
       .where(eq(issues.id, recompiled.body.generatingIssue.id)).then((rows) => rows[0]!);
-    expect(compileRow).toMatchObject({ visibility: "private", createdByUserId: null, assigneeAgentId: fixture.summarizer.id });
+    expect(compileRow).toMatchObject({
+      visibility: "private",
+      createdByUserId: null,
+      responsibleUserId: MEMBER,
+      assigneeAgentId: fixture.summarizer.id,
+    });
     expect(compileRow.description).toContain("Synthetic scope prompt");
-    for (const app of [fixture.apps.nonMember, fixture.apps.member]) {
-      expect([403, 404]).toContain((await readIssue(app, compileRow.id)).status);
-    }
+    expect([403, 404]).toContain((await readIssue(fixture.apps.nonMember, compileRow.id)).status);
+    expect((await readIssue(await summarizerReadApp(fixture, compileRow.id), compileRow.id)).status).toBe(200);
   });
 
   it("R1: the scheduler path creates a private task and the index.ts wakeup still reaches the Summarizer", async () => {
@@ -337,7 +458,15 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
     expect(tick.enqueued).toHaveLength(1);
     const { cardId, generatingIssue } = tick.enqueued[0]!;
     expect(cardId).toBe(card.id);
-    expect(generatingIssue).toMatchObject({ visibility: "private", createdByUserId: null, assigneeAgentId: fixture.summarizer.id });
+    expect(generatingIssue).toMatchObject({
+      visibility: "private",
+      createdByUserId: null,
+      responsibleUserId: MEMBER,
+      assigneeAgentId: fixture.summarizer.id,
+    });
+    // The Summarizer's scheduler-woken run (system wake, so it resolves the
+    // task's responsible user) can read the task.
+    expect((await readIssue(await summarizerReadApp(fixture, generatingIssue.id), generatingIssue.id)).status).toBe(200);
 
     // The same call server/src/index.ts makes for each enqueued task.
     const wakes: WakeCall[] = [];
@@ -369,10 +498,17 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
     expect(created.status).toBe(201);
     const compileIssueId = created.body.generatingIssueId as string;
     const compileIssue = await db.select().from(issues).where(eq(issues.id, compileIssueId)).then((rows) => rows[0]!);
-    expect(compileIssue).toMatchObject({ visibility: "private", createdByUserId: null, assigneeAgentId: summarizer.id });
+    expect(compileIssue).toMatchObject({
+      visibility: "private",
+      createdByUserId: null,
+      responsibleUserId: MEMBER,
+      assigneeAgentId: summarizer.id,
+    });
 
-    // The Summarizer writes the query and the first summary from that task.
+    // The Summarizer (on behalf of MEMBER, as its run is) reads the task and
+    // writes the query and the first summary from it.
     const compileApp = await startSummarizerRun(fixture, compileIssueId);
+    expect((await readIssue(compileApp, compileIssueId)).status).toBe(200);
     const queryWrite = await request(compileApp).put(`/api/status-cards/${created.body.id}/query`).send({
       queries: [VALID_QUERY],
       title: "Synthetic launch",
@@ -445,11 +581,14 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
     const tick = await service.tickDueStatusCards(t2);
     expect(tick.enqueued).toHaveLength(1);
     const updateIssue = tick.enqueued[0]!.generatingIssue;
-    expect(updateIssue).toMatchObject({ visibility: "private", createdByUserId: null, assigneeAgentId: summarizer.id });
+    expect(updateIssue).toMatchObject({
+      visibility: "private",
+      createdByUserId: null,
+      responsibleUserId: MEMBER,
+      assigneeAgentId: summarizer.id,
+    });
     expect(updateIssue.description).toContain(PRIVATE_TITLE);
-    for (const app of [apps.nonMember, apps.member]) {
-      expect([403, 404]).toContain((await readIssue(app, updateIssue.id)).status);
-    }
+    expect([403, 404]).toContain((await readIssue(apps.nonMember, updateIssue.id)).status);
 
     // The Summarizer reads its task and writes the normal update.
     const updateApp = await startSummarizerRun(fixture, updateIssue.id);
