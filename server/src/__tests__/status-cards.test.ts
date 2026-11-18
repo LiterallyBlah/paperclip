@@ -104,11 +104,21 @@ describeEmbeddedPostgres("status card routes", () => {
   });
 
   async function seedCompany() {
-    return db
+    const company = await db
       .insert(companies)
       .values({ name: "Status Cards Co", issuePrefix: `SC${randomUUID().slice(0, 6).toUpperCase()}` })
       .returning()
       .then((rows) => rows[0]!);
+    // An active owner: generation tasks act for the card's creator (here
+    // board-user) or, failing that, the company's owner (BLA-1487 B1).
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: "board-user",
+      membershipRole: "owner",
+      status: "active",
+    });
+    return company;
   }
 
   async function enableStatusCards() {
