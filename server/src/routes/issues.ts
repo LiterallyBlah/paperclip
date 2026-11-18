@@ -5704,6 +5704,35 @@ export function issueRoutes(
     return true;
   }
 
+  /**
+   * A decision-triage delegate may only hand work to an active agent of the
+   * same company, never to a user or to nobody.
+   */
+  async function assertDecisionTriageAssignee(
+    companyId: string,
+    requestedAssigneeAgentId: string | null | undefined,
+    requestedAssigneeUserId: string | null | undefined,
+  ) {
+    if (!requestedAssigneeAgentId || requestedAssigneeUserId) {
+      throw unprocessable("A decision-triage delegate may assign only an active agent", {
+        code: "decision_triage_assignee_agent_required",
+      });
+    }
+    const target = await agentsSvc.getById(requestedAssigneeAgentId);
+    if (
+      !target ||
+      target.companyId !== companyId ||
+      target.status === "paused" ||
+      target.status === "terminated" ||
+      target.status === "pending_approval"
+    ) {
+      throw conflict("The requested assignee is not an active agent of this company", {
+        code: "decision_triage_assignee_unavailable",
+        assigneeAgentId: requestedAssigneeAgentId,
+      });
+    }
+  }
+
   function decisionTriageActivityDetails(req: Request): Record<string, unknown> {
     const use = decisionTriageUseByRequest.get(req);
     if (!use) return {};
@@ -7015,11 +7044,77 @@ export function issueRoutes(
     return false;
   }
 
+  /**
+   * BLA-1616 G3a. The delegate may assign an active agent and resume a fully
+   * unassigned blocked issue whose unblock descriptor names the board or a
+   * user, once no blocker is open (checked by the caller) and no human card
+   * (pending interaction or linked pending approval) waits on it.
+   */
+  async function admitDecisionTriageResume(
+    req: Request,
+    issue: Parameters<typeof decideIssueAccess>[1],
+    input: {
+      reason: string | null | undefined;
+      requestedAssigneeAgentId: string | null | undefined;
+      requestedAssigneeUserId: string | null | undefined;
+    },
+  ): Promise<boolean> {
+    const row = await svc.getById(issue.id);
+    if (!row || row.status !== "blocked" || row.assigneeAgentId || row.assigneeUserId) return false;
+    const owner = (row.unblockDescriptor as { owner?: unknown } | null)?.owner;
+    // A board-owned active recovery action is also a human-owned hold (G1:
+    // the delegate may hand the recovered work to an agent in one PATCH).
+    const humanOwned =
+      owner === "board" ||
+      (typeof owner === "object" && owner !== null && "userId" in owner) ||
+      (await recoveryActionsSvc.getActiveForIssue(row.companyId, row.id))?.ownerType === "board";
+    if (!humanOwned) return false;
+    if (!(await admitDecisionTriageDelegate(req, row.companyId, "G3a", input.reason))) return false;
+
+    const [pendingInteraction] = await db
+      .select({ id: issueThreadInteractions.id })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.companyId, row.companyId),
+        eq(issueThreadInteractions.issueId, row.id),
+        eq(issueThreadInteractions.status, "pending"),
+        activeIssueInteractionCondition(),
+      ))
+      .limit(1);
+    if (pendingInteraction) {
+      throw conflict("A pending question or confirmation waits on a human for this issue", {
+        code: "decision_triage_human_wait_pending",
+        issueId: row.id,
+      });
+    }
+    const approvals = await issueApprovalsSvc.listApprovalsForIssue(row.id);
+    if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) {
+      throw conflict("A linked approval is pending for this issue", {
+        code: "decision_triage_approval_pending",
+        issueId: row.id,
+      });
+    }
+    await assertDecisionTriageAssignee(row.companyId, input.requestedAssigneeAgentId, input.requestedAssigneeUserId);
+    return true;
+  }
+
   async function assertExplicitResumeIntentAllowed(
     req: Request,
     res: Response,
     issue: Parameters<typeof decideIssueAccess>[1],
-    options: { resumeIntent?: boolean } = {},
+    options: {
+      resumeIntent?: boolean;
+      /**
+       * BLA-1616 G3a: the PATCH's reason and requested assignee, offered so
+       * the decision-triage delegate may assign and resume an unassigned
+       * issue held by a human-owned block.
+       */
+      decisionTriage?: {
+        reason: string | null | undefined;
+        requestedAssigneeAgentId: string | null | undefined;
+        requestedAssigneeUserId: string | null | undefined;
+      };
+    } = {},
   ) {
     if (
       await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)
@@ -7088,6 +7183,12 @@ export function issueRoutes(
       return false;
     }
     if (!issue.assigneeAgentId) {
+      if (
+        options.decisionTriage &&
+        (await admitDecisionTriageResume(req, issue, options.decisionTriage))
+      ) {
+        return true;
+      }
       res.status(409).json({
         error: "Issue follow-up requires an assigned agent",
         details: { issueId: issue.id, actorAgentId },
@@ -7128,7 +7229,17 @@ export function issueRoutes(
     activeRecoveryAction: Awaited<
       ReturnType<typeof recoveryActionsSvc.getActiveForIssue>
     >,
-    input: { source: "issue_update" | "recovery_action_resolution" },
+    input: {
+      source: "issue_update" | "recovery_action_resolution";
+      /** Reason a decision-triage delegate gives for G1; null = not offered. */
+      decisionTriageReason?: string | null;
+      /**
+       * BLA-1616 G2: the request records an execution reconciliation for a
+       * cause that only the board could settle. The delegate may then resolve
+       * it even when the source has an assignee agent.
+       */
+      decisionTriageExecutionReconciliation?: boolean;
+    },
   ) {
     if (req.actor.type !== "agent") return true;
     if (!activeRecoveryAction) return true;
@@ -7138,6 +7249,22 @@ export function issueRoutes(
       throw forbidden("Agent authentication required");
     }
     if (issue.assigneeAgentId === actorAgentId) return true;
+    // BLA-1616 G1: with no assignee agent there is no agent owner to defer
+    // to, so the configured decision-triage delegate may resolve the item.
+    if (
+      !issue.assigneeAgentId &&
+      input.decisionTriageReason !== undefined &&
+      (await admitDecisionTriageDelegate(req, issue.companyId, "G1", input.decisionTriageReason))
+    ) {
+      return true;
+    }
+    if (
+      input.decisionTriageExecutionReconciliation &&
+      input.decisionTriageReason !== undefined &&
+      (await admitDecisionTriageDelegate(req, issue.companyId, "G2", input.decisionTriageReason))
+    ) {
+      return true;
+    }
     if (
       issue.assigneeAgentId &&
       (await hasActiveCheckoutManagementOverride(
@@ -7195,11 +7322,61 @@ export function issueRoutes(
       checkoutRunId?: string | null;
       executionRunId?: string | null;
       executionState?: unknown;
+      assigneeUserId?: string | null;
+    },
+    decisionTriage?: {
+      reason: string | null | undefined;
+      /**
+       * True when the mutation sets or clears the assignee. A delegate may
+       * then act only on a fully unassigned source and must have checked the
+       * requested assignee (see assertDecisionTriageAssignee).
+       */
+      changesAssignee: boolean;
+      /** True when the mutation moves the source to done or cancelled. */
+      closesSource: boolean;
+      requestedAssigneeAgentId?: string | null;
+      requestedAssigneeUserId?: string | null;
     },
   ) {
     if (req.actor.type !== "agent") return;
     const actorAgentId = req.actor.agentId;
     if (!actorAgentId) throw forbidden("Agent authentication required");
+
+    // BLA-1616 G1: no assignee agent to defer to. A user-assigned source may
+    // have its status moved, but never be reassigned away from the user.
+    if (
+      decisionTriage &&
+      !decisionTriage.closesSource &&
+      !issue.assigneeAgentId &&
+      !(decisionTriage.changesAssignee && issue.assigneeUserId) &&
+      (await admitDecisionTriageDelegate(req, issue.companyId, "G1", decisionTriage.reason))
+    ) {
+      if (decisionTriage.changesAssignee) {
+        await assertDecisionTriageAssignee(
+          issue.companyId,
+          decisionTriage.requestedAssigneeAgentId,
+          decisionTriage.requestedAssigneeUserId,
+        );
+      }
+      const actorRunId = req.actor.runId?.trim() || null;
+      const conflictingRunId = [issue.checkoutRunId, issue.executionRunId].find(
+        (runId) => runId && runId !== actorRunId,
+      );
+      if (conflictingRunId) {
+        throw conflict(
+          "Source issue mutation is locked by another active checkout or run",
+          {
+            code: "recovery_source_run_lock",
+            issueId: issue.id,
+            actorAgentId,
+            actorRunId,
+            checkoutRunId: issue.checkoutRunId ?? null,
+            executionRunId: issue.executionRunId ?? null,
+          },
+        );
+      }
+      return;
+    }
 
     const isSourceOwner = issue.assigneeAgentId === actorAgentId;
     const isExecutionParticipant =
@@ -9809,7 +9986,15 @@ export function issueRoutes(
         workspaceBaseRef,
       } = req.body;
       if (outcome === "false_positive" || outcome === "cancelled") {
-        assertBoard(req);
+        // BLA-1616 G2: the delegate may record these as recovery-action
+        // outcomes only. `cancelled` cancels the recovery item, never the
+        // issue; with `done` the outcome would close the work, so that stays
+        // with the board.
+        const delegateMayRecord =
+          req.actor.type === "agent" &&
+          sourceIssueStatus === "in_review" &&
+          (await admitDecisionTriageDelegate(req, existing.companyId, "G2", resolutionNote));
+        if (!delegateMayRecord) assertBoard(req);
       }
 
       if (workspaceBaseRef) {
@@ -9933,7 +10118,15 @@ export function issueRoutes(
           req,
           lockedIssue,
           activeRecoveryAction,
-          { source: "recovery_action_resolution" },
+          {
+            source: "recovery_action_resolution",
+            decisionTriageReason: resolutionNote ?? null,
+            decisionTriageExecutionReconciliation: Boolean(
+              executionReconciliation &&
+              sourceIssueStatus === "todo" &&
+              requiresExecutionReconciliation(activeRecoveryAction.cause),
+            ),
+          },
         );
 
         const workspaceRetry = outcome === "restored" && sourceIssueStatus === "todo"
@@ -10062,7 +10255,12 @@ export function issueRoutes(
           sourceIssueStatus === "todo" &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
-          assertBoard(req);
+          // BLA-1616 G2: the delegate is admitted with the same outcome set.
+          const delegateMayReconcile =
+            req.actor.type === "agent" &&
+            Boolean(executionReconciliation) &&
+            (await admitDecisionTriageDelegate(req, lockedIssue.companyId, "G2", resolutionNote));
+          if (!delegateMayReconcile) assertBoard(req);
           await validateExecutionReconciliation({
             db: tx as unknown as Db,
             companyId: lockedIssue.companyId,
@@ -10179,7 +10377,11 @@ export function issueRoutes(
               recoveryAction: activeRecoveryAction,
             });
           } else {
-            await requireRecoverySourceMutationAuthority(req, lockedIssue);
+            await requireRecoverySourceMutationAuthority(req, lockedIssue, {
+              reason: resolutionNote ?? null,
+              changesAssignee: false,
+              closesSource: sourceIssueStatus === "done" || sourceIssueStatus === "cancelled",
+            });
           }
 
           if (workspaceRetry?.selection) {
@@ -10371,6 +10573,7 @@ export function issueRoutes(
           sourceIssueStatus: sourceIssueStatus ?? null,
           resolutionNote: result.recoveryAction.resolutionNote,
           ...(workspaceBaseRef ? { workspaceBaseRef } : {}),
+          ...decisionTriageActivityDetails(req),
         },
       });
 
@@ -14026,10 +14229,22 @@ export function issueRoutes(
       ) {
         return;
       }
+      const decisionTriageResume = {
+        reason: commentBody ?? null,
+        requestedAssigneeAgentId:
+          normalizedAssigneeAgentId === undefined
+            ? existing.assigneeAgentId
+            : normalizedAssigneeAgentId,
+        requestedAssigneeUserId:
+          req.body.assigneeUserId === undefined
+            ? existing.assigneeUserId
+            : req.body.assigneeUserId,
+      };
       if (
         resumeRequested === true &&
         !(await assertExplicitResumeIntentAllowed(req, res, existing, {
           resumeIntent: true,
+          decisionTriage: decisionTriageResume,
         }))
       )
         return;
@@ -14075,7 +14290,7 @@ export function issueRoutes(
           req,
           existing,
           activeRecoveryActionBeforeUpdate,
-          { source: "issue_update" },
+          { source: "issue_update", decisionTriageReason: commentBody ?? null },
         );
         const recoveryRestrictedSourceMutationRequested =
           activeRecoveryActionBeforeUpdate != null &&
@@ -14087,7 +14302,20 @@ export function issueRoutes(
               typeof updateFields.status === "string" &&
               updateFields.status !== existing.status));
         if (recoveryRestrictedSourceMutationRequested) {
-          await requireRecoverySourceMutationAuthority(req, existing);
+          await requireRecoverySourceMutationAuthority(req, existing, {
+            reason: commentBody ?? null,
+            changesAssignee:
+              normalizedAssigneeAgentId !== undefined ||
+              req.body.assigneeUserId !== undefined,
+            closesSource:
+              updateFields.status === "done" ||
+              updateFields.status === "cancelled",
+            requestedAssigneeAgentId: requestedAssigneeAgentId,
+            requestedAssigneeUserId:
+              req.body.assigneeUserId === undefined
+                ? existing.assigneeUserId
+                : req.body.assigneeUserId,
+          });
         }
       }
       if (req.body.executionPolicy !== undefined) {
@@ -14100,7 +14328,9 @@ export function issueRoutes(
       if (
         resumeRequested !== true &&
         agentStatusTransitionRequiresResumeAuthority &&
-        !(await assertExplicitResumeIntentAllowed(req, res, existing))
+        !(await assertExplicitResumeIntentAllowed(req, res, existing, {
+          decisionTriage: decisionTriageResume,
+        }))
       ) {
         return;
       }
@@ -14779,6 +15009,7 @@ export function issueRoutes(
               changes,
               ...(reviewInteractionId ? { reviewInteractionId } : {}),
               ...(commentBody ? { source: "comment" } : {}),
+              ...decisionTriageActivityDetails(req),
               ...(resumeRequested === true
                 ? { resumeIntent: true, followUpRequested: true }
                 : {}),
@@ -15164,6 +15395,7 @@ export function issueRoutes(
             changes: issueChanges,
             ...(reviewInteractionId ? { reviewInteractionId } : {}),
             ...(commentBody ? { source: "comment" } : {}),
+              ...decisionTriageActivityDetails(req),
             ...(resumeRequested === true
               ? { resumeIntent: true, followUpRequested: true }
               : {}),
