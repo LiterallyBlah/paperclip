@@ -34,6 +34,17 @@ import {
   buildPendingStageParticipantWakeup,
 } from "../services/execution-stage-wake-wait.js";
 import { resolveReviewEscalationDelegateAgentId } from "../services/review-escalation-delegate.js";
+import { decisionTriageDelegateStanding } from "../services/decision-triage-delegate.js";
+
+/** Decision-triage gaps the delegate may route (BLA-1616); G5 and G6 stay human. */
+type DecisionTriageGap = "G1" | "G2" | "G3a" | "G4" | "G7";
+
+/** One decision-triage nudge per (issue, target agent) per this window. */
+const TRIAGE_NUDGE_WINDOW_MS = 30 * 60 * 1000;
+
+const triageNudgeBodySchema = z.object({
+  reason: z.string().trim().min(1).max(10_000),
+}).strict();
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
@@ -51,7 +62,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
@@ -5631,6 +5642,75 @@ export function issueRoutes(
       resource: { type: "issue", companyId, assigneeAgentId },
     });
     return decision.allowed;
+  }
+
+  // BLA-1616 Part B: the company's decision-triage delegate. Each request
+  // remembers which gaps used the delegate path and why, so the request's own
+  // activity entry records `via: "decision_triage_delegate"`.
+  const decisionTriageStandingByRequest = new WeakMap<Request, Map<string, Promise<"none" | "active" | "inactive">>>();
+  const decisionTriageUseByRequest = new WeakMap<Request, { gaps: Set<DecisionTriageGap>; reason: string }>();
+
+  function decisionTriageStanding(req: Request, companyId: string) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return Promise.resolve("none" as const);
+    let byCompany = decisionTriageStandingByRequest.get(req);
+    if (!byCompany) {
+      byCompany = new Map();
+      decisionTriageStandingByRequest.set(req, byCompany);
+    }
+    let standing = byCompany.get(companyId);
+    if (!standing) {
+      standing = decisionTriageDelegateStanding(db, companyId, req.actor.agentId);
+      byCompany.set(companyId, standing);
+    }
+    return standing;
+  }
+
+  /**
+   * Whether the acting agent may use the decision-triage delegate path for
+   * `gap` on an issue of `companyId`. False (today's behaviour) when no
+   * delegate is configured or the actor is not it. When the actor is the
+   * configured delegate, the delegate must still be an active agent of the
+   * company, act from a run, and give a non-empty reason; otherwise the request
+   * is refused with a stable code. A true result is recorded for the activity
+   * entry. The caller still applies the run cap and every other gate.
+   */
+  async function admitDecisionTriageDelegate(
+    req: Request,
+    companyId: string,
+    gap: DecisionTriageGap,
+    reason: string | null | undefined,
+  ): Promise<boolean> {
+    const standing = await decisionTriageStanding(req, companyId);
+    if (standing === "none") return false;
+    if (standing === "inactive") {
+      throw forbidden("The decision-triage delegate is not an active agent of this company", {
+        code: "decision_triage_delegate_inactive",
+      });
+    }
+    if (!req.actor.runId?.trim()) {
+      throw forbidden("A decision-triage delegate action requires an agent run id", {
+        code: "decision_triage_run_required",
+      });
+    }
+    const trimmedReason = typeof reason === "string" ? reason.trim() : "";
+    if (!trimmedReason) {
+      throw unprocessable("A decision-triage delegate action requires a non-empty reason", {
+        code: "decision_triage_reason_required",
+      });
+    }
+    const use = decisionTriageUseByRequest.get(req) ?? { gaps: new Set<DecisionTriageGap>(), reason: trimmedReason };
+    use.gaps.add(gap);
+    decisionTriageUseByRequest.set(req, use);
+    return true;
+  }
+
+  function decisionTriageActivityDetails(req: Request): Record<string, unknown> {
+    const use = decisionTriageUseByRequest.get(req);
+    if (!use) return {};
+    return {
+      via: "decision_triage_delegate",
+      decisionTriage: { gaps: [...use.gaps].sort(), reason: use.reason },
+    };
   }
 
   /**
@@ -13559,9 +13639,24 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      assertBoard(req);
+      // G7 (BLA-1616): the decision-triage delegate may choose a path for a
+      // stalled review, but never an option that accepts the work.
+      const viaTriageDelegate =
+        req.actor.type === "agent" &&
+        (await admitDecisionTriageDelegate(req, issue.companyId, "G7", req.body.note));
+      if (viaTriageDelegate) {
+        if (req.body.action === "approve") {
+          throw forbidden("Accepting a stalled review stays with the board", {
+            code: "decision_triage_accepting_option_board_only",
+          });
+        }
+        if (!(await assertIssueReadAllowed(req, res, issue))) return;
+        if (!(await assertCrossIssueInfluenceWithinRunCap(req, res, issue, "update"))) return;
+      } else {
+        assertBoard(req);
+      }
 
-      if (req.actor.source !== "local_implicit") {
+      if (!viaTriageDelegate && req.actor.source !== "local_implicit") {
         const userId = req.actor.userId?.trim();
         const membership = userId
           ? await db
@@ -13591,10 +13686,17 @@ export function issueRoutes(
         companyId: issue.companyId,
         action: req.body.action,
         note: req.body.note,
-        actor: {
-          userId: actor.actorId,
-          runId: actor.runId,
-        },
+        actor: viaTriageDelegate
+          ? {
+              type: "agent",
+              agentId: actor.agentId!,
+              runId: actor.runId,
+              activityDetails: decisionTriageActivityDetails(req),
+            }
+          : {
+              userId: actor.actorId,
+              runId: actor.runId,
+            },
       });
 
       // The decision transaction has already committed the status change. The
@@ -13628,7 +13730,7 @@ export function issueRoutes(
 
       let wakeQueued = false;
       if (req.body.action !== "approve" && result.issue.assigneeAgentId) {
-        const userAuthoredNote = result.comment
+        const userAuthoredNote = result.comment && !viaTriageDelegate
           ? { commentId: result.comment.id, authorUserId: actor.actorId }
           : undefined;
         try {
@@ -13639,7 +13741,7 @@ export function issueRoutes(
               triggerDetail: "system",
               reason: "issue_status_changed",
               idempotencyKey: `stalled-review-decision:${result.issue.id}:${req.body.action}`,
-              requestedByActorType: "user",
+              requestedByActorType: viaTriageDelegate ? "agent" : "user",
               requestedByActorId: actor.actorId,
               payload: {
                 issueId: result.issue.id,
@@ -16597,6 +16699,119 @@ export function issueRoutes(
     }
 
     res.json({ issue: updated, commentId: comment.id, wakeQueued });
+  });
+
+  // G4 (BLA-1616): the decision-triage delegate may nudge the issue's current
+  // assignee agent. The wake goes through the normal wake queue, so paused
+  // agents, budget checks and the scheduler still apply; an execution hold is
+  // refused because lifting it needs the board. One nudge per issue and target
+  // agent per 30 minutes. `POST /agents/:id/wakeup` stays self-only.
+  router.post("/issues/:id/triage-nudge", async (req, res) => {
+    const body = triageNudgeBodySchema.parse(req.body ?? {});
+    const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!existing) return;
+    if (!(await assertIssueReadAllowed(req, res, existing))) return;
+    const admitted = req.actor.type === "agent" &&
+      (await admitDecisionTriageDelegate(req, existing.companyId, "G4", body.reason));
+    if (!admitted) {
+      throw forbidden("Only the company's decision-triage delegate can nudge an issue's assignee", {
+        code: "decision_triage_delegate_required",
+      });
+    }
+    const delegateAgentId = req.actor.agentId!;
+    const targetAgentId = existing.assigneeAgentId;
+    if (!targetAgentId) {
+      throw conflict("The issue has no assignee agent to nudge", { code: "triage_nudge_no_assignee_agent" });
+    }
+    if (targetAgentId === delegateAgentId) {
+      throw unprocessable("The delegate cannot nudge itself through this route", { code: "triage_nudge_self" });
+    }
+    const target = await agentsSvc.getById(targetAgentId);
+    if (!target || target.companyId !== existing.companyId || target.status === "paused" ||
+        target.status === "terminated" || target.status === "pending_approval") {
+      throw conflict("The assignee agent is paused or unavailable; resuming it needs the board", {
+        code: "triage_nudge_target_unavailable",
+        targetAgentId,
+      });
+    }
+    const hold = await treeControlSvc.getActivePauseHoldGate(existing.companyId, existing.id);
+    if (hold) {
+      throw conflict("The issue is under an execution hold; releasing it needs the board", {
+        code: "triage_nudge_hold_requires_board",
+        holdId: hold.holdId,
+      });
+    }
+    const windowMs = TRIAGE_NUDGE_WINDOW_MS;
+    const since = new Date(Date.now() - windowMs);
+    const [recent] = await db
+      .select({ id: activityLog.id, createdAt: activityLog.createdAt })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, existing.companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, existing.id),
+        eq(activityLog.action, "issue.triage_nudged"),
+        sql`${activityLog.details}->>'targetAgentId' = ${targetAgentId}`,
+        gte(activityLog.createdAt, since),
+      ))
+      .orderBy(desc(activityLog.createdAt))
+      .limit(1);
+    if (recent) {
+      const retryAt = new Date(new Date(recent.createdAt).getTime() + windowMs);
+      res.setHeader("Retry-After", String(Math.max(1, Math.ceil((retryAt.getTime() - Date.now()) / 1000))));
+      res.status(429).json({
+        error: "This issue's assignee was nudged in the last 30 minutes",
+        details: { code: "triage_nudge_rate_limited", retryAt: retryAt.toISOString() },
+      });
+      return;
+    }
+    if (!(await assertCrossIssueInfluenceWithinRunCap(req, res, existing, "update"))) return;
+
+    const actor = getActorInfo(req);
+    const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
+    const idempotencyKey = `triage-nudge:${existing.id}:${targetAgentId}:${windowStart}`;
+    let wakeQueued = false;
+    let wakeId: string | null = null;
+    try {
+      const wake = await heartbeat.wakeup(targetAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "decision_triage_nudge",
+        idempotencyKey,
+        requestedByActorType: "agent",
+        requestedByActorId: delegateAgentId,
+        payload: { issueId: existing.id, mutation: "decision_triage_nudge" },
+        contextSnapshot: {
+          issueId: existing.id,
+          taskId: existing.id,
+          source: "issue.triage_nudge",
+          wakeReason: "decision_triage_nudge",
+        },
+      });
+      wakeQueued = wake !== null;
+      wakeId = wake?.id ?? null;
+    } catch (err) {
+      logger.warn({ err, issueId: existing.id, agentId: targetAgentId }, "failed to enqueue decision-triage nudge");
+    }
+    await logActivity(db, {
+      companyId: existing.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "issue.triage_nudged",
+      entityType: "issue",
+      entityId: existing.id,
+      details: {
+        targetAgentId,
+        wakeQueued,
+        wakeId,
+        idempotencyKey,
+        ...decisionTriageActivityDetails(req),
+      },
+    });
+    res.json({ issueId: existing.id, targetAgentId, wakeQueued, idempotencyKey });
   });
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {

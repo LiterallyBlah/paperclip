@@ -14,10 +14,14 @@ import {
   type IssuePostCommitAction,
 } from "./issues.js";
 
-export interface StalledReviewDecisionActor {
-  userId: string;
-  runId?: string | null;
-}
+export type StalledReviewDecisionActor =
+  | { type?: "user"; userId: string; runId?: string | null }
+  /**
+   * The company's decision-triage delegate (BLA-1616 G7). The route admits it
+   * only for options that do not accept the work; `activityDetails` carries
+   * the `via: "decision_triage_delegate"` marker into the decision entry.
+   */
+  | { type: "agent"; agentId: string; runId?: string | null; activityDetails?: Record<string, unknown> };
 
 export interface DecideStalledReviewInput {
   issueId: string;
@@ -31,6 +35,14 @@ export function stalledReviewDecisionService(db: Db) {
   const svc = issueService(db);
   return {
     decide: async (input: DecideStalledReviewInput) => {
+      const actor = input.actor;
+      const isAgent = actor.type === "agent";
+      const actorRef = isAgent
+        ? { actorType: "agent" as const, actorId: actor.agentId, agentId: actor.agentId }
+        : { actorType: "user" as const, actorId: actor.userId };
+      if (isAgent && input.action === "approve") {
+        throw conflict("Accepting a stalled review stays with the board");
+      }
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const result = await db.transaction(async (tx) => {
@@ -68,8 +80,10 @@ export function stalledReviewDecisionService(db: Db) {
           ? await svc.addComment(
               lockedIssue.id,
               input.note,
-              { userId: input.actor.userId, runId: input.actor.runId ?? null },
-              { authorType: "user" },
+              isAgent
+                ? { agentId: actor.agentId, runId: actor.runId ?? null }
+                : { userId: actor.userId, runId: actor.runId ?? null },
+              { authorType: isAgent ? "agent" : "user" },
               tx,
             )
           : null;
@@ -78,7 +92,7 @@ export function stalledReviewDecisionService(db: Db) {
           lockedIssue.id,
           {
             status,
-            actorUserId: input.actor.userId,
+            ...(isAgent ? { actorAgentId: actor.agentId } : { actorUserId: actor.userId }),
           },
           tx,
           postCommitActivityPublications,
@@ -89,25 +103,23 @@ export function stalledReviewDecisionService(db: Db) {
         if (comment) {
           await logActivity(txDb, {
             companyId: updated.companyId,
-            actorType: "user",
-            actorId: input.actor.userId,
-            runId: input.actor.runId ?? null,
+            ...actorRef,
+            runId: actor.runId ?? null,
             action: "issue.comment_added",
             entityType: "issue",
             entityId: updated.id,
             issueId: updated.id,
             details: {
               commentId: comment.id,
-              authorUserId: input.actor.userId,
+              ...(isAgent ? { authorAgentId: actor.agentId } : { authorUserId: actor.userId }),
               source: "stalled_review_decision",
             },
           });
         }
         await logActivity(txDb, {
           companyId: updated.companyId,
-          actorType: "user",
-          actorId: input.actor.userId,
-          runId: input.actor.runId ?? null,
+          ...actorRef,
+          runId: actor.runId ?? null,
           action: "issue.stalled_review_decided",
           entityType: "issue",
           entityId: updated.id,
@@ -117,7 +129,8 @@ export function stalledReviewDecisionService(db: Db) {
             status,
             identifier: updated.identifier,
             commentId: comment?.id ?? null,
-            authorUserId: comment ? input.actor.userId : null,
+            authorUserId: comment && !isAgent ? actor.userId : null,
+            ...(isAgent ? { authorAgentId: comment ? actor.agentId : null, ...(actor.activityDetails ?? {}) } : {}),
             _previous: { status: lockedIssue.status },
           },
         });
