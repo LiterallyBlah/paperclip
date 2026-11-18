@@ -1527,4 +1527,247 @@ describeEmbeddedPostgres("status card routes", () => {
       expect.objectContaining({ kind: "compile", queryVersion: 2 }),
     ]));
   });
+
+  // ------------------------------------------------ abandoned generations (BLA-1691)
+
+  const BLOCKED_QUERY = { scope: "issues", status: ["blocked", "done"], updatedWithin: "7d", sort: "updated", limit: 20, offset: 0 } as const;
+  const INTERVAL_POLICY = { ...defaultStatusCardRefreshPolicy, mode: "interval" as const, intervalMinutes: 15 };
+  const MINUTE = 60 * 1000;
+
+  async function seedRecoveryCard(refreshPolicy: typeof defaultStatusCardRefreshPolicy = INTERVAL_POLICY) {
+    const company = await seedCompany();
+    await enableStatusCards();
+    const summarizer = await seedSummarizer(company.id);
+    // One watched issue that the stored (empty) fingerprint has not seen, so
+    // every evaluation has a change to summarise until a summary is written.
+    await db.insert(issues).values({ companyId: company.id, title: "Launch is blocked on approval", status: "blocked", priority: "high" });
+    const card = await db.insert(statusCards).values({
+      companyId: company.id,
+      createdByUserId: "board-user",
+      interestPrompt: "Blocked launch tasks",
+      queries: [BLOCKED_QUERY],
+      queryVersion: 1,
+      refreshPolicy,
+      state: "active",
+      fingerprint: {},
+      nextEvalAt: new Date(Date.now() - 1000),
+    }).returning().then((rows) => rows[0]!);
+    return { company, summarizer, card };
+  }
+
+  async function readCard(cardId: string) {
+    return db.select().from(statusCards).where(eq(statusCards.id, cardId)).then((rows) => rows[0]!);
+  }
+
+  async function ledger(cardId: string) {
+    const rows = await db.select().from(statusCardUpdates).where(eq(statusCardUpdates.cardId, cardId));
+    return rows.sort((left, right) => left.startedAt.getTime() - right.startedAt.getTime());
+  }
+
+  async function tickEnqueuesGeneration(cardId: string, at: Date) {
+    const tick = await statusCardService(db).tickDueStatusCards(at);
+    expect(tick).toMatchObject({ evaluated: 1 });
+    expect(tick.enqueued.map((entry) => entry.cardId)).toEqual([cardId]);
+    return tick.enqueued[0]!.generatingIssue;
+  }
+
+  // How each abandonment reaches the task: through the issue service (the
+  // scheduler's wake-failure cancel, a Summarizer status PATCH) or by a direct
+  // row update that bypasses the transition hook (run recovery parking the
+  // task, any other writer).
+  const ABANDONMENTS = [
+    { label: "cancelled (wake failed, via issue service)", status: "cancelled", direct: false },
+    { label: "failed (run recovery parks it blocked, direct row update)", status: "blocked", direct: true },
+    { label: "done without a summary write (via issue service)", status: "done", direct: false },
+    { label: "done without a summary write (direct row update)", status: "done", direct: true },
+  ] as const;
+
+  async function abandon(issueId: string, status: "cancelled" | "blocked" | "done", direct: boolean) {
+    if (direct) await db.update(issues).set({ status, updatedAt: new Date() }).where(eq(issues.id, issueId));
+    else await issueService(db).update(issueId, { status });
+  }
+
+  for (const abandonment of ABANDONMENTS) {
+    it(`recovers a card whose generation task ended ${abandonment.label}`, async () => {
+      const { card } = await seedRecoveryCard();
+      const started = new Date();
+      const generation = await tickEnqueuesGeneration(card.id, started);
+      expect(await readCard(card.id)).toMatchObject({ generatingIssueId: generation.id, state: "active" });
+
+      await abandon(generation.id, abandonment.status, abandonment.direct);
+
+      // The next tick releases the claim and re-arms the card; it is not due yet.
+      const release = await statusCardService(db).tickDueStatusCards(new Date());
+      expect(release).toMatchObject({ evaluated: 0, enqueued: [] });
+      const released = await readCard(card.id);
+      const [failedRow] = await ledger(card.id);
+      expect(failedRow).toMatchObject({ status: "failed", finishedAt: expect.any(Date), generationIssueId: generation.id });
+      expect(released).toMatchObject({ generatingIssueId: null, state: "error", failureReason: expect.any(String) });
+      expect(released.nextEvalAt).toEqual(new Date(failedRow!.finishedAt!.getTime() + 15 * MINUTE));
+
+      // The next eligible tick re-checks the card and retries the generation.
+      const retry = await tickEnqueuesGeneration(card.id, new Date(released.nextEvalAt!.getTime() + 1000));
+      expect(retry.status).toBe("todo");
+      expect(await readCard(card.id)).toMatchObject({ generatingIssueId: retry.id, state: "active", failureReason: null });
+      expect((await ledger(card.id)).map((row) => row.status)).toEqual(["failed", "running"]);
+    });
+  }
+
+  it("backs off repeated abandoned generations and stops after a finite cap", async () => {
+    const { card } = await seedRecoveryCard();
+    const service = statusCardService(db);
+    let generation = await tickEnqueuesGeneration(card.id, new Date());
+    const delays: number[] = [];
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await abandon(generation.id, "cancelled", false);
+      const abandonedAt = (await ledger(card.id)).at(-1)!.finishedAt!;
+      // Ticks right after the abandonment start nothing.
+      for (const offset of [1000, 30_000, 59_000]) {
+        expect(await service.tickDueStatusCards(new Date(abandonedAt.getTime() + offset))).toMatchObject({ evaluated: 0, enqueued: [] });
+      }
+      const parked = await readCard(card.id);
+      delays.push(parked.nextEvalAt!.getTime() - abandonedAt.getTime());
+      // Still nothing just before the backed-off retry is due.
+      expect(await service.tickDueStatusCards(new Date(parked.nextEvalAt!.getTime() - 1000))).toMatchObject({ evaluated: 0, enqueued: [] });
+      generation = await tickEnqueuesGeneration(card.id, new Date(parked.nextEvalAt!.getTime() + 1000));
+    }
+    // 15 min cadence -> 15, 30, 60 min (never faster than the card's cadence).
+    expect(delays).toEqual([15 * MINUTE, 30 * MINUTE, 60 * MINUTE]);
+
+    // The fourth abandonment in a row exceeds the cap: the card stays in its
+    // visible error state and no later tick regenerates it.
+    await abandon(generation.id, "cancelled", false);
+    const issueCount = (await db.select().from(issues)).length;
+    for (const later of [MINUTE, 2 * 60 * MINUTE, 24 * 60 * MINUTE]) {
+      expect(await service.tickDueStatusCards(new Date(Date.now() + later))).toMatchObject({ evaluated: 0, enqueued: [] });
+    }
+    expect(await readCard(card.id)).toMatchObject({ state: "error", generatingIssueId: null, nextEvalAt: null });
+    expect((await ledger(card.id)).map((row) => row.status)).toEqual(["failed", "failed", "failed", "failed"]);
+    expect((await db.select().from(issues)).length).toBe(issueCount);
+
+    // A manual refresh still runs, as before.
+    const manual = await service.requestRefresh(card.id, { actor: { agentId: null, userId: "board-user" } });
+    expect(manual).toMatchObject({ enqueued: true });
+  });
+
+  it("caps the backoff at two hours and never retries faster than 60 s", async () => {
+    // Short reactive debounce: base is floored at 60 s.
+    const reactive = await seedRecoveryCard({ ...defaultStatusCardRefreshPolicy, mode: "reactive", debounceSeconds: 1 });
+    const service = statusCardService(db);
+    // The first evaluation records the change; the 1 s debounce lets the next one run.
+    expect(await service.tickDueStatusCards(new Date())).toMatchObject({ evaluated: 1, enqueued: [] });
+    const tick = await service.tickDueStatusCards(new Date(Date.now() + 2000));
+    const generation = tick.enqueued.find((entry) => entry.cardId === reactive.card.id)!.generatingIssue;
+    await abandon(generation.id, "cancelled", false);
+    await service.tickDueStatusCards(new Date());
+    const parked = await readCard(reactive.card.id);
+    const abandonedAt = (await ledger(reactive.card.id)).at(-1)!.finishedAt!;
+    expect(parked.nextEvalAt!.getTime() - abandonedAt.getTime()).toBe(MINUTE);
+
+    // Long interval: the retry is never sooner than the card's own cadence.
+    await db.update(statusCards).set({
+      refreshPolicy: { ...defaultStatusCardRefreshPolicy, mode: "interval", intervalMinutes: 90 },
+      nextEvalAt: null,
+    }).where(eq(statusCards.id, reactive.card.id));
+    await db.insert(statusCardUpdates).values([
+      { cardId: reactive.card.id, kind: "full", trigger: "interval", status: "failed", startedAt: new Date(Date.now() + 1000), finishedAt: new Date(Date.now() + 2000) },
+    ]);
+    await service.tickDueStatusCards(new Date());
+    const twice = await readCard(reactive.card.id);
+    // Two in a row at 90 min: min(180 min, 120 min) = 120 min, which is >= 90 min.
+    expect(twice.nextEvalAt!.getTime() - (Date.now() + 2000)).toBeGreaterThan(119 * MINUTE);
+    expect(twice.nextEvalAt!.getTime() - (Date.now() + 2000)).toBeLessThanOrEqual(120 * MINUTE);
+  });
+
+  it("starts no model run for an unchanged card, including after a recovered abandonment", async () => {
+    const { card } = await seedRecoveryCard();
+    const service = statusCardService(db);
+    const generation = await tickEnqueuesGeneration(card.id, new Date());
+    await abandon(generation.id, "cancelled", false);
+    await service.tickDueStatusCards(new Date());
+    const parked = await readCard(card.id);
+    expect(parked.state).toBe("error");
+
+    // Nothing changed since the last written summary: the stored fingerprint
+    // already matches the watched set.
+    const dryRunFingerprint = (await db.select().from(issues).where(eq(issues.title, "Launch is blocked on approval")).then((rows) => rows))
+      .map((issue) => [issue.id, {
+        status: issue.status,
+        updatedAt: issue.updatedAt.toISOString(),
+        latestHumanCommentAt: null,
+        identifier: issue.identifier,
+        title: issue.title,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+      }]);
+    await db.update(statusCards).set({ fingerprint: Object.fromEntries(dryRunFingerprint) }).where(eq(statusCards.id, card.id));
+
+    const issueCount = (await db.select().from(issues)).length;
+    const rows = (await ledger(card.id)).length;
+    const retryAt = new Date(parked.nextEvalAt!.getTime() + 1000);
+    expect(await service.tickDueStatusCards(retryAt)).toMatchObject({ evaluated: 1, enqueued: [] });
+    const settled = await readCard(card.id);
+    expect(settled).toMatchObject({ state: "active", generatingIssueId: null });
+    expect(settled.nextEvalAt).toEqual(new Date(retryAt.getTime() + 15 * MINUTE));
+    // The following normal tick is also a no-op.
+    expect(await service.tickDueStatusCards(new Date(settled.nextEvalAt!.getTime() + 1000))).toMatchObject({ evaluated: 1, enqueued: [] });
+    expect((await db.select().from(issues)).length).toBe(issueCount);
+    expect((await ledger(card.id)).length).toBe(rows);
+    const reopened = await db.select().from(issues).where(eq(issues.id, generation.id)).then((r) => r[0]!);
+    expect(reopened.status).toBe("cancelled");
+  });
+
+  it("leaves manual cards, compile-less cards and other error states alone", async () => {
+    const { company, card } = await seedRecoveryCard({ ...defaultStatusCardRefreshPolicy, mode: "manual" });
+    const service = statusCardService(db);
+    const manual = await service.requestRefresh(card.id, { actor: { agentId: null, userId: "board-user" } });
+    await abandon(manual.generatingIssue!.id, "cancelled", false);
+    // An error card with no failed ledger row (some other error) and a card
+    // whose compile never produced a query.
+    const other = await db.insert(statusCards).values({
+      companyId: company.id, createdByUserId: "board-user", interestPrompt: "Other", queries: [BLOCKED_QUERY], queryVersion: 1,
+      refreshPolicy: INTERVAL_POLICY, state: "error", failureReason: "something else", fingerprint: {},
+    }).returning().then((rows) => rows[0]!);
+    const uncompiled = await db.insert(statusCards).values({
+      companyId: company.id, createdByUserId: "board-user", interestPrompt: "Uncompiled", queries: [], queryVersion: 0,
+      refreshPolicy: INTERVAL_POLICY, state: "error", failureReason: "compile cancelled",
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(statusCardUpdates).values({ cardId: uncompiled.id, kind: "compile", trigger: "manual", status: "failed", finishedAt: new Date() });
+
+    for (const later of [MINUTE, 3 * 60 * MINUTE]) {
+      expect(await service.tickDueStatusCards(new Date(Date.now() + later))).toMatchObject({ evaluated: 0, enqueued: [] });
+    }
+    for (const id of [card.id, other.id, uncompiled.id]) {
+      expect(await readCard(id)).toMatchObject({ state: "error", generatingIssueId: null, nextEvalAt: null });
+    }
+  });
+
+  it("writes a summary after a recovered retry and resets the abandonment count", async () => {
+    const { company, summarizer, card } = await seedRecoveryCard();
+    const service = statusCardService(db);
+    const first = await tickEnqueuesGeneration(card.id, new Date());
+    await abandon(first.id, "cancelled", false);
+    await service.tickDueStatusCards(new Date());
+    const parked = await readCard(card.id);
+    const retry = await tickEnqueuesGeneration(card.id, new Date(parked.nextEvalAt!.getTime() + 1000));
+
+    const run = await seedRun(company.id, summarizer.id);
+    await db.update(issues).set({ checkoutRunId: run.id }).where(eq(issues.id, retry.id));
+    const write = await request(createApp(db, agentActor(company.id, summarizer.id, run.id)))
+      .put(`/api/status-cards/${card.id}/summary`)
+      .send({ markdown: "**Decide:** unblock launch approval.", changeSummary: "First summary after a retry.", generationIssueId: retry.id, model: "gpt-5.4" });
+    expect(write.status).toBe(200);
+    expect(write.body.card).toMatchObject({ state: "active", generatingIssueId: null, failureReason: null });
+    expect((await ledger(card.id)).map((row) => row.status)).toEqual(["failed", "ok"]);
+
+    // A later change and a new abandonment count from one again (15 min).
+    await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.title, "Launch is blocked on approval"));
+    const written = await readCard(card.id);
+    const next = await tickEnqueuesGeneration(card.id, new Date(written.nextEvalAt!.getTime() + 1000));
+    await abandon(next.id, "cancelled", false);
+    await service.tickDueStatusCards(new Date());
+    const again = await readCard(card.id);
+    const abandonedAt = (await ledger(card.id)).at(-1)!.finishedAt!;
+    expect(again.nextEvalAt!.getTime() - abandonedAt.getTime()).toBe(15 * MINUTE);
+  });
 });
