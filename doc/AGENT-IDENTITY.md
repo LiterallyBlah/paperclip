@@ -23,7 +23,8 @@ Cloud secret or Cloud registry record is needed.
 
 Decryption and public/private key validation happen before launch. A wrong
 master key, corrupt ciphertext, or mismatched public key fails the run; none
-causes automatic key replacement. Renames, model changes, pauses, resumes, and
+causes automatic key replacement. Only the explicit rotation control below
+replaces an existing key. Renames, model changes, pauses, resumes, and
 restarts preserve the keypair.
 
 ## Managed runs
@@ -67,7 +68,8 @@ const signature = sign(null, challengeBytes, process.env.PAPERCLIP_AGENT_PRIVATE
 
 This identity does not change Paperclip bearer-token authentication. There is no
 signing API, private-key download endpoint, Git integration, rotation UI, or
-external-key import. Agents possess their private keys. External consumers must
+external-key import. Rotation is available through the board API only (see
+[Rotation](#rotation)). Agents possess their private keys. External consumers must
 define their own authorization, expiry, and revocation rules.
 
 ## Public identity
@@ -82,6 +84,38 @@ returns `null` before provisioning, otherwise:
 The agent's Identity section shows a shortened fingerprint and copies the full
 public PEM. Before provisioning it shows “Not created yet” and explains that
 creation happens on the next managed run.
+
+## Rotation
+
+`POST /api/agents/:id/identity/rotate` (no body) replaces an agent's existing
+identity with a fresh Ed25519 pair. It requires a board actor with the
+agent-management permission for the agent's company; agent bearer tokens,
+including the agent's own, are refused. It never provisions a missing identity
+(`404`). It returns the new public identity in the same shape as
+`GET /api/agents/:id/identity`, never private material.
+
+Rotation takes the same agent-row lock as run preparation, so a concurrent run
+receives either the complete previous pair or the complete new pair. The row is
+updated in place (`keyId`, `publicKeyPem`, encrypted private material, and
+`createdAt` as the current key's creation time); the schema does not change. An
+`agent.identity.rotated` activity records the actor, `algorithm`,
+`previousKeyId` and `keyId`.
+
+Effect on runs:
+
+- A process that is already running keeps the previous key in its environment
+  until it ends, and its output redactor continues to mask that previous key.
+- Runs prepared after rotation receive the new key and mask the new key.
+- Session compatibility includes the key ID, so a warm or native session is
+  replaced before its next turn.
+- Run authority for customer-success inspection reports the agent's current
+  key ID, including for a run that started before rotation.
+
+Rotation does not revoke anything outside Paperclip. Copies of the previous
+private key held by a runtime host, a log, or any other party remain usable, and
+signatures made with it remain mathematically valid against the previous public
+key. Paperclip itself does not verify agent signatures. External consumers must
+trust only the current public identity from `GET /api/agents/:id/identity`.
 
 ## Copies and recovery
 

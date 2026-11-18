@@ -4,7 +4,9 @@ import { agentIdentityKeys, agents, type Db } from "@paperclipai/db";
 import type { AgentPublicIdentity } from "@paperclipai/shared";
 import { notFound } from "../errors.js";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
-import { persistActivity } from "./activity-log.js";
+import { persistActivity, publishActivity, type LogActivityInput } from "./activity-log.js";
+
+export type AgentIdentityRotationActor = Pick<LogActivityInput, "actorType" | "actorId" | "agentId" | "runId">;
 
 const publicColumns = {
   algorithm: agentIdentityKeys.algorithm,
@@ -34,14 +36,9 @@ export function agentIdentityService(db: Db) {
         if (!owner) throw notFound("Agent not found");
         let [row] = await tx.select().from(agentIdentityKeys).where(ownership(companyId, agentId));
         if (!row) {
-          const keys = generateKeyPairSync("ed25519");
-          const publicKeyPem = keys.publicKey.export({ type: "spki", format: "pem" }).toString();
-          const keyId = fingerprint(keys.publicKey.export({ type: "spki", format: "der" }));
-          const privateKeyPem = keys.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
-          const encrypted = await localEncryptedProvider.createSecret({ value: privateKeyPem });
+          const { keyId, publicKeyPem, privateKeyMaterial } = await generateEncryptedKeyPair();
           [row] = await tx.insert(agentIdentityKeys).values({
-            companyId, agentId, algorithm: "Ed25519", keyId, publicKeyPem,
-            privateKeyMaterial: encrypted.material,
+            companyId, agentId, algorithm: "Ed25519", keyId, publicKeyPem, privateKeyMaterial,
           }).returning();
           await persistActivity(tx as unknown as Db, {
             companyId, actorType: "system", actorId: "system",
@@ -52,7 +49,9 @@ export function agentIdentityService(db: Db) {
         const privateKeyPem = await localEncryptedProvider.resolveVersion({
           material: row.privateKeyMaterial, externalRef: null,
         });
-        // Fail closed on corruption or a wrong master key; never replace a key.
+        // Fail closed on corruption or a wrong master key; never replace a key
+        // automatically. Only the explicit, audited rotateAgentIdentity path
+        // replaces an existing key.
         const privateKey = createPrivateKey(privateKeyPem);
         const derived = createPublicKey(privateKey).export({ type: "spki", format: "der" });
         const stored = createPublicKey(row.publicKeyPem).export({ type: "spki", format: "der" });
@@ -63,7 +62,50 @@ export function agentIdentityService(db: Db) {
         return { keyId: row.keyId, publicKeyPem: row.publicKeyPem, privateKeyPem };
       });
     },
+
+    // Explicit operator rotation: replaces an existing identity in place with
+    // a fresh pair. It never provisions a missing identity, and it returns
+    // only public fields. Rows keep the same shape, so earlier releases can
+    // still read a rotated identity.
+    async rotateAgentIdentity(
+      companyId: string,
+      agentId: string,
+      actor: AgentIdentityRotationActor,
+    ): Promise<AgentPublicIdentity> {
+      const { identity, publication } = await db.transaction(async (tx) => {
+        // Same lock as ensureAgentIdentity, so a concurrent run preparation
+        // sees either the old pair or the new pair, never a mix.
+        const [owner] = await tx.select({ id: agents.id }).from(agents)
+          .where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))).for("update");
+        if (!owner) throw notFound("Agent not found");
+        const [current] = await tx.select({ keyId: agentIdentityKeys.keyId })
+          .from(agentIdentityKeys).where(ownership(companyId, agentId));
+        if (!current) throw notFound("Agent identity not found");
+        const { keyId, publicKeyPem, privateKeyMaterial } = await generateEncryptedKeyPair();
+        const [row] = await tx.update(agentIdentityKeys).set({
+          algorithm: "Ed25519", keyId, publicKeyPem, privateKeyMaterial, createdAt: new Date(),
+        }).where(ownership(companyId, agentId)).returning(publicColumns);
+        const { publication } = await persistActivity(tx as unknown as Db, {
+          companyId, actorType: actor.actorType, actorId: actor.actorId,
+          agentId: actor.agentId ?? null, runId: actor.runId ?? null,
+          action: "agent.identity.rotated", entityType: "agent", entityId: agentId,
+          details: { algorithm: "Ed25519", previousKeyId: current.keyId, keyId },
+        });
+        return { identity: { ...row, createdAt: row.createdAt.toISOString() }, publication };
+      });
+      publishActivity(publication);
+      return identity;
+    },
   };
+}
+
+async function generateEncryptedKeyPair() {
+  const keys = generateKeyPairSync("ed25519");
+  const publicKeyPem = keys.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const keyId = fingerprint(keys.publicKey.export({ type: "spki", format: "der" }));
+  const privateKeyPem = keys.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const encrypted = await localEncryptedProvider.createSecret({ value: privateKeyPem });
+  return { keyId, publicKeyPem, privateKeyMaterial: encrypted.material };
 }
 
 function fingerprint(spki: Buffer): string {
