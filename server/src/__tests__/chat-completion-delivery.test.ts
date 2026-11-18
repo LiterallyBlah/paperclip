@@ -394,6 +394,11 @@ import { createHeartbeatQueueTestDependencies } from "./helpers/heartbeat-queue.
   });
   it("queues onboarding completion behind a busy turn without changing generic handoffs", () => {
     expect(shouldQueueFollowupForRunningIssueWake({ contextSnapshot: { wakeReason: "issue_children_completed", onboardingCompletion: true }, wakeCommentId: null })).toBe(true);
-    expect(shouldQueueFollowupForRunningIssueWake({ contextSnapshot: { wakeReason: "issue_children_completed" }, wakeCommentId: null })).toBe(false);
+    // Fork behaviour (BLA-1227 port of upstream d42a7d86, commit ba3e4cf38): every
+    // child-completion wake is deferred as a follow-up behind an active run of the
+    // same issue, so a generic handoff queues too instead of merging into the turn.
+    expect(shouldQueueFollowupForRunningIssueWake({ contextSnapshot: { wakeReason: "issue_children_completed" }, wakeCommentId: null })).toBe(true);
+    // Unrelated wake reasons are unchanged and still merge into the running turn.
+    expect(shouldQueueFollowupForRunningIssueWake({ contextSnapshot: { wakeReason: "issue_assigned" }, wakeCommentId: null })).toBe(false);
   });
 });
