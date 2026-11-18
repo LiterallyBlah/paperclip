@@ -2117,6 +2117,35 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/decision-triage-delegate",
+  tags: ["companies"],
+  summary: "Get the company's decision-triage delegate",
+  description: "Returns `{ agentId }`; null means every decision-triage delegate route is closed. Separate from the review escalation delegate.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/companies/{companyId}/decision-triage-delegate",
+  tags: ["companies"],
+  summary: "Set or clear the company's decision-triage delegate",
+  description: "Board session with non-viewer write access only; MCP OAuth board sessions and agents are refused. The agent must be an active agent of the company.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(z.object({ agentId: z.string().uuid().nullable() })),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/artifacts",
   tags: ["companies"],
   summary: "List company artifacts",
@@ -4429,6 +4458,7 @@ registry.registerPath({
   path: "/api/issues/{id}/stalled-review-decision",
   tags: ["issues"],
   summary: "Resolve a stalled issue review",
+  description: "Board, or the company's decision-triage delegate for options that do not accept or complete the work (a note is then the required reason; approve returns 403 `decision_triage_accepting_option_board_only`).",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(stalledReviewDecisionSchema),
@@ -4440,6 +4470,28 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/triage-nudge",
+  tags: ["issues"],
+  summary: "Queue one wake for the issue's current assignee agent as the decision-triage delegate",
+  description: "Delegate agent only (run id and non-empty reason required). Goes through the normal wake queue, so holds, paused agents and budgets still apply. One nudge per issue and target agent per 30 minutes. Response: `{ issueId, targetAgentId, wakeQueued, idempotencyKey }`.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(z.object({ reason: z.string().min(1).max(10_000) }).strict()),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+    429: { description: "The assignee was nudged in the last 30 minutes (`triage_nudge_rate_limited`)" },
   },
 });
 
