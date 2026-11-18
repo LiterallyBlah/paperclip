@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { createAgentIdentityRedactor, runSecretEnvValues, runSecretRedactionForms } from "../services/agent-identity-redaction.js";
 import { createHeartbeatRunOutput } from "../services/heartbeat/run-output.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { AI_AUTH_ENV_KEYS, AI_CONFIG_ENV_KEYS } from "../services/ai-connection-runtime.js";
 
 // Synthetic fixtures only. None of these is, or resembles, a real credential.
 const BOUND_SECRET = 'synthetic-bound-"quoted"\\value-0001';
@@ -61,7 +62,7 @@ function prepareRedactor() {
   return redactor;
 }
 
-async function startOutput(redactor = prepareRedactor()) {
+async function startOutput(redactor = prepareRedactor(), declaredKeys: Set<string> = secretKeys) {
   const companyId = randomUUID();
   const runId = randomUUID();
   const run = { id: runId, companyId, agentId: randomUUID(), status: "running", lastOutputSeq: 0, logBytes: 0, lastOutputAt: null } as never;
@@ -78,7 +79,7 @@ async function startOutput(redactor = prepareRedactor()) {
       append: async (_handle, entry) => { stored.push({ stream: entry.stream, chunk: entry.chunk }); return entry.chunk.length; },
     } as never,
     identityRedactor: redactor,
-    secretKeys,
+    secretKeys: declaredKeys,
     appendRunEvent: (async (_run: unknown, event: { eventType: string; payload?: Record<string, unknown>; message?: string }) => { events.push(event); }) as never,
     getCurrentUserRedactionOptions: async () => ({ enabled: false, replacement: "*" }) as never,
   });
@@ -141,6 +142,44 @@ describe("run secret value redaction", () => {
       });
     }
   }
+
+  it("masks managed AI credentials but not model, endpoint or config-home values", async () => {
+    const managedEnv: Record<string, string> = {
+      ANTHROPIC_API_KEY: "synthetic-provider-value-0006-abcdefgh",
+      PAPERCLIP_AI_PROVIDER_KEY: "synthetic-routing-value-0007-abcdefgh",
+      ANTHROPIC_MODEL: "synthetic-model-x1",
+      ANTHROPIC_BASE_URL: "https://gateway.example.invalid/v1",
+      CLAUDE_CONFIG_DIR: "/fixture/synthetic/claude-config",
+      CODEX_HOME: "/fixture/synthetic/codex-home",
+    };
+    const managedKeys = new Set<string>(AI_AUTH_ENV_KEYS);
+    const redactor = createAgentIdentityRedactor();
+    redactor.add(runSecretEnvValues(managedEnv, managedKeys, new Set(AI_CONFIG_ENV_KEYS)));
+    expect(redactor.values).toEqual(expect.arrayContaining([managedEnv.ANTHROPIC_API_KEY, managedEnv.PAPERCLIP_AI_PROVIDER_KEY]));
+    for (const key of ["ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR", "CODEX_HOME"]) {
+      expect(redactor.values).not.toContain(managedEnv[key]);
+    }
+
+    const { handlers, stored, events, finish } = await startOutput(redactor, managedKeys);
+    const config = `${JSON.stringify({ type: "system", model: managedEnv.ANTHROPIC_MODEL, url: managedEnv.ANTHROPIC_BASE_URL })}\n` +
+      `transcript ${managedEnv.CLAUDE_CONFIG_DIR}/projects/a.jsonl\n`;
+    await handlers.onLog("stdout", config);
+    await handlers.onLog("stdout", `key ${managedEnv.ANTHROPIC_API_KEY} route ${managedEnv.PAPERCLIP_AI_PROVIDER_KEY}\n`);
+    await handlers.onAdapterMeta?.({ adapterType: "claude_local", command: "fixture", env: managedEnv, prompt: "fixture" });
+    await finish();
+    const storedText = stored.map(entry => entry.chunk).join("");
+    expect(storedText.startsWith(config)).toBe(true);
+    expect(storedText).not.toContain(managedEnv.ANTHROPIC_API_KEY);
+    expect(storedText).not.toContain(managedEnv.PAPERCLIP_AI_PROVIDER_KEY);
+    // Names stay masked in the invoke env, as before value registration.
+    expect(JSON.stringify(events.find(event => event.eventType === "adapter.invoke"))).not.toContain(managedEnv.ANTHROPIC_MODEL);
+
+    const adapterResult = {
+      model: managedEnv.ANTHROPIC_MODEL,
+      sessionParams: { transcript: `${managedEnv.CLAUDE_CONFIG_DIR}/projects/a.jsonl`, home: managedEnv.CODEX_HOME },
+    };
+    expect(redactor.redact(adapterResult)).toEqual(adapterResult);
+  });
 
   it("leaves short, boolean and numeric env values and ordinary output unchanged", async () => {
     const { handlers, stored, live, finish } = await startOutput();

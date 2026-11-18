@@ -10,7 +10,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { agents, authUsers, companies, companyMemberships, companySkills, companySkillTestRuns, createDb, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, projects, plugins, environments } from "@paperclipai/db";
 import { companySkillService } from "../services/company-skills.js";
 import { withSkillVersionCacheLock } from "../services/skill-version-cache.js";
-import { registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
+import { registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext, type AdapterExecutionResult } from "../adapters/index.js";
 import { HttpError } from "../errors.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { bindHeartbeatRunnerHomeMode, prepareHeartbeatExecutionConfiguration, type HeartbeatExecutionConfigurationInput } from "../services/heartbeat/execution-configuration.js";
@@ -123,7 +123,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
   let db: ReturnType<typeof createDb>;
   let heartbeat: ReturnType<typeof heartbeatService>;
   const captured = new Map<string, AdapterExecutionContext>();
-  const inspect = new Map<string, (input: AdapterExecutionContext) => Promise<void>>();
+  const inspect = new Map<string, (input: AdapterExecutionContext) => Promise<Partial<AdapterExecutionResult> | void>>();
   const adapterType = "codex_local";
   const oldHome = process.env.PAPERCLIP_HOME;
   let home: string;
@@ -140,8 +140,8 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       execute: async input => {
         captured.set(input.runId, input);
         await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, String(input.context.issueId)));
-        await inspect.get(input.agent.id)?.(input);
-        return { exitCode: 0, signal: null, timedOut: false, resultJson: {} };
+        const result = await inspect.get(input.agent.id)?.(input);
+        return { exitCode: 0, signal: null, timedOut: false, resultJson: {}, ...(result ?? {}) };
       },
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
     });
@@ -724,6 +724,37 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       trace.disable();
       await provider.shutdown();
     }
+  });
+
+  it("masks the managed credential value but keeps model, endpoint and config-home values", async () => {
+    const f = await seed(true);
+    const homes = new Map<string, string>();
+    inspect.set(f.agentId, async input => {
+      const env = input.config.env as Record<string, string>;
+      const providerHome = env.CODEX_HOME;
+      homes.set(input.runId, providerHome);
+      const transcript = `${providerHome}/sessions/fixture.jsonl`;
+      await input.onLog("stdout", `${JSON.stringify({ type: "system", model: "issue-model", home: providerHome })}\n`);
+      await input.onLog("stdout", `transcript ${transcript} key ${env.OPENAI_API_KEY}\n`);
+      return {
+        model: "issue-model",
+        sessionParams: { transcript },
+        resultJson: { model: "issue-model", transcript, leaked: env.CODEX_API_KEY },
+      };
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const providerHome = homes.get(finished.id) ?? "";
+    expect(providerHome.length).toBeGreaterThan(8);
+    const transcript = `${providerHome}/sessions/fixture.jsonl`;
+    const content = (await heartbeat.readLog(finished.id)).content;
+    expect(content).not.toContain(f.credential);
+    const log = content.trim().split("\n").map(line => JSON.parse(line) as { stream: string; chunk: string })
+      .filter(line => line.stream === "stdout").map(line => line.chunk).join("");
+    expect(log).toContain(`${JSON.stringify({ type: "system", model: "issue-model", home: providerHome })}\n`);
+    expect(log).toContain(`transcript ${transcript} key ***REDACTED***`);
+    expect(JSON.stringify(finished)).not.toContain(f.credential);
+    expect(finished.resultJson).toMatchObject({ model: "issue-model", transcript });
   });
 
   it("cleans acquired credentials and redacts diagnostics when later skill preparation fails", async () => {

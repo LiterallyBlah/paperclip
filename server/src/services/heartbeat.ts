@@ -2761,7 +2761,7 @@ export function heartbeatService(
       if (!executionConfiguration.prepared) return;
       const {
         mergedConfig, configSnapshot, runScopedMentionedSkillKeys, githubSelection, useHostGitHub,
-        resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest,
+        resolvedConfig, configuredTaskEnvironment, secretKeys, nameOnlySecretKeys, secretManifest,
         runtimeSkillEntries, nativeRunnerPreparationSpans, agentIdentity, observability,
       } = executionConfiguration;
       let { runtimeConfig } = executionConfiguration;
@@ -3084,7 +3084,7 @@ export function heartbeatService(
       }
       // Bound secrets, managed provider/GitHub credentials and the broker token
       // are final here. Mask their values (not only their names) in run output.
-      identityRedactor.add(runSecretEnvValues(runtimeConfig.env, secretKeys));
+      identityRedactor.add(runSecretEnvValues(runtimeConfig.env, secretKeys, nameOnlySecretKeys));
       context.paperclipEnvironment = selectedEnvironment && activeEnvironmentLease ? {
         id: selectedEnvironment.id,
         name: selectedEnvironment.name,

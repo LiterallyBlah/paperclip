@@ -15,7 +15,7 @@ import { AI_CONNECTION_BUSY_RETRY_REASON, extractWakeCommentIds, isNonAssigneeWo
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "../agent-identity.js";
 import { readAiConnectionConfigurationFailure, readAiCredentialAccessFailure } from "../ai-connection-configuration-failure.js";
-import { AI_AUTH_ENV_KEYS, isAiConnectionBusy, prepareManagedAiRuntime, stripAiAuthBindings } from "../ai-connection-runtime.js";
+import { AI_AUTH_ENV_KEYS, AI_CONFIG_ENV_KEYS, isAiConnectionBusy, prepareManagedAiRuntime, stripAiAuthBindings } from "../ai-connection-runtime.js";
 import { managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import type { companySkillService } from "../company-skills.js";
 import { connectionIntentService } from "../connection-intents.js";
@@ -204,6 +204,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       trustPreset,
     }));
   onFailureSecretsResolved(() => collectRunFailureSecretValues(resolvedConfig.env, secretKeys));
+  const nameOnlySecretKeys = new Set<string>();
   if (aiBinding) {
     try {
       managedAiRuntime = await time("configuration_ai_runtime", () => prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig }));
@@ -246,6 +247,9 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     }
     Object.assign(resolvedConfig, managedAiRuntime.config);
     for (const key of AI_AUTH_ENV_KEYS) secretKeys.add(key);
+    // Managed runs set these from the connection (bindings for them are stripped
+    // or rejected above); they are configuration, so mask names but not values.
+    for (const key of AI_CONFIG_ENV_KEYS) nameOnlySecretKeys.add(key);
     context.aiConnection = { ...managedAiRuntime.attribution, accountName: managedAiRuntime.accountName, identity: managedAiRuntime.identity, sessionIdentity: managedAiRuntime.sessionIdentity };
     await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiConnection: context.aiConnection, ...(context.aiRouterTaskKey ? { aiRouterTaskKey: context.aiRouterTaskKey } : {}), ...(context.aiRouterSelection ? { aiRouterSelection: context.aiRouterSelection } : {}) })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
   }
@@ -416,7 +420,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   return {
     prepared: true as const,
     mergedConfig, configSnapshot, runScopedMentionedSkillKeys, githubSelection, useHostGitHub,
-    resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest,
+    resolvedConfig, configuredTaskEnvironment, secretKeys, nameOnlySecretKeys, secretManifest,
     runtimeSkillEntries, nativeRunnerPreparationSpans, runtimeConfig, agentIdentity, observability,
   };
 }
