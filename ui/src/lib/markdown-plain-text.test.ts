@@ -39,7 +39,7 @@ describe("markdownToPlainText", () => {
   });
 });
 
-describe("markdownToPlainText tables and plain prompts (BLA-185)", () => {
+describe("markdownToPlainText tables and plain prompts", () => {
   it("keeps plain prompts unchanged", () => {
     expect(markdownToPlainText("Which color?")).toBe("Which color?");
     expect(markdownToPlainText("Pick yes|no for snake_case")).toBe("Pick yes|no for snake_case");

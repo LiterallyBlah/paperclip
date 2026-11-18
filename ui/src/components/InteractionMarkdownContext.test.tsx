@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
 /**
- * Regression tests for decision/question context written in Markdown
- * (BLA-185). Agents put their context in `questions[].prompt`, `helpText`,
+ * Regression tests for decision/question context written in Markdown.
+ * Agents put their context in `questions[].prompt`, `helpText`,
  * option `description` and confirmation `payload.prompt`; those fields used to
  * render as plain text, so users saw raw `**`, `|---|` and backticks. All text
  * here is synthetic.
@@ -77,11 +77,11 @@ const HELP_MARKDOWN = "Pick **one**. Details in `synthetic-help-code`.";
 const OPTION_MARKDOWN = "Uses the **shared** pool.\n\n- keeps `cache-key` stable\n- [option reference](https://example.com/option)";
 const PLAIN_MULTILINE = "First plain line\nSecond plain line";
 const HOSTILE_MARKDOWN = [
-  "Before <script>window.__bla185Executed = true</script> after",
+  "Before <script>window.__markdownProbeExecuted = true</script> after",
   "",
-  '<img src="x" onerror="window.__bla185Executed = true">',
+  '<img src="x" onerror="window.__markdownProbeExecuted = true">',
   "",
-  "[script link](javascript:window.__bla185Executed=true) and [data link](data:text/html;base64,PHNjcmlwdD4=)",
+  "[script link](javascript:window.__markdownProbeExecuted=true) and [data link](data:text/html;base64,PHNjcmlwdD4=)",
 ].join("\n");
 const LONG_TABLE = [
   `| ${Array.from({ length: 12 }, (_, i) => `Column ${i + 1} with a long synthetic header`).join(" | ")} |`,
@@ -142,7 +142,7 @@ afterEach(() => {
     client.clear();
   }
   vi.clearAllMocks();
-  delete (window as { __bla185Executed?: boolean }).__bla185Executed;
+  delete (window as { __markdownProbeExecuted?: boolean }).__markdownProbeExecuted;
 });
 
 function promptElement(host: HTMLElement, interactionId: string, questionId: string) {
@@ -458,9 +458,52 @@ describe("Markdown decision context negative controls", () => {
     expect(host.querySelector("script")).toBeNull();
     expect(host.querySelector("img")).toBeNull();
     expect(host.querySelector("[onerror]")).toBeNull();
-    expect((window as { __bla185Executed?: boolean }).__bla185Executed).toBeUndefined();
+    expect((window as { __markdownProbeExecuted?: boolean }).__markdownProbeExecuted).toBeUndefined();
     const hrefs = [...host.querySelectorAll("a")].map((a) => a.getAttribute("href") ?? "");
     expect(hrefs.some((href) => /^\s*(javascript|data):/i.test(href))).toBe(false);
+  });
+
+  it("renders a long report-style prompt as separate paragraphs, list items and links, without raw HTML", () => {
+    const report = [
+      "Summary of the synthetic review. Two findings need a choice.",
+      "",
+      "The second paragraph explains the background in plain words.",
+      "1. First finding: the cache is stale.",
+      "2. Second finding: the retry count is too low.",
+      "3. Third finding: see [the review notes](https://example.com/review/notes) for detail.",
+      "",
+      "Raw markup must stay text: <script>window.__markdownProbeExecuted = true</script> <div class=\"raw-html-probe\">raw div</div> <b>raw bold</b>",
+      "",
+      "Final paragraph with the recommendation.",
+    ].join("\n");
+    const interaction = {
+      ...questionInteraction,
+      payload: {
+        ...questionInteraction.payload,
+        questions: [{ ...questionInteraction.payload.questions[0]!, prompt: report, helpText: undefined }],
+      },
+    };
+    const host = mount(<IssueThreadInteractionCard interaction={interaction} onSubmitInteractionAnswers={vi.fn()} />);
+    const prompt = promptElement(host, interaction.id, "storage");
+
+    // Numbered items are separate list elements, not one run-together line.
+    const items = [...prompt.querySelectorAll("ol > li")];
+    expect(items.map((li) => li.textContent?.trim())).toEqual([
+      "First finding: the cache is stale.",
+      "Second finding: the retry count is too low.",
+      "Third finding: see the review notes for detail.",
+    ]);
+    // Paragraphs stay separate blocks.
+    expect(prompt.querySelectorAll("p").length).toBeGreaterThanOrEqual(3);
+    // The Markdown link is an anchor with its URL, not raw `[text](url)`.
+    const link = prompt.querySelector<HTMLAnchorElement>('a[href="https://example.com/review/notes"]');
+    expect(link?.textContent).toBe("the review notes");
+    expect(prompt.textContent).not.toContain("](https://");
+    // Raw HTML creates no elements and runs nothing.
+    expect(host.querySelector("script")).toBeNull();
+    expect(host.querySelector(".raw-html-probe")).toBeNull();
+    expect(prompt.querySelector("b")).toBeNull();
+    expect((window as { __markdownProbeExecuted?: boolean }).__markdownProbeExecuted).toBeUndefined();
   });
 
   it("contains long tables and fenced code in their own scroll containers", () => {
