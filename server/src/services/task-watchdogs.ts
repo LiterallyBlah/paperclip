@@ -42,6 +42,59 @@ const TASK_WATCHDOG_TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed
 // false-positive stopped-subtree review. The periodic watchdog reconciler
 // re-evaluates after the window, so a genuinely idle issue still triggers.
 const TASK_WATCHDOG_FIRST_RUN_GRACE_MS = 15_000;
+// Native hand-offs (review-stage entry, changes-requested return,
+// resubmission, reassignment, reopen, run release) commit the issue transition
+// first and enqueue the successor wake afterwards, outside that transaction.
+// A stopped-subtree evaluation that lands in that gap - for example the
+// mutation hook in the issue routes, which runs while the route's own wake
+// dispatch is still in flight - sees no live path even though one is being
+// created. Within this window after the most recent transition of any issue in
+// the watched subtree, a would-be stopped verdict is deferred rather than
+// dispatched. The periodic watchdog reconciler re-evaluates every active
+// watchdog on its normal cadence, so a stall that persists past the window
+// still triggers exactly once (same fingerprint, same dedup and wake keys).
+//
+// The deferral is bounded per stopped condition, not per transition: updatedAt
+// is also refreshed by comments and other metadata-only touches that prove no
+// live path, so a stream of such touches must not renew the window. A
+// would-be stopped verdict may be deferred only while this process first
+// observed the same watchdog with the same stop fingerprint less than the
+// settle window ago. Once that bound has elapsed the verdict dispatches, even
+// if subtree timestamps keep moving. The worst case for a genuine stall is
+// therefore the settle window plus one reconciler interval after its first
+// observation.
+const TASK_WATCHDOG_TRANSITION_SETTLE_MS = 15_000;
+// First observation of each watchdog's current would-be stopped fingerprint.
+// Module-level so every service instance in the process (route hook and
+// periodic reconciler) shares one bound. An entry is kept while the watchdog
+// stays stopped (deferred or dispatched) and dropped as soon as an evaluation
+// yields anything else (live, pending first run, already reviewed, not
+// applicable), so a new stop after the subtree was live again gets its own
+// window. A fingerprint change (a material transition) also restarts it. Process restart
+// forgets entries, which can at most grant one more bounded window.
+const taskWatchdogSettleObservations = new Map<string, { stopFingerprint: string; firstObservedAtMs: number }>();
+const TASK_WATCHDOG_SETTLE_OBSERVATION_PRUNE_SIZE = 1_000;
+const TASK_WATCHDOG_SETTLE_OBSERVATION_MAX_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * Records the first observation of `stopFingerprint` for `watchdogId` and
+ * reports whether a settle deferral is still within its bound at `nowMs`.
+ */
+function taskWatchdogSettleDeferralWithinBound(watchdogId: string, stopFingerprint: string, nowMs: number) {
+  const existing = taskWatchdogSettleObservations.get(watchdogId);
+  if (!existing || existing.stopFingerprint !== stopFingerprint) {
+    if (taskWatchdogSettleObservations.size >= TASK_WATCHDOG_SETTLE_OBSERVATION_PRUNE_SIZE) {
+      for (const [id, entry] of taskWatchdogSettleObservations) {
+        if (nowMs - entry.firstObservedAtMs > TASK_WATCHDOG_SETTLE_OBSERVATION_MAX_AGE_MS) {
+          taskWatchdogSettleObservations.delete(id);
+        }
+      }
+    }
+    taskWatchdogSettleObservations.set(watchdogId, { stopFingerprint, firstObservedAtMs: nowMs });
+    return true;
+  }
+  return nowMs - existing.firstObservedAtMs < TASK_WATCHDOG_TRANSITION_SETTLE_MS;
+}
 
 type ActorFields = {
   agentId?: string | null;
@@ -176,6 +229,14 @@ export type TaskWatchdogClassifierResult =
     pendingIssueIds: string[];
   }
   | {
+    state: "settling";
+    reason: string;
+    includedIssueIds: string[];
+    settlingIssueIds: string[];
+    stopFingerprint: string;
+    stopSnapshot: TaskWatchdogStopSnapshot;
+  }
+  | {
     state: "already_reviewed";
     reason: string;
     includedIssueIds: string[];
@@ -214,6 +275,11 @@ export type TaskWatchdogClassifierInput = {
   // Such issues are never treated as "pending first run" — they have
   // demonstrably executed, so a stop is genuine rather than a snapshot race.
   completedRunIssueIds?: string[];
+  // When provided together with `evaluatedAt`, a stopped verdict is reported
+  // as "settling" while any included issue transitioned (updatedAt) within
+  // this many milliseconds. Only the dispatching evaluation sets it; mutation
+  // revalidation for an already-dispatched review does not. Omit to disable.
+  transitionSettleMs?: number | null;
 };
 
 type TaskWatchdogWakeupOptions = {
@@ -549,6 +615,31 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
       stopSnapshot: currentStopSnapshot,
       pendingInteractionsByIssueId,
     };
+  }
+
+  // Transition-settle guard: see TASK_WATCHDOG_TRANSITION_SETTLE_MS. Applied
+  // only to a verdict that would dispatch new watchdog work, after liveness,
+  // the first-run grace and fingerprint dedup have all been decided.
+  const settleMs = input.transitionSettleMs ?? 0;
+  if (evaluatedAtMs != null && settleMs > 0) {
+    const settlingIssueIds = included
+      .filter((issue) => {
+        const updatedAtMs = toEpochMs(issue.updatedAt);
+        return updatedAtMs != null && evaluatedAtMs - updatedAtMs < settleMs;
+      })
+      .map((issue) => issue.id)
+      .sort();
+    if (settlingIssueIds.length > 0) {
+      return {
+        state: "settling",
+        reason:
+          "An issue in the watched subtree transitioned within the hand-off settle window; deferring the stopped verdict to the next reconciler pass so an in-flight successor run/wake can become visible.",
+        includedIssueIds: includedIds,
+        settlingIssueIds,
+        stopFingerprint,
+        stopSnapshot: currentStopSnapshot,
+      };
+    }
   }
 
   return {
@@ -1521,7 +1612,24 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     }
 
     const input = await collectClassifierInput(watchdog.companyId, watchdog);
-    const classification = classifyTaskWatchdogSubtree(input);
+    let classification = classifyTaskWatchdogSubtree({
+      ...input,
+      transitionSettleMs: TASK_WATCHDOG_TRANSITION_SETTLE_MS,
+    });
+    if (classification.state === "settling") {
+      const nowMs = toEpochMs(input.evaluatedAt) ?? Date.now();
+      if (!taskWatchdogSettleDeferralWithinBound(watchdog.id, classification.stopFingerprint, nowMs)) {
+        // The same stopped condition has already been deferred for the whole
+        // settle window; recent timestamps alone may not extend it.
+        classification = classifyTaskWatchdogSubtree(input);
+      }
+    }
+    if (classification.state !== "settling" && classification.state !== "stopped") {
+      // The stopped condition is gone (live, pending first run, reviewed, not
+      // applicable). While it persists - including after it dispatched - the
+      // observation is kept, so it can never be deferred again.
+      taskWatchdogSettleObservations.delete(watchdog.id);
+    }
     if (classification.state === "pending_first_run") {
       const pending = new Set(classification.pendingIssueIds);
       for (const issue of input.issues) if (pending.has(issue.id)) {
@@ -1883,6 +1991,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         triggered: 0,
         live: 0,
         pendingFirstRun: 0,
+        settling: 0,
         alreadyReviewed: 0,
         incomplete: 0,
         incompleteIssueIds: [] as string[],
@@ -1903,6 +2012,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           result.live += 1;
         } else if (evaluated.state === "pending_first_run") {
           result.pendingFirstRun += 1;
+        } else if (evaluated.state === "settling") {
+          result.settling += 1;
         } else if (evaluated.state === "already_reviewed") {
           result.alreadyReviewed += 1;
         } else if (evaluated.state === "incomplete") {
@@ -1927,6 +2038,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         pendingFirstRun: 0,
         incomplete: 0,
         incompleteIssueIds: [] as string[],
+        settling: 0,
         skipped: 0,
         watchdogIssueIds: [] as string[],
       };
@@ -1941,6 +2053,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         } else if (evaluated.state === "incomplete") {
           result.incomplete += 1;
           result.incompleteIssueIds.push(row.issueId);
+        } else if (evaluated.state === "settling") {
+          result.settling += 1;
         } else if (
           evaluated.state === "watchdog_review_open" ||
           evaluated.state === "watchdog_live" ||

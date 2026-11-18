@@ -3260,12 +3260,11 @@ describe("issue thread interaction routes", () => {
   });
 
   it("contains task-bridge resolvers at the ordinary issue mutation boundary", async () => {
-    mockAccessDecide.mockResolvedValue({
-      allowed: false,
-      action: "issue:mutate",
-      reason: "deny_task_bridge_scope",
-      explanation: "Denied by task bridge scope.",
-    });
+    // LR-4: resolution routes check issue:read first (a non-reader gets 404).
+    // This case is about the mutation boundary, so the bridge key may read the issue.
+    mockAccessDecide.mockImplementation(async (input: { action?: string }) => input.action === "issue:mutate"
+      ? { allowed: false, action: "issue:mutate", reason: "deny_task_bridge_scope", explanation: "Denied by task bridge scope." }
+      : { allowed: true, action: input.action, reason: "allow_explicit_grant" } as never);
     const app = await createApp({
       type: "agent",
       agentId: ASSIGNEE_AGENT_ID,
