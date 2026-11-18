@@ -655,10 +655,10 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
 
   // ------------------------------------------------------------ cadence
 
-  it("cadence gap (characterisation): a card whose generation task ended without a write is not re-evaluated", async () => {
-    // Documents current behaviour for the BLA-1487 cadence report; not a fix.
-    // tickDueStatusCards only selects cards with no generatingIssueId, and the
-    // link clears only on a successful summary write or archive.
+  it("cadence: the tick releases a card whose generation task ended without a write (BLA-1691)", async () => {
+    // BLA-1487 reported this gap; BLA-1691 closes it in the existing tick. The
+    // task here ends by a direct row update, so no transition hook ran. Retry
+    // timing is covered in status-cards.test.ts.
     const fixture = await seedFixture();
     const now = new Date();
     const card = await seedCard(fixture, {
@@ -674,7 +674,11 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
     }).returning().then((rows) => rows[0]!);
     await db.update(statusCards).set({ generatingIssueId: ended.id }).where(eq(statusCards.id, card.id));
     expect(await statusCardService(db).tickDueStatusCards(now)).toMatchObject({ evaluated: 0, enqueued: [] });
-    // A manual refresh still supersedes the ended task.
+    const released = await db.select().from(statusCards).where(eq(statusCards.id, card.id)).then((rows) => rows[0]!);
+    expect(released).toMatchObject({ generatingIssueId: null, state: "error", failureReason: expect.stringContaining("cancelled") });
+    // The release carries no private payload into the visible failure reason.
+    expect(released.failureReason).not.toContain(PRIVATE_TITLE);
+    // A manual refresh still runs.
     const manual = await request(fixture.apps.member).post(`/api/status-cards/${card.id}/refresh`).send({ full: true });
     expect(manual.status).toBe(202);
   });

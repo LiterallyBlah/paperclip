@@ -28,6 +28,7 @@ import { issueReadSqlCondition } from "./authorization.js";
 import { builtInAgentService } from "./built-in-agents.js";
 import { companySearchService } from "./company-search.js";
 import { issueService } from "./issues.js";
+import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { SUMMARIZER_BUILT_IN_KEY } from "./summary-slots.js";
 import {
   buildStatusCardFingerprint,
@@ -50,6 +51,33 @@ type StatusCardRow = typeof statusCards.$inferSelect;
 type StatusCardReadOptions = { issueReadCondition?: SQL<boolean> };
 
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+// Generation tasks in these statuses make no further progress on their own
+// (the same set status-card-finalization releases on a status transition).
+const STALLED_GENERATION_ISSUE_STATUSES = ["done", "cancelled", "blocked"] as const;
+// Abandoned-generation recovery: after the Nth consecutive generation that ended
+// without a summary write, the existing tick retries once after
+// max(base, min(base * 2^(N-1), 2 h)), where base is the card's normal cadence
+// (reactive: min(debounce, 60 s); interval: intervalMinutes) but at least 60 s.
+// After more than STATUS_CARD_ABANDONED_RETRY_LIMIT in a row the card is left
+// in its visible `error` state until a manual refresh, recompile or
+// refresh-policy change. Manual-mode cards are never re-armed.
+const STATUS_CARD_ABANDONED_RETRY_LIMIT = 3;
+const STATUS_CARD_ABANDONED_BACKOFF_MIN_MS = 60 * 1000;
+const STATUS_CARD_ABANDONED_BACKOFF_CAP_MS = 2 * 60 * 60 * 1000;
+
+function isReopenableGenerationStatus(status: string) {
+  return TERMINAL_ISSUE_STATUSES.has(status) || status === "blocked";
+}
+
+function abandonedGenerationRetryAt(policy: StatusCardRow["refreshPolicy"], consecutiveAbandoned: number, abandonedAt: Date) {
+  if (consecutiveAbandoned < 1 || consecutiveAbandoned > STATUS_CARD_ABANDONED_RETRY_LIMIT) return null;
+  const cadence = nextStatusCardEvaluationAt(policy, new Date(0));
+  if (!cadence) return null;
+  const baseMs = Math.max(cadence.getTime(), STATUS_CARD_ABANDONED_BACKOFF_MIN_MS);
+  const delayMs = Math.max(baseMs, Math.min(baseMs * 2 ** (consecutiveAbandoned - 1), STATUS_CARD_ABANDONED_BACKOFF_CAP_MS));
+  return new Date(abandonedAt.getTime() + delayMs);
+}
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function promptHash(prompt: string) {
@@ -962,7 +990,10 @@ export function statusCardService(
       createdByAgentId: input.actor?.agentId ?? null,
       hiddenAt: now,
       idempotencyKey: `status-card-update:private:${card.id}:${fingerprintHash}`,
-      reopenStatuses: (status) => TERMINAL_ISSUE_STATUSES.has(status),
+      // A retry for an unchanged fingerprint deduplicates onto the earlier
+      // task. A `blocked` one is stuck (see the guard above), so it is reopened
+      // like a terminal one and gets a fresh ledger row below.
+      reopenStatuses: isReopenableGenerationStatus,
     });
     const generationIssue = await finalize(
       updateDescription({ card, generationIssueId: created.id, fingerprint, changes, kind, trigger, previousSummary, snapshot }),
@@ -993,7 +1024,7 @@ export function statusCardService(
       const winnerIssue = await db.select().from(issues).where(eq(issues.id, winner.generatingIssueId)).then((rows) => rows[0] ?? null);
       return { card: winner, generatingIssue: winnerIssue, alreadyGenerating: true, enqueued: false, kind, changes };
     }
-    if (!deduplicated || TERMINAL_ISSUE_STATUSES.has(created.status)) {
+    if (!deduplicated || isReopenableGenerationStatus(created.status)) {
       await db.insert(statusCardUpdates).values({
         cardId: card.id,
         kind,
@@ -1007,7 +1038,75 @@ export function statusCardService(
     return { card: next, generatingIssue: generationIssue!, alreadyGenerating: deduplicated, enqueued: true, kind, changes };
   }
 
+  /**
+   * Abandoned-generation recovery, run at the start of the existing tick.
+   * A generation task that reached done/cancelled/blocked without a summary
+   * write must not leave the card unchecked for ever:
+   *  1. a card still claimed by such a task (its status changed without the
+   *     issue-service transition hook) is released through the same
+   *     finalization the hook uses (state `error`, ledger row `failed`);
+   *  2. an `error` card released that way gets `nextEvalAt` re-armed with a
+   *     bounded backoff counted from the card's own update ledger, so repeated
+   *     abandonment does not regenerate on every tick and stops after a cap.
+   * No model run starts here; the normal due-card evaluation below decides
+   * whether anything changed.
+   */
+  async function recoverAbandonedGenerations(now: Date) {
+    const stalled = await db
+      .selectDistinct({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+      })
+      .from(statusCards)
+      .innerJoin(issues, and(eq(issues.id, statusCards.generatingIssueId), eq(issues.companyId, statusCards.companyId)))
+      .where(and(isNull(statusCards.archivedAt), inArray(issues.status, [...STALLED_GENERATION_ISSUE_STATUSES])));
+    for (const issue of stalled) {
+      await finalizeStatusCardsForStalledGeneration(db, issue as Parameters<typeof finalizeStatusCardsForStalledGeneration>[1]);
+    }
+
+    const parked = await db.select().from(statusCards).where(and(
+      isNull(statusCards.archivedAt),
+      isNull(statusCards.generatingIssueId),
+      isNull(statusCards.nextEvalAt),
+      eq(statusCards.state, "error"),
+      sql`jsonb_array_length(${statusCards.queries}) > 0`,
+    ));
+    let rearmed = 0;
+    for (const card of parked) {
+      if (card.refreshPolicy.mode === "manual") continue;
+      const recent = await db.select({ status: statusCardUpdates.status, finishedAt: statusCardUpdates.finishedAt })
+        .from(statusCardUpdates)
+        .where(eq(statusCardUpdates.cardId, card.id))
+        .orderBy(desc(statusCardUpdates.startedAt))
+        .limit(STATUS_CARD_ABANDONED_RETRY_LIMIT + 1);
+      let consecutiveAbandoned = 0;
+      while (consecutiveAbandoned < recent.length && recent[consecutiveAbandoned]!.status === "failed") consecutiveAbandoned += 1;
+      if (consecutiveAbandoned === 0) continue;
+      const retryAt = abandonedGenerationRetryAt(card.refreshPolicy, consecutiveAbandoned, recent[0]!.finishedAt ?? now);
+      if (!retryAt) continue;
+      const [updated] = await db.update(statusCards).set({ nextEvalAt: retryAt })
+        .where(and(
+          eq(statusCards.id, card.id),
+          isNull(statusCards.archivedAt),
+          isNull(statusCards.generatingIssueId),
+          isNull(statusCards.nextEvalAt),
+          eq(statusCards.state, "error"),
+        ))
+        .returning({ id: statusCards.id });
+      if (updated) rearmed += 1;
+    }
+    return { released: stalled.length, rearmed };
+  }
+
   async function tickDueStatusCards(now = new Date()) {
+    try {
+      await recoverAbandonedGenerations(now);
+    } catch (err) {
+      logger.warn({ err }, "status card abandoned-generation recovery failed");
+    }
     const due = await db.select().from(statusCards).where(and(isNull(statusCards.archivedAt), isNull(statusCards.generatingIssueId), isNotNull(statusCards.nextEvalAt), lte(statusCards.nextEvalAt, now)));
     const enqueued: Array<{ cardId: string; generatingIssue: typeof issues.$inferSelect }> = [];
     let evaluated = 0;
@@ -1151,7 +1250,11 @@ export function statusCardService(
         : [];
       const existingUpdate = await tx.select().from(statusCardUpdates)
         .where(eq(statusCardUpdates.generationIssueId, input.generationIssueId))
-        .then((rows) => rows.find((row) => row.kind !== "compile") ?? null);
+        // A retried generation reopens the same task, so it can own several
+        // rows: close the one still running, not an earlier failed attempt.
+        .then((rows) => rows.find((row) => row.kind !== "compile" && !row.finishedAt)
+          ?? rows.find((row) => row.kind !== "compile")
+          ?? null);
       const updateValues = {
         runId: actor.runId,
         finishedAt: now,
