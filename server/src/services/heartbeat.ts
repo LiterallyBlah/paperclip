@@ -258,7 +258,7 @@ export { buildPaperclipTaskMarkdown } from "./heartbeat/task-markdown.js";
 
 import { decisionModelService } from "./decision-models.js";
 import { TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";
-import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
+import { createAgentIdentityRedactor, runSecretEnvValues } from "./agent-identity-redaction.js";
 
 
 import {
@@ -3082,6 +3082,9 @@ export function heartbeatService(
         runtimeConfig = { ...runtimeConfig, env: githubLaunchers.env };
         secretKeys.add("PAPERCLIP_GITHUB_BROKER_TOKEN");
       }
+      // Bound secrets, managed provider/GitHub credentials and the broker token
+      // are final here. Mask their values (not only their names) in run output.
+      identityRedactor.add(runSecretEnvValues(runtimeConfig.env, secretKeys));
       context.paperclipEnvironment = selectedEnvironment && activeEnvironmentLease ? {
         id: selectedEnvironment.id,
         name: selectedEnvironment.name,

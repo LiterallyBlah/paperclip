@@ -272,6 +272,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           localAgentJwtScope,
         )
       : null;
+  // The run token reaches the adapter as PAPERCLIP_API_KEY; mask its value too.
+  identityRedactor.add([authToken]);
   if (
     nativeRuntimeResolution.kind === "legacy" &&
     adapter.supportsLocalAgentJwt &&
@@ -835,6 +837,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
           token: authToken, connectionId: "paperclip-project-tools" });
       }
+      // Per-run tool tokens can reach the adapter env or its MCP config.
+      identityRedactor.add([runtimeTools?.bearerToken, ...runtimeMcpServers.map(server => server.token)]);
       const runtimeMcp = createAdapterRuntimeMcpAccess(runtimeMcpServers);
       if (runtimeTools && runtimeToolDelivery === "invocation_context") {
         adapterContext.paperclipRuntimeTools = runtimeTools;

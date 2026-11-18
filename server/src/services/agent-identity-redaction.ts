@@ -1,6 +1,40 @@
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { redactRegisteredSecretValues } from "./run-secret-redaction.js";
 
+// Shorter values, booleans and plain numbers are too likely to occur in
+// ordinary output; masking them would corrupt logs without protecting much.
+const MIN_RUN_SECRET_VALUE_LENGTH = 8;
+
+/**
+ * Literal forms of credentials the server injects into one run (bound secret
+ * env values, run tokens). Each value is matched raw and JSON-escaped.
+ */
+export function runSecretRedactionForms(values: Iterable<unknown>): string[] {
+  const forms: string[] = [];
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed.length < MIN_RUN_SECRET_VALUE_LENGTH) continue;
+    if (/^(?:true|false)$/i.test(trimmed) || /^[-+]?\d+(?:\.\d+)?$/.test(trimmed)) continue;
+    for (const form of [value, trimmed, JSON.stringify(value).slice(1, -1), JSON.stringify(trimmed).slice(1, -1)]) {
+      if (form.length >= MIN_RUN_SECRET_VALUE_LENGTH) forms.push(form);
+    }
+  }
+  return forms;
+}
+
+/** Values of the declared secret keys present in a run's final adapter env. */
+export function runSecretEnvValues(env: unknown, secretKeys: Iterable<string>): string[] {
+  if (!env || typeof env !== "object" || Array.isArray(env)) return [];
+  const record = env as Record<string, unknown>;
+  const values: string[] = [];
+  for (const key of secretKeys) {
+    const value = record[key];
+    if (typeof value === "string") values.push(value);
+  }
+  return values;
+}
+
 /** Keep private material in memory only; do not copy it into run snapshots. */
 export function createAgentIdentityRedactor(privateKeyPem?: string) {
   const values = privateKeyPem ? [...new Set([
@@ -16,6 +50,15 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
   const redactor = {
     values,
     redact<T>(value: T): T { return redactRegisteredSecretValues(value, values); },
+    /**
+     * Register more run-scoped secret values. They stay in this in-memory list
+     * only; never copy them into run snapshots, events or the database.
+     */
+    add(extra: Iterable<unknown>) {
+      const merged = [...new Set([...values, ...runSecretRedactionForms(extra)])]
+        .sort((a, b) => b.length - a.length);
+      values.splice(0, values.length, ...merged);
+    },
     // Hold only a suffix that could begin a secret. Separate buffers prevent
     // interleaved stdout/stderr from defeating matching across output chunks.
     chunk(stream: string, chunk: string): string {
