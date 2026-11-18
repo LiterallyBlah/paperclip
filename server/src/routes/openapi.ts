@@ -2090,6 +2090,33 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/review-escalation-delegate",
+  tags: ["companies"],
+  summary: "Get the company's review escalation delegate",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/companies/{companyId}/review-escalation-delegate",
+  tags: ["companies"],
+  summary: "Set or clear the company's review escalation delegate",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(z.object({ agentId: z.string().uuid().nullable() })),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/artifacts",
   tags: ["companies"],
   summary: "List company artifacts",
@@ -4413,6 +4440,50 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/review-escalation/claim",
+  tags: ["issues"],
+  summary: "Claim an exhausted review hold as the review escalation delegate",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    404: r.notFound,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/execution/return-to-executor",
+  tags: ["issues"],
+  summary: "Return a pending execution stage to its return assignee without a decision",
+  description:
+    "Moves an in_review issue whose pending stage has a return assignee to in_progress under that assignee, with the execution state set to changes_requested. The stage, participant, round count and decision history are kept and no decision is recorded, so the next submission re-pends the same stage at the same count. Allowed for a board member with company write access (not MCP OAuth) and the company's review escalation delegate; neither may be the return assignee or the current participant. Escalation holds are refused.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(
+      z
+        .object({
+          reason: z.string().trim().min(1).max(10_000),
+          expectedStageId: z.string().uuid(),
+          expectedChangesRequestedCount: z.number().int().nonnegative().optional(),
+        })
+        .strict(),
+    ),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 

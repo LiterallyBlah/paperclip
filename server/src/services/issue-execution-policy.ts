@@ -12,7 +12,7 @@ import type {
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
-import { unprocessable } from "../errors.js";
+import { conflict, forbidden, unprocessable } from "../errors.js";
 
 type AssigneeLike = {
   assigneeAgentId?: string | null;
@@ -1596,6 +1596,138 @@ export function buildReviewEscalationClaimPatch(input: {
     stage,
     state,
     maxReviewRounds,
+  };
+}
+
+export const EXECUTION_RETURN_TO_EXECUTOR_REFUSED =
+  "This issue has no pending execution stage that can be returned to its executor";
+export const EXECUTION_RETURN_TO_EXECUTOR_STALE =
+  "The pending execution stage changed since it was read; re-read the issue and retry";
+export const EXECUTION_RETURN_TO_EXECUTOR_FORBIDDEN =
+  "Only a board member with write access or the review escalation delegate can return this stage to its executor";
+
+/** Who is asking to return the stage; the route establishes this before the call. */
+export type ExecutionReturnAuthority =
+  | { type: "board"; userId: string | null }
+  | { type: "review_escalation_delegate"; agentId: string };
+
+/**
+ * Administrative return of a pending execution stage to its return assignee,
+ * without a decision.
+ *
+ * The result is the state a request for changes leaves behind, except that no
+ * decision is recorded: the issue goes to `in_progress` under the return
+ * assignee and the execution state becomes `changes_requested`. Everything
+ * else in the state is kept as it is (stage id, index and type, participant,
+ * return assignee, completed stages, last decision id and outcome, monitor and
+ * the round count), `reviewRequest` is cleared, and the policy is not touched.
+ * A later resubmission therefore re-pends the same stage with the same
+ * participant and count through the normal changes-requested branch.
+ *
+ * Refusals change nothing:
+ * - 422 `execution_return_refused` when the issue is not `in_review` with a
+ *   pending stage of its current policy, a current participant and a return
+ *   assignee, or when the stage is an escalation hold (those keep the
+ *   review-escalation claim and decision paths);
+ * - 409 `execution_return_stale` when the stage id, or the round count when
+ *   given, differs from what the caller expected;
+ * - 403 `execution_return_forbidden` when the acting board user or review
+ *   escalation delegate is the return assignee or the current participant.
+ */
+export function buildReturnToExecutorPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy | null;
+  authority: ExecutionReturnAuthority;
+  expectedStageId: string;
+  expectedChangesRequestedCount?: number | null;
+}): {
+  patch: {
+    status: "in_progress";
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+    executionState: IssueExecutionState;
+  };
+  stage: IssueExecutionStage;
+  state: IssueExecutionState;
+  previousParticipant: IssueExecutionStagePrincipal;
+  returnAssignee: IssueExecutionStagePrincipal;
+} {
+  const refuse = (reason: string): never => {
+    throw unprocessable(EXECUTION_RETURN_TO_EXECUTOR_REFUSED, { code: "execution_return_refused", reason });
+  };
+  if (input.issue.status !== "in_review") return refuse("issue_not_in_review");
+  if (!input.policy) return refuse("no_execution_policy");
+  const state = parseIssueExecutionState(input.issue.executionState);
+  if (!state || state.status !== PENDING_STATUS) return refuse("no_pending_stage");
+  const stage = findStageById(input.policy, state.currentStageId);
+  if (!stage) return refuse("stage_not_found");
+  const previousParticipant = state.currentParticipant ?? null;
+  if (!previousParticipant) return refuse("no_current_participant");
+  const returnAssignee = state.returnAssignee ?? null;
+  if (!returnAssignee) return refuse("no_return_assignee");
+  if (
+    state.escalationHolder ||
+    isEscalationHold({ state, stage, participant: previousParticipant, policy: input.policy })
+  ) {
+    return refuse("escalation_hold");
+  }
+
+  const changesRequestedCount = state.changesRequestedCount ?? 0;
+  if (stage.id !== input.expectedStageId) {
+    throw conflict(EXECUTION_RETURN_TO_EXECUTOR_STALE, {
+      code: "execution_return_stale",
+      reason: "stage_mismatch",
+      currentStageId: stage.id,
+    });
+  }
+  if (
+    typeof input.expectedChangesRequestedCount === "number" &&
+    input.expectedChangesRequestedCount !== changesRequestedCount
+  ) {
+    throw conflict(EXECUTION_RETURN_TO_EXECUTOR_STALE, {
+      code: "execution_return_stale",
+      reason: "count_mismatch",
+      changesRequestedCount,
+    });
+  }
+
+  // Neither the implementer nor the current reviewer may use this to bounce
+  // the stage, whichever authority they act under.
+  const actingPrincipal: IssueExecutionStagePrincipal | null =
+    input.authority.type === "review_escalation_delegate"
+      ? { type: "agent", agentId: input.authority.agentId, userId: null }
+      : input.authority.userId
+        ? { type: "user", agentId: null, userId: input.authority.userId }
+        : null;
+  const actorLabel = input.authority.type === "review_escalation_delegate" ? "delegate" : "actor";
+  if (principalsEqual(actingPrincipal, returnAssignee)) {
+    throw forbidden(EXECUTION_RETURN_TO_EXECUTOR_FORBIDDEN, {
+      code: "execution_return_forbidden",
+      reason: `${actorLabel}_is_return_assignee`,
+    });
+  }
+  if (principalsEqual(actingPrincipal, previousParticipant)) {
+    throw forbidden(EXECUTION_RETURN_TO_EXECUTOR_FORBIDDEN, {
+      code: "execution_return_forbidden",
+      reason: `${actorLabel}_is_current_participant`,
+    });
+  }
+
+  const executionState: IssueExecutionState = {
+    ...state,
+    status: CHANGES_REQUESTED_STATUS,
+    reviewRequest: null,
+  };
+  return {
+    patch: {
+      status: "in_progress",
+      ...patchForPrincipal(returnAssignee),
+      executionState,
+    },
+    stage,
+    state,
+    previousParticipant,
+    returnAssignee,
   };
 }
 
