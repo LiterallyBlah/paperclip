@@ -23,12 +23,21 @@ export function runSecretRedactionForms(values: Iterable<unknown>): string[] {
   return forms;
 }
 
-/** Values of the declared secret keys present in a run's final adapter env. */
-export function runSecretEnvValues(env: unknown, secretKeys: Iterable<string>): string[] {
+/**
+ * Values of the declared secret keys present in a run's final adapter env.
+ * `nameOnlyKeys` are masked by name elsewhere but carry ordinary configuration
+ * (model, endpoint, config home), so their values are not registered.
+ */
+export function runSecretEnvValues(
+  env: unknown,
+  secretKeys: Iterable<string>,
+  nameOnlyKeys: ReadonlySet<string> = new Set(),
+): string[] {
   if (!env || typeof env !== "object" || Array.isArray(env)) return [];
   const record = env as Record<string, unknown>;
   const values: string[] = [];
   for (const key of secretKeys) {
+    if (nameOnlyKeys.has(key)) continue;
     const value = record[key];
     if (typeof value === "string") values.push(value);
   }

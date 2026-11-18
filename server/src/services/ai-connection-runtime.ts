@@ -61,6 +61,16 @@ export const AI_AUTH_ENV_KEYS = [
   "CLAUDE_CODE_USE_VERTEX",
   "CLAUDE_CODE_USE_FOUNDRY",
 ] as const;
+// Credential-bearing members of AI_AUTH_ENV_KEYS. The rest select models,
+// endpoints or config homes: their names stay masked in adapter.invoke env,
+// but their values are ordinary configuration and must not be masked in output.
+export const AI_CREDENTIAL_ENV_KEYS: ReadonlySet<string> = new Set([
+  "COPILOT_GITHUB_TOKEN", "PAPERCLIP_AI_PROVIDER_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+  "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK",
+  "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY",
+  "CODEX_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY", "GROK_API_KEY", "OPENCODE_AUTH_JSON",
+]);
+export const AI_CONFIG_ENV_KEYS: readonly string[] = AI_AUTH_ENV_KEYS.filter((key) => !AI_CREDENTIAL_ENV_KEYS.has(key));
 export function stripAiAuthBindings(env: unknown): Record<string, unknown> {
   const result = {
     ...(env && typeof env === "object" ? (env as Record<string, unknown>) : {}),
