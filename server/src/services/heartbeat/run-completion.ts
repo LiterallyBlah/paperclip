@@ -4,6 +4,7 @@ import { NON_RETRYABLE_PREFLIGHT_FAILURE_CODES, isHeartbeatRunTerminalStatus } f
 import { ChatControlRecoveryUnresolvedError } from "./queue.js";
 import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspaceGitScanCode } from "./retries.js";
 import { type RunSessionOutcome, resolveNextSessionState, normalizeUsageTotals, resolveCacheAdjustedCostUsd, resolveLedgerBiller, resolveLedgerCostStatus, normalizeLedgerBillingType } from "./run-state.js";
+import { resolveAdapterResultOutcome } from "./adapter-result-outcome.js";
 import { readGitConnectionFailure } from "../git-connection-failure.js";
 import { CONFIGURATION_INCOMPLETE_FAILURE_CODE, ConfigurationIncompleteFailure } from "./run-preparation.js";
 import { isWorkspaceValidationFailedRun, isWorkspaceValidationFailure, attachPaperclipSessionMetadataToSessionParams } from "./workspaces.js";
@@ -397,28 +398,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       outcome = latestRun.status;
     } else if (signal.aborted) {
       outcome = "cancelled";
-    } else if (adapterResult.nativeFinalization) {
-      const nativeTerminal =
-        adapterResult.nativeFinalization.terminal.runTerminalState;
-      outcome =
-        nativeTerminal === "succeeded"
-          ? "succeeded"
-          : nativeTerminal === "cancelled"
-            ? "cancelled"
-            : "failed";
-    } else if (adapterResult.timedOut) {
-      outcome = "timed_out";
-    } else if (adapterResult.resultJson?.status === "cancelled") {
-      outcome = "cancelled";
-    } else if (
-      (adapterResult.exitCode ?? 0) === 0 &&
-      !adapterResult.errorMessage &&
-      !adapterResult.signal &&
-      !processCancellation?.failed
-    ) {
-      outcome = "succeeded";
     } else {
-      outcome = "failed";
+      outcome = resolveAdapterResultOutcome(adapterResult, {
+        processCancellationFailed: Boolean(processCancellation?.failed),
+      });
     }
 
     const nextSessionState = resolveNextSessionState({
