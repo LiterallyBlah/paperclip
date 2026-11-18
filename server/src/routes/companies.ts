@@ -75,6 +75,12 @@ import {
   setReviewEscalationDelegate,
   withoutReviewEscalationDelegate,
 } from "../services/review-escalation-delegate.js";
+import {
+  preserveDecisionTriageDelegate,
+  readDecisionTriageDelegateAgentId,
+  setDecisionTriageDelegate,
+  withoutDecisionTriageDelegate,
+} from "../services/decision-triage-delegate.js";
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "./company-import-paths.js";
@@ -285,6 +291,10 @@ export interface CompanyRoutesOptions {
 
 
 const reviewEscalationDelegateBodySchema = z.object({
+  agentId: z.string().uuid().nullable(),
+}).strict();
+
+const decisionTriageDelegateBodySchema = z.object({
   agentId: z.string().uuid().nullable(),
 }).strict();
 
@@ -1280,7 +1290,12 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       body = updateCompanySchema.parse(
         rawBody.interactionResolverGovernance === undefined
           ? req.body
-          : { ...rawBody, interactionResolverGovernance: withoutReviewEscalationDelegate(rawBody.interactionResolverGovernance) },
+          : {
+              ...rawBody,
+              interactionResolverGovernance: withoutDecisionTriageDelegate(
+                withoutReviewEscalationDelegate(rawBody.interactionResolverGovernance),
+              ),
+            },
       );
     }
 
@@ -1292,8 +1307,11 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     if (body.interactionResolverGovernance && typeof body.interactionResolverGovernance === "object") {
       body = {
         ...body,
-        interactionResolverGovernance: preserveReviewEscalationDelegate(
-          body.interactionResolverGovernance as Record<string, unknown>,
+        interactionResolverGovernance: preserveDecisionTriageDelegate(
+          preserveReviewEscalationDelegate(
+            body.interactionResolverGovernance as Record<string, unknown>,
+            existingCompany.interactionResolverGovernance,
+          ),
           existingCompany.interactionResolverGovernance,
         ),
       };
@@ -1390,6 +1408,46 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       runId: actor.runId,
       agentApiKeyId: actor.agentApiKeyId,
       action: "company.review_escalation_delegate_updated",
+      entityType: "company",
+      entityId: companyId,
+      details: { agentId: result.agentId, _previous: { agentId: result.previousAgentId } },
+    });
+    res.json({ agentId: result.agentId });
+  });
+
+  // The decision-triage delegate (BLA-1616): the agent that may take the
+  // routing decisions of decision-triage gaps G1, G2, G3a, G4 and G7. Separate
+  // from the review escalation delegate. Any company member can read it; only
+  // a board actor with write access (not an agent, not MCP OAuth) can set it.
+  router.get("/:companyId/decision-triage-delegate", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const company = await svc.getById(companyId);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    res.json({ agentId: readDecisionTriageDelegateAgentId(company.interactionResolverGovernance) });
+  });
+
+  router.put("/:companyId/decision-triage-delegate", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertBoard(req);
+    if (req.actor.type === "board" && req.actor.source === "mcp_oauth") {
+      throw forbidden("Board access required");
+    }
+    assertCompanyAccess(req, companyId);
+    const body = decisionTriageDelegateBodySchema.parse(req.body);
+    const result = await setDecisionTriageDelegate(db, companyId, body.agentId);
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "company.decision_triage_delegate_updated",
       entityType: "company",
       entityId: companyId,
       details: { agentId: result.agentId, _previous: { agentId: result.previousAgentId } },
