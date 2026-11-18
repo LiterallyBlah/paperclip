@@ -29,7 +29,11 @@ import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
-import { buildExecutionStageWakeContext } from "../services/execution-stage-wake-wait.js";
+import {
+  buildExecutionStageWakeContext,
+  buildPendingStageParticipantWakeup,
+} from "../services/execution-stage-wake-wait.js";
+import { resolveReviewEscalationDelegateAgentId } from "../services/review-escalation-delegate.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
@@ -152,6 +156,8 @@ import {
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
   type IssueLockedStub,
+  type IssueBlockerAttention,
+  type IssueBlockedInboxAttention,
   type IssueReviewPolicy,
   type IssueThreadInteractionCanonicalResolverPolicy,
   type IssueComment,
@@ -230,7 +236,11 @@ import {
   isReviewPathRecoveryIdempotencyConflict,
   REVIEW_PATH_RECOVERY_INSTRUCTION,
 } from "../services/recovery/review-path-recovery.js";
-import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
+import {
+  hydrateSuccessfulRunHandoffLiveness,
+  SUCCESSFUL_RUN_HANDOFF_LIVE_RUN_STATUSES,
+  SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
+} from "../services/successful-run-handoff-state.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
   resolveTaskWatchdogMutationScope,
@@ -329,6 +339,9 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  buildReturnToExecutorPatch,
+  buildReviewEscalationClaimPatch,
+  EXECUTION_RETURN_TO_EXECUTOR_FORBIDDEN,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -528,6 +541,7 @@ function noopTaskWatchdogService(): TaskWatchdogService {
       triggered: 0,
       live: 0,
       pendingFirstRun: 0,
+      settling: 0,
       alreadyReviewed: 0,
       skipped: 0,
       watchdogIssueIds: [],
@@ -536,6 +550,7 @@ function noopTaskWatchdogService(): TaskWatchdogService {
       checked: 0,
       triggered: 0,
       pendingFirstRun: 0,
+      settling: 0,
       skipped: 0,
       watchdogIssueIds: [],
     }),
@@ -5336,6 +5351,52 @@ export function issueRoutes(
     return { id: issue.id, identifier: issue.identifier, locked: true };
   }
 
+  // blockerAttention.terminalBlocker carries the blocker's title. When the
+  // viewer cannot read that blocker, omit the summary; the ids and identifiers
+  // that remain are the same fields a locked edge stub already exposes. This is
+  // presentation only: dependency readiness and admission use the full graph.
+  function redactBlockerAttentionTerminal<A extends IssueBlockerAttention | null | undefined>(
+    attention: A,
+    readableIds: ReadonlySet<string>,
+  ): A {
+    const terminal = attention?.terminalBlocker;
+    if (!attention || !terminal || readableIds.has(terminal.id)) return attention;
+    return { ...attention, terminalBlocker: null };
+  }
+
+  // blockedInboxAttention names its source, leaf (blocker) and recovery issues
+  // with their titles. Omit each reference the viewer cannot read, as
+  // terminalBlocker above. Presentation only.
+  function blockedInboxAttentionIssueIds(attention: IssueBlockedInboxAttention | null | undefined) {
+    return [attention?.sourceIssue?.id, attention?.leafIssue?.id, attention?.recoveryIssue?.id]
+      .filter((id): id is string => Boolean(id));
+  }
+
+  function redactBlockedInboxAttention<A extends IssueBlockedInboxAttention | null | undefined>(
+    attention: A,
+    readableIds: ReadonlySet<string>,
+  ): A {
+    if (!attention) return attention;
+    if (blockedInboxAttentionIssueIds(attention).every((id) => readableIds.has(id))) return attention;
+    const visible = (ref: IssueBlockedInboxAttention["leafIssue"]) => (ref && readableIds.has(ref.id) ? ref : null);
+    return {
+      ...attention,
+      sourceIssue: visible(attention.sourceIssue),
+      leafIssue: visible(attention.leafIssue),
+      recoveryIssue: visible(attention.recoveryIssue),
+    };
+  }
+
+  async function redactBlockerAttentionForActor<A extends IssueBlockerAttention | null | undefined>(
+    req: Request,
+    companyId: string,
+    attention: A,
+  ): Promise<A> {
+    const terminalId = attention?.terminalBlocker?.id;
+    if (!terminalId) return attention;
+    return redactBlockerAttentionTerminal(attention, await readableIssueEdgeIds(req, companyId, [terminalId]));
+  }
+
   async function redactIssueRelationEdges(
     req: Request,
     companyId: string,
@@ -5389,6 +5450,8 @@ export function issueRoutes(
     id: string;
     blockedBy?: IssueRelationIssueSummary[];
     blocks?: IssueRelationIssueSummary[];
+    blockerAttention?: IssueBlockerAttention | null;
+    blockedInboxAttention?: IssueBlockedInboxAttention | null;
   }>(req: Request, companyId: string, rows: T[]): Promise<T[]> {
     const related = rows.flatMap((row) => [...(row.blockedBy ?? []), ...(row.blocks ?? [])]);
     const edgeIds = new Set<string>();
@@ -5398,6 +5461,11 @@ export function issueRoutes(
       if (edgeIds.has(issue.id)) continue;
       edgeIds.add(issue.id);
       pending.push(...(issue.terminalBlockers ?? []));
+    }
+    for (const row of rows) {
+      const terminalId = row.blockerAttention?.terminalBlocker?.id;
+      if (terminalId) edgeIds.add(terminalId);
+      for (const id of blockedInboxAttentionIssueIds(row.blockedInboxAttention)) edgeIds.add(id);
     }
     const readableIds = await readableIssueEdgeIds(req, companyId, [...edgeIds]);
     const redact = (issue: IssueRelationIssueSummary, ancestors = new Set<string>()): IssueEdgeReference => {
@@ -5416,6 +5484,8 @@ export function issueRoutes(
       ...row,
       ...(row.blockedBy ? { blockedBy: row.blockedBy.map((issue) => redact(issue)) } : {}),
       ...(row.blocks ? { blocks: row.blocks.map((issue) => redact(issue)) } : {}),
+      ...(row.blockerAttention ? { blockerAttention: redactBlockerAttentionTerminal(row.blockerAttention, readableIds) } : {}),
+      ...(row.blockedInboxAttention ? { blockedInboxAttention: redactBlockedInboxAttention(row.blockedInboxAttention, readableIds) } : {}),
     })) as T[];
   }
 
@@ -8956,6 +9026,7 @@ export function issueRoutes(
       recoveryActionsByRelationIssue,
     );
     const visibleRelations = await redactIssueRelationEdges(req, issue.companyId, relationsWithRecoveryActions);
+    const visibleBlockerAttention = await redactBlockerAttentionForActor(req, issue.companyId, blockerAttention);
     const revalidatedActiveRecoveryAction = await revalidateActiveSourceRecoveryForRead({
         issue,
         trigger: "read_projection",
@@ -8999,7 +9070,7 @@ export function issueRoutes(
         description: issue.description,
         status: issue.status,
         workMode: issue.workMode,
-        ...(blockerAttention ? { blockerAttention } : {}),
+        ...(visibleBlockerAttention ? { blockerAttention: visibleBlockerAttention } : {}),
         ...(reviewAttention ? { reviewAttention } : {}),
         scheduledRetry,
         activeRecoveryAction: revalidatedActiveRecoveryAction,
@@ -9296,11 +9367,12 @@ export function issueRoutes(
     const relationsWithRecoveryActions = withRecoveryActionsOnRelationSummaries(
       relations, recoveryActionsByRelationIssue,
     );
-    const [visibleRelations, visibleReferenceSummary, visibleProject, mentionedProjectVisibility] = await Promise.all([
+    const [visibleRelations, visibleReferenceSummary, visibleProject, mentionedProjectVisibility, visibleBlockerAttention] = await Promise.all([
       redactIssueRelationEdges(req, issue.companyId, relationsWithRecoveryActions),
       redactIssueReferenceEdges(req, issue.companyId, referenceSummary),
       visibleIssueProject(req, project),
       Promise.all(mentionedProjects.map((mentionedProject) => canActorReadProject(req, mentionedProject))),
+      redactBlockerAttentionForActor(req, issue.companyId, blockerAttention),
     ]);
     const visibleMentionedProjects = mentionedProjects.filter((_, index) => mentionedProjectVisibility[index]);
     // Recovery revalidation may change the blocker; read it afterwards.
@@ -9311,7 +9383,7 @@ export function issueRoutes(
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
       ancestors,
-      ...(blockerAttention ? { blockerAttention } : {}),
+      ...(visibleBlockerAttention ? { blockerAttention: visibleBlockerAttention } : {}),
       ...(reviewAttention ? { reviewAttention } : {}),
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
       executionBlocker,
@@ -10039,6 +10111,9 @@ export function issueRoutes(
               },
               allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
               commentBody: resolutionNote ?? null,
+              reviewEscalationDelegateAgentId: executionPolicy
+                ? await resolveReviewEscalationDelegateAgentId(tx as unknown as Db, lockedIssue.companyId)
+                : null,
             });
             Object.assign(updateFields, transition.patch);
             if (transition.decision) {
@@ -14104,6 +14179,9 @@ export function issueRoutes(
         reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
+        reviewEscalationDelegateAgentId: nextExecutionPolicy
+          ? await resolveReviewEscalationDelegateAgentId(db, existing.companyId)
+          : null,
       });
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
@@ -16151,6 +16229,329 @@ export function issueRoutes(
     res.json(released);
   });
 
+  // BLA-501: the company's review escalation delegate explicitly claims one
+  // issue's exhausted review that the cap escalation handed to a user. The
+  // claim moves only the hold (participant, escalation marker and assignee);
+  // it records no decision and leaves the stage, the round count and cap, the
+  // return assignee and the decision history unchanged. Every refusal is the
+  // hold guard's 422 with no state change.
+  router.post("/issues/:id/review-escalation/claim", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(
+      req,
+      res,
+      svc.getById(id),
+      "Issue not found",
+    );
+    if (!existing) return;
+    if (!(await assertIssueReadAllowed(req, res, existing))) return;
+    // getAccessibleResource already applied the 404 gate and assertCompanyAccess.
+    const actor = getActorInfo(req);
+
+    const { updated, claim } = await db.transaction(async (tx) => {
+      const locked = await tx
+        .select()
+        .from(issueRows)
+        .where(and(eq(issueRows.id, id), eq(issueRows.companyId, existing.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!locked) throw notFound("Issue not found");
+      const reviewEscalationDelegateAgentId =
+        await resolveReviewEscalationDelegateAgentId(tx as unknown as Db, locked.companyId);
+      const claim = buildReviewEscalationClaimPatch({
+        issue: locked,
+        policy: normalizeIssueExecutionPolicy(locked.executionPolicy ?? null),
+        actor: {
+          agentId: actor.agentId ?? null,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        reviewEscalationDelegateAgentId,
+      });
+      const updated = await svc.update(
+        id,
+        {
+          ...claim.patch,
+          executionState: claim.patch.executionState as unknown as Record<string, unknown>,
+          actorAgentId: actor.agentId ?? null,
+        },
+        tx,
+      );
+      if (!updated) throw notFound("Issue not found");
+      return { updated, claim };
+    });
+
+    await logActivity(db, {
+      companyId: updated.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "issue.review_escalation_claimed",
+      entityType: "issue",
+      entityId: updated.id,
+      details: {
+        stageId: claim.stage.id,
+        stageType: claim.stage.type,
+        changesRequestedCount: claim.state.changesRequestedCount ?? 0,
+        maxReviewRounds: claim.maxReviewRounds,
+        lastDecisionId: claim.state.lastDecisionId ?? null,
+        returnAssignee: claim.state.returnAssignee ?? null,
+        participant: claim.patch.executionState.currentParticipant,
+        _previous: {
+          participant: claim.previousParticipant,
+          assigneeAgentId: existing.assigneeAgentId,
+          assigneeUserId: existing.assigneeUserId,
+        },
+      },
+    });
+
+    const wake = buildPendingStageParticipantWakeup(updated.id, claim.patch.executionState);
+    if (wake) {
+      void heartbeat
+        .wakeup(wake.agentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: wake.reason,
+          payload: wake.payload,
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: wake.contextSnapshot,
+        })
+        .catch((err) =>
+          logger.warn({ err, issueId: updated.id }, "failed to wake review escalation delegate after claim"),
+        );
+    }
+
+    res.json(updated);
+  });
+
+  // Administrative return of a pending execution stage to its return assignee
+  // without a decision. The issue goes back to `in_progress` under the return
+  // assignee with the execution state set to `changes_requested`, keeping the
+  // stage, participant, round count and decision history, so the next
+  // submission re-pends the same stage at the same count. No decision row is
+  // written and the policy is not touched. Allowed for a board member with
+  // company write access (not MCP OAuth) and for the company's review
+  // escalation delegate when it is neither the return assignee nor the
+  // current participant. Escalation holds keep the claim and decision paths.
+  const returnToExecutorBodySchema = z
+    .object({
+      reason: z.string().trim().min(1).max(10_000),
+      expectedStageId: z.string().uuid(),
+      expectedChangesRequestedCount: z.number().int().nonnegative().optional(),
+    })
+    .strict();
+
+  router.post("/issues/:id/execution/return-to-executor", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(
+      req,
+      res,
+      svc.getById(id),
+      "Issue not found",
+    );
+    if (!existing) return;
+    if (!(await assertIssueReadAllowed(req, res, existing))) return;
+    const body = returnToExecutorBodySchema.parse(req.body);
+    const deny = (reason: string): never => {
+      throw forbidden(EXECUTION_RETURN_TO_EXECUTOR_FORBIDDEN, {
+        code: "execution_return_forbidden",
+        reason,
+      });
+    };
+
+    // getAccessibleResource already applied the 404 gate and assertCompanyAccess
+    // (which refuses viewers on writes when memberships are known).
+    if (req.actor.type === "board") {
+      if (req.actor.source === "mcp_oauth") deny("mcp_oauth_not_allowed");
+      if (req.actor.source !== "local_implicit") {
+        const userId = req.actor.userId?.trim();
+        const membership = userId
+          ? await db
+              .select({ membershipRole: companyMemberships.membershipRole })
+              .from(companyMemberships)
+              .where(
+                and(
+                  eq(companyMemberships.companyId, existing.companyId),
+                  eq(companyMemberships.principalType, "user"),
+                  eq(companyMemberships.principalId, userId),
+                  eq(companyMemberships.status, "active"),
+                ),
+              )
+              .then((rows) => rows[0] ?? null)
+          : null;
+        if (!membership?.membershipRole || membership.membershipRole === "viewer") {
+          deny("board_write_access_required");
+        }
+      }
+    } else if (req.actor.type === "agent") {
+      if (!req.actor.agentId) deny("agent_identity_required");
+    } else {
+      deny("board_or_delegate_required");
+    }
+    const actor = getActorInfo(req);
+
+    const { updated, result, comment } = await db.transaction(async (tx) => {
+      const locked = await tx
+        .select()
+        .from(issueRows)
+        .where(and(eq(issueRows.id, id), eq(issueRows.companyId, existing.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!locked) throw notFound("Issue not found");
+
+      let authority: Parameters<typeof buildReturnToExecutorPatch>[0]["authority"] = {
+        type: "board",
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      };
+      if (actor.actorType === "agent") {
+        const delegateAgentId = await resolveReviewEscalationDelegateAgentId(
+          tx as unknown as Db,
+          locked.companyId,
+        );
+        if (!delegateAgentId || delegateAgentId !== actor.agentId) {
+          deny("actor_is_not_review_escalation_delegate");
+        }
+        authority = { type: "review_escalation_delegate", agentId: delegateAgentId! };
+      }
+
+      const result = buildReturnToExecutorPatch({
+        issue: locked,
+        policy: normalizeIssueExecutionPolicy(locked.executionPolicy ?? null),
+        authority,
+        expectedStageId: body.expectedStageId,
+        expectedChangesRequestedCount: body.expectedChangesRequestedCount,
+      });
+
+      const runIds = [locked.checkoutRunId, locked.executionRunId].filter(
+        (runId): runId is string => Boolean(runId),
+      );
+      if (runIds.length > 0) {
+        const liveRun = await tx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              inArray(heartbeatRuns.id, runIds),
+              inArray(heartbeatRuns.status, [...SUCCESSFUL_RUN_HANDOFF_LIVE_RUN_STATUSES]),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        if (liveRun) {
+          throw conflict("The issue has a live checkout or execution run; wait for it to finish", {
+            code: "execution_return_live_run",
+            runId: liveRun.id,
+          });
+        }
+      }
+
+      const updated = await svc.update(
+        id,
+        {
+          ...result.patch,
+          executionState: result.patch.executionState as unknown as Record<string, unknown>,
+          actorAgentId: actor.agentId ?? null,
+          actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        tx,
+      );
+      if (!updated) throw notFound("Issue not found");
+      const comment = await svc.addComment(
+        id,
+        body.reason,
+        {
+          agentId: actor.agentId ?? undefined,
+          userId: actor.actorType === "user" ? actor.actorId : undefined,
+          runId: actor.runId,
+          onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
+        },
+        { sourceTrust: await sourceTrustForActorWrite(locked, actor) },
+        tx as unknown as Db,
+      );
+      return { updated, result, comment };
+    });
+
+    try {
+      await issueReferencesSvc.syncComment(comment.id);
+      await externalObjectsSvc.syncCommentSafely(comment.id);
+    } catch (err) {
+      logger.warn({ err, issueId: updated.id, commentId: comment.id }, "failed to sync return-to-executor comment");
+    }
+
+    const changesRequestedCount = result.state.changesRequestedCount ?? 0;
+    await logActivity(db, {
+      companyId: updated.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "issue.execution_returned_to_executor",
+      entityType: "issue",
+      entityId: updated.id,
+      details: {
+        stageId: result.stage.id,
+        stageType: result.stage.type,
+        changesRequestedCount,
+        lastDecisionId: result.state.lastDecisionId ?? null,
+        previousParticipant: result.previousParticipant,
+        returnAssignee: result.returnAssignee,
+        reason: body.reason,
+        commentId: comment.id,
+        _previous: {
+          status: existing.status,
+          assigneeAgentId: existing.assigneeAgentId,
+          assigneeUserId: existing.assigneeUserId,
+        },
+      },
+    });
+
+    let wakeQueued = false;
+    const stageWake = buildExecutionStageWakeup({
+      issueId: updated.id,
+      previousState: result.state,
+      nextState: result.patch.executionState,
+      interruptedRunId: null,
+      requestedByActorType: actor.actorType,
+      requestedByActorId: actor.actorId,
+    });
+    if (stageWake) {
+      const idempotencyKey = `execution-return-to-executor:${updated.id}:${result.stage.id}:${changesRequestedCount}`;
+      try {
+        // One live wake per issue, stage and count: a wake with this key that
+        // is still queued is reused instead of enqueuing a duplicate.
+        const pendingWake = await db
+          .select({ id: agentWakeupRequests.id })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, updated.companyId),
+              eq(agentWakeupRequests.agentId, stageWake.agentId),
+              eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+              inArray(agentWakeupRequests.status, [...SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES]),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        const wake = pendingWake ?? await heartbeat.wakeup(stageWake.agentId, {
+          ...stageWake.wakeup,
+          payload: { ...stageWake.wakeup.payload, commentId: comment.id },
+          contextSnapshot: {
+            ...stageWake.wakeup.contextSnapshot,
+            commentId: comment.id,
+            wakeCommentId: comment.id,
+          },
+          idempotencyKey,
+        });
+        wakeQueued = wake !== null;
+      } catch (err) {
+        logger.warn({ err, issueId: updated.id }, "failed to wake return assignee after return to executor");
+      }
+    }
+
+    res.json({ issue: updated, commentId: comment.id, wakeQueued });
+  });
+
   router.post("/issues/:id/admin/force-release", async (req, res) => {
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Board access required" });
@@ -16965,6 +17366,9 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
+      // LR-4/LR-5: deny non-readers with the same 404 as GET /issues/:id before any
+      // resolver-policy or addressee check, so no existence signal leaks.
+      if (!(await assertIssueReadAllowed(req, res, issue))) return;
       const authorizedResolution =
         await getIssueThreadInteractionResolutionAuthorization(
           req,
@@ -17292,6 +17696,9 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
+      // LR-4/LR-5: deny non-readers with the same 404 as GET /issues/:id before any
+      // resolver-policy or addressee check, so no existence signal leaks.
+      if (!(await assertIssueReadAllowed(req, res, issue))) return;
       const authorizedResolution =
         await getIssueThreadInteractionResolutionAuthorization(
           req,
@@ -17402,6 +17809,9 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
+      // LR-4/LR-5: deny non-readers with the same 404 as GET /issues/:id before any
+      // resolver-policy or addressee check, so no existence signal leaks.
+      if (!(await assertIssueReadAllowed(req, res, issue))) return;
       const authorizedResolution =
         await getIssueThreadInteractionResolutionAuthorization(
           req,
@@ -17709,6 +18119,9 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
+      // LR-4/LR-5: deny non-readers with the same 404 as GET /issues/:id before any
+      // resolver-policy or addressee check, so no existence signal leaks.
+      if (!(await assertIssueReadAllowed(req, res, issue))) return;
       if (req.actor.type === "agent") {
         res.status(403).json({
           error:

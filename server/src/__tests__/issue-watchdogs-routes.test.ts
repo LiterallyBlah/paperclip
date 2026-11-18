@@ -188,6 +188,9 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       // window) so attaching a watchdog evaluates immediately instead of being
       // deferred by the pending-first-run guard.
       createdAt: overrides.createdAt ?? new Date(Date.now() - 60 * 60 * 1000),
+      // Likewise default to a settled issue (last transition before the
+      // hand-off settle window) so the transition-settle guard does not defer.
+      updatedAt: overrides.updatedAt ?? new Date(Date.now() - 60 * 60 * 1000),
     });
     return id;
   }

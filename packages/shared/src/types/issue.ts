@@ -783,6 +783,12 @@ export interface IssueExecutionState {
   monitor?: IssueExecutionMonitorState | null;
   /** Consecutive agent-initiated changes-requested rounds on the current stage. */
   changesRequestedCount?: number;
+  /**
+   * Set only when the review cap escalated the pending stage to this principal.
+   * It marks a genuine escalation hold, independent of stage membership, and is
+   * dropped by any transition that leaves the escalation.
+   */
+  escalationHolder?: IssueExecutionStagePrincipal | null;
 }
 
 export interface IssueExecutionDecision {

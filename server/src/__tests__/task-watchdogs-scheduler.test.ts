@@ -111,7 +111,10 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       originKind: overrides.originKind,
       originId: overrides.originId,
       originFingerprint: overrides.originFingerprint,
-      updatedAt: overrides.updatedAt,
+      // Default to a settled issue (last transition before the hand-off settle
+      // window) so the transition-settle guard does not defer it. Tests
+      // exercising the hand-off race pass an explicit recent `updatedAt`.
+      updatedAt: overrides.updatedAt ?? new Date(Date.now() - 60 * 60 * 1000),
       // Default to an "established" issue (created well before the first-run
       // grace window) so the pending-first-run guard does not defer it. Tests
       // exercising the create-race pass an explicit recent `createdAt`.
@@ -474,7 +477,9 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     await db
       .update(issues)
-      .set({ status: "blocked", updatedAt: new Date(Date.now() + 60_000) })
+      // A later stopped state whose transition has already settled (outside
+      // the hand-off settle window, still newer than the seeded default).
+      .set({ status: "blocked", updatedAt: new Date(Date.now() - 60_000) })
       .where(eq(issues.id, childId));
     const retriggered = await service.reconcileTaskWatchdogs({ companyId });
 
@@ -561,7 +566,9 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     await db
       .update(issues)
-      .set({ status: "blocked", updatedAt: new Date(Date.now() + 60_000) })
+      // A later stopped state whose transition has already settled (outside
+      // the hand-off settle window, still newer than the seeded default).
+      .set({ status: "blocked", updatedAt: new Date(Date.now() - 60_000) })
       .where(eq(issues.id, childId));
     const changedWhileReviewLive = await service.reconcileTaskWatchdogs({ companyId });
     expect(changedWhileReviewLive).toMatchObject({ checked: 1, triggered: 0, live: 1 });
