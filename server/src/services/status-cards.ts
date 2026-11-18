@@ -181,6 +181,25 @@ ${JSON.stringify(payload, null, 2)}
 \`\`\``;
 }
 
+/**
+ * Generation tasks are created with this neutral body and receive their real
+ * payload only in the same update that makes them private, so the task never
+ * holds private data while it is still open to the company.
+ */
+const GENERATION_PLACEHOLDER_DESCRIPTION = "Status-card generation task. The task body is written when the task is made private.";
+
+/**
+ * N2: when the watched-issue visibility read fails, a scoped viewer is treated
+ * as redacted. Trusted internal callers (no read condition) are unaffected.
+ */
+function isSummaryRedacted(
+  visibility: { privacyRedacted: boolean } | undefined,
+  options: StatusCardReadOptions,
+) {
+  if (!options.issueReadCondition) return false;
+  return visibility?.privacyRedacted ?? true;
+}
+
 function parseGenerationPayload(description: string | null) {
   const match = description?.match(/```json\n([\s\S]*?)\n```/);
   if (!match) return null;
@@ -285,11 +304,13 @@ export function statusCardService(
       ...card,
       fingerprint: issueRefs.fingerprint,
       mentionedIssueIds: issueRefs.mentionedIssueIds,
-      summaryBody: watchedIssues?.privacyRedacted ? null : document?.latestBody ?? null,
-      ...(watchedIssues === undefined ? {} : {
-        watchedIssueCount: watchedIssues.count,
-        privacyRedacted: watchedIssues.privacyRedacted,
-      }),
+      summaryBody: isSummaryRedacted(watchedIssues, options) ? null : document?.latestBody ?? null,
+      ...(watchedIssues === undefined
+        ? (options.issueReadCondition ? { privacyRedacted: true } : {})
+        : {
+          watchedIssueCount: watchedIssues.count,
+          privacyRedacted: watchedIssues.privacyRedacted,
+        }),
       todayTokens: today.tokens,
       todayCostCents: today.costCents,
     };
@@ -436,10 +457,11 @@ export function statusCardService(
       readWatchedIssueVisibility(card, options),
       readableIssueIds(card.companyId, rows.flatMap((row) => (row.changes ?? []).map((change) => change.issueId)), options),
     ]);
+    const redacted = isSummaryRedacted(visibility, options);
     return rows.map((row) => ({
       ...row,
-      changes: (row.changes ?? []).filter((change) => readable?.has(change.issueId) ?? true),
-      changeSummary: visibility?.privacyRedacted ? null : row.changeSummary,
+      changes: (row.changes ?? []).filter((change) => readable?.has(change.issueId) ?? false),
+      changeSummary: redacted ? null : row.changeSummary,
     }));
   }
 
@@ -462,7 +484,7 @@ export function statusCardService(
     // watched issue sees neither revision bodies nor their change summaries
     // (the Summarizer writes the same text into the update ledger).
     const visibility = await readWatchedIssueVisibility(card, options);
-    if (!visibility?.privacyRedacted) return revisions;
+    if (!isSummaryRedacted(visibility, options)) return revisions;
     return revisions.map((revision) => ({ ...revision, body: null, changeSummary: null }));
   }
 
@@ -500,6 +522,59 @@ export function statusCardService(
     return builtIn.agentId;
   }
 
+  /**
+   * R1: a generation task holds Summarizer-scoped issue titles, the previous
+   * summary and the Summarizer's own run output, so only its assignee may read
+   * it. `issuesSvc.create` files a new private task without a project under a
+   * responsible user's personal private project, which would make that user a
+   * reader (and fails outright on the scheduler path, which has no user). So
+   * the task is created with a neutral placeholder body and no creating user
+   * (a creating user is an implicit private reader), then `finalize` makes it
+   * private in the same update that writes the real payload. The private-task
+   * predicate then admits only the assignee (and its assignment grant).
+   */
+  async function createGenerationIssue(
+    card: StatusCardRow,
+    input: {
+      title: string;
+      assigneeAgentId: string;
+      createdByAgentId: string | null;
+      hiddenAt: Date;
+      idempotencyKey: string;
+      reopenStatuses: (status: string) => boolean;
+    },
+  ) {
+    let deduplicated = false;
+    const created = await issuesSvc().create(card.companyId, {
+      title: input.title,
+      description: GENERATION_PLACEHOLDER_DESCRIPTION,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: input.assigneeAgentId,
+      createdByAgentId: input.createdByAgentId,
+      createdByUserId: null,
+      hiddenAt: input.hiddenAt,
+      idempotencyKey: input.idempotencyKey,
+      onDeduplicated: (reason) => {
+        deduplicated = reason === "idempotency_key";
+      },
+    });
+    const reopen = deduplicated && input.reopenStatuses(created.status);
+    return {
+      created,
+      deduplicated,
+      finalize: async (description: string) => {
+        const updated = await issuesSvc().update(created.id, {
+          ...(reopen ? { status: "todo", assigneeAgentId: input.assigneeAgentId } : {}),
+          visibility: "private",
+          description,
+        });
+        if (!updated) throw notFound("Status-card generation task not found");
+        return updated;
+      },
+    };
+  }
+
   async function requestCompile(cardId: string, actor: StatusCardActor) {
     const card = await getById(cardId);
     if (!card) throw notFound("Status card not found");
@@ -519,31 +594,21 @@ export function statusCardService(
       }
     }
 
-    let deduplicated = false;
     const createdAt = new Date();
-    const created = await issuesSvc().create(card.companyId, {
-      title: `Compile status card: ${card.title ?? card.interestPrompt.slice(0, 80)}`,
-      description: compileDescription(card, null, hash),
-      status: "todo",
-      priority: "medium",
-      assigneeAgentId: summarizerAgentId,
-      createdByAgentId: actor.agentId,
-      createdByUserId: actor.userId,
-      hiddenAt: createdAt,
-      idempotencyKey: `status-card-compile:${card.id}:${hash}`,
-      onDeduplicated: (reason) => {
-        deduplicated = reason === "idempotency_key";
-      },
-    });
     // Re-open a superseded setup task so the Summarizer picks it back up. This
     // covers idempotency-key hits that resolve to a terminal task (done/cancelled)
     // as well as a `blocked` one that a manual re-kick is reviving.
-    const reopened = deduplicated && (TERMINAL_ISSUE_STATUSES.has(created.status) || created.status === "blocked")
-      ? await issuesSvc().update(created.id, { status: "todo", assigneeAgentId: summarizerAgentId })
-      : created;
-    const generationIssue = await issuesSvc().update(reopened!.id, {
-      description: compileDescription(card, reopened!.id, hash),
+    // The `private` key segment keeps new tasks from deduplicating onto
+    // historical open generation tasks, whose creating user could read them.
+    const { created, deduplicated, finalize } = await createGenerationIssue(card, {
+      title: `Compile status card: ${card.title ?? card.interestPrompt.slice(0, 80)}`,
+      assigneeAgentId: summarizerAgentId,
+      createdByAgentId: actor.agentId,
+      hiddenAt: createdAt,
+      idempotencyKey: `status-card-compile:private:${card.id}:${hash}`,
+      reopenStatuses: (status) => TERMINAL_ISSUE_STATUSES.has(status) || status === "blocked",
     });
+    const generationIssue = await finalize(compileDescription(card, created.id, hash));
     const [nextCard] = await mutate(card.companyId, tx => tx
       .update(statusCards)
       .set({ generatingIssueId: generationIssue!.id, state: "compiling", failureReason: null, updatedAt: createdAt })
@@ -912,29 +977,23 @@ export function statusCardService(
       ? await db.select().from(documents).where(eq(documents.id, card.documentId)).then((rows) => rows[0]?.latestBody ?? null)
       : null;
     const fingerprintHash = statusCardFingerprintHash(fingerprint);
-    let deduplicated = false;
-    const created = await issuesSvc().create(card.companyId, {
+    const { created, deduplicated, finalize } = await createGenerationIssue(card, {
       title: `${kind === "full" ? "Rebuild" : "Update"} status card: ${card.title ?? card.interestPrompt.slice(0, 80)}`,
-      description: updateDescription({ card, generationIssueId: null, fingerprint, changes, kind, trigger, previousSummary, snapshot }),
-      status: "todo",
-      priority: "medium",
       assigneeAgentId: summarizerAgentId,
       createdByAgentId: input.actor?.agentId ?? null,
-      createdByUserId: input.actor?.userId ?? null,
       hiddenAt: now,
       // Claim ownership is revision-scoped too. A superseded refresh may cancel
       // its unclaimed task; it must not share that task with a newer revision
       // which has the same watched fingerprint but has not claimed the card yet.
       // Concurrent refreshes of this revision still deduplicate normally.
-      idempotencyKey: `status-card-update:${card.id}:${revision}:${fingerprintHash}`,
-      onDeduplicated: (reason) => { deduplicated = reason === "idempotency_key"; },
+      // The `private` key segment keeps new tasks from deduplicating onto
+      // historical open generation tasks, whose creating user could read them.
+      idempotencyKey: `status-card-update:private:${card.id}:${revision}:${fingerprintHash}`,
+      reopenStatuses: (status) => TERMINAL_ISSUE_STATUSES.has(status),
     });
-    const reopened = deduplicated && TERMINAL_ISSUE_STATUSES.has(created.status)
-      ? await issuesSvc().update(created.id, { status: "todo", assigneeAgentId: summarizerAgentId })
-      : created;
-    const generationIssue = await issuesSvc().update(reopened!.id, {
-      description: updateDescription({ card, generationIssueId: reopened!.id, fingerprint, changes, kind, trigger, previousSummary, snapshot }),
-    });
+    const generationIssue = await finalize(
+      updateDescription({ card, generationIssueId: created.id, fingerprint, changes, kind, trigger, previousSummary, snapshot }),
+    );
     const priorGenerationPredicate = card.generatingIssueId
       ? eq(statusCards.generatingIssueId, card.generatingIssueId)
       : isNull(statusCards.generatingIssueId);

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Router, type Request } from "express";
 import { companies, type Db } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
@@ -21,6 +22,29 @@ import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAcc
 function publicCard<T extends { nextEvalReason?: unknown }>(card: T) {
   const { nextEvalReason: _reason, ...result } = card;
   return result;
+}
+
+/**
+ * R2: `status_card` activity rows are readable company-wide, so Summarizer
+ * text (change summaries, compiled queries) is logged only as length + hash.
+ */
+function textDigest(value: string) {
+  return { length: value.length, sha256: createHash("sha256").update(value).digest("hex") };
+}
+
+/**
+ * R1: the generation task is private to the Summarizer. Mutation responses
+ * carry only a reference to it, never its description or other payload.
+ */
+function generationIssueRef(issue: { id: string; identifier: string | null; title: string; status: string; assigneeAgentId: string | null } | null) {
+  if (!issue) return null;
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    status: issue.status,
+    assigneeAgentId: issue.assigneeAgentId,
+  };
 }
 
 export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWakeupDeps } = {}) {
@@ -91,18 +115,24 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
    * Mutation responses carry the card row and, for refresh, the computed
    * change list. Both pass through the caller's read scope like GET does.
    */
-  async function scopeMutationResult<T extends { card: Parameters<typeof service.hydrate>[0]; changes?: Array<{ issueId: string }> }>(
+  async function scopeMutationResult<T extends {
+    card: Parameters<typeof service.hydrate>[0];
+    generatingIssue: Parameters<typeof generationIssueRef>[0];
+    changes?: Array<{ issueId: string }>;
+  }>(
     req: Request,
     result: T,
   ) {
     const scope = await viewerScope(req);
     const card = await service.hydrate(result.card, scope);
-    if (!result.changes) return { ...result, card };
+    const generatingIssue = generationIssueRef(result.generatingIssue);
+    if (!result.changes) return { ...result, card, generatingIssue };
     const readable = await service.readableIssueIds(result.card.companyId, result.changes.map((change) => change.issueId), scope);
     return {
       ...result,
       card,
-      changes: result.changes.filter((change) => readable?.has(change.issueId) ?? true),
+      generatingIssue,
+      changes: result.changes.filter((change) => readable?.has(change.issueId) ?? false),
     };
   }
 
@@ -335,7 +365,9 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
     await logMutation(req, card.companyId, "status_card.query_written", card.id, {
       queryVersion: updated.queryVersion,
       generationIssueId: req.body.generationIssueId,
-      changeSummary: req.body.changeSummary,
+      queryCount: req.body.queries.length,
+      queries: textDigest(JSON.stringify(req.body.queries)),
+      changeSummary: textDigest(req.body.changeSummary),
     });
     res.json(publicCard(updated));
   });
@@ -355,7 +387,7 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
       queryVersion: result.card.queryVersion,
       generationIssueId: req.body.generationIssueId,
       documentId: result.document.id,
-      changeSummary: req.body.changeSummary,
+      changeSummary: textDigest(req.body.changeSummary),
     });
     res.json({ ...result, card: publicCard(result.card) });
   });
