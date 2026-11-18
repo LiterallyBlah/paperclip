@@ -342,6 +342,8 @@ import {
   buildReturnToExecutorPatch,
   buildReviewEscalationClaimPatch,
   EXECUTION_RETURN_TO_EXECUTOR_FORBIDDEN,
+  EXECUTION_STAGE_PARTICIPANT_REQUIRED,
+  liveStageParticipantRemoval,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -5629,6 +5631,44 @@ export function issueRoutes(
       resource: { type: "issue", companyId, assigneeAgentId },
     });
     return decision.allowed;
+  }
+
+  /**
+   * BLA-1616 Part A. While an execution stage is live, an executionPolicy edit
+   * that clears the policy, removes the current stage or drops its current
+   * participant is allowed only for the board (not MCP OAuth), the current
+   * participant themself, or, for an agent participant, an agent with the
+   * active-checkout management override on that participant. Everyone else
+   * gets 403 `execution_stage_participant_required` before anything changes.
+   */
+  async function assertLiveStageParticipantEditAllowed(
+    req: Request,
+    existing: { companyId: string } & Parameters<typeof liveStageParticipantRemoval>[0]["issue"],
+    nextPolicy: NormalizedExecutionPolicy | null,
+  ) {
+    const removal = liveStageParticipantRemoval({
+      issue: existing,
+      previousPolicy: normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),
+      nextPolicy,
+    });
+    if (!removal) return;
+    const { participant } = removal;
+    if (req.actor.type === "board") {
+      if (req.actor.source !== "mcp_oauth") return;
+      if (participant.type === "user" && participant.userId && req.actor.userId === participant.userId) return;
+    } else if (req.actor.type === "agent" && req.actor.agentId) {
+      if (participant.type === "agent" && participant.agentId) {
+        if (req.actor.agentId === participant.agentId) return;
+        if (await hasActiveCheckoutManagementOverride(req.actor.agentId, existing.companyId, participant.agentId)) {
+          return;
+        }
+      }
+    }
+    throw forbidden(EXECUTION_STAGE_PARTICIPANT_REQUIRED, {
+      code: "execution_stage_participant_required",
+      reason: removal.reason,
+      stageId: removal.stageId,
+    });
   }
 
   async function assertAgentIssueMutationAllowed(
@@ -13947,6 +13987,13 @@ export function issueRoutes(
         if (recoveryRestrictedSourceMutationRequested) {
           await requireRecoverySourceMutationAuthority(req, existing);
         }
+      }
+      if (req.body.executionPolicy !== undefined) {
+        await assertLiveStageParticipantEditAllowed(
+          req,
+          existing,
+          normalizeIssueExecutionPolicy(req.body.executionPolicy),
+        );
       }
       if (
         resumeRequested !== true &&

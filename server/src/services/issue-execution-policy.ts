@@ -1675,3 +1675,51 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
 export function applyIssueMonitorPolicyTransition(input: TransitionInput): TransitionResult {
   return { patch: applyMonitorTransition(input, {}) };
 }
+
+export const EXECUTION_STAGE_PARTICIPANT_REQUIRED =
+  "Only the current stage participant, a manager of that participant agent, or the board can remove or replace a live execution stage";
+
+export type LiveStageParticipantRemoval = {
+  /** Which kind of edit would dissolve or re-route the live stage. */
+  reason: "policy_cleared" | "stage_removed" | "participant_removed";
+  stageId: string;
+  participant: IssueExecutionStagePrincipal;
+};
+
+/**
+ * Whether replacing `previousPolicy` with `nextPolicy` would take a live
+ * execution stage away from its current participant (BLA-1616 Part A).
+ *
+ * A stage is live while the execution state is `pending` or
+ * `changes_requested` and its stored stage id resolves in the previous policy.
+ * The edit removes it when it:
+ * - clears the policy (`executionPolicy: null`),
+ * - replaces the policy so that the stage id no longer resolves, or
+ * - keeps the stage but drops the current participant from its participants.
+ *
+ * Edits that keep the stage and its participant (monitor-only changes sent with
+ * the full policy, added later stages, extra participants) return null. A
+ * review-cap escalation holder is not a configured participant, so only the
+ * first two cases apply to a hold; the hold's own rules are unchanged.
+ * The caller decides who may make the edit.
+ */
+export function liveStageParticipantRemoval(input: {
+  issue: IssueLike;
+  previousPolicy: IssueExecutionPolicy | null;
+  nextPolicy: IssueExecutionPolicy | null;
+}): LiveStageParticipantRemoval | null {
+  const state = parseIssueExecutionState(input.issue.executionState);
+  if (!state || (state.status !== PENDING_STATUS && state.status !== CHANGES_REQUESTED_STATUS)) return null;
+  const participant = state.currentParticipant ?? null;
+  if (!state.currentStageId || !participant || !input.previousPolicy) return null;
+  const previousStage = findStageById(input.previousPolicy, state.currentStageId);
+  if (!previousStage) return null;
+  const base = { stageId: state.currentStageId, participant };
+  if (!input.nextPolicy) return { ...base, reason: "policy_cleared" };
+  const nextStage = findStageById(input.nextPolicy, state.currentStageId);
+  if (!nextStage) return { ...base, reason: "stage_removed" };
+  if (stageHasParticipant(previousStage, participant) && !stageHasParticipant(nextStage, participant)) {
+    return { ...base, reason: "participant_removed" };
+  }
+  return null;
+}
