@@ -7,6 +7,7 @@ import { MarkdownBody } from "@/components/MarkdownBody";
 import { Button } from "@/components/ui/button";
 import { CircleHelp, ChevronRight } from "lucide-react";
 import { shouldHideInteractionCard } from "@/lib/issue-thread-interactions";
+import { markdownToPlainText } from "@/lib/markdown-plain-text";
 import { TaskChatCompactInteractionCard } from "./TaskChatCompactInteractionCard";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
 import type { TaskChatInteractionItem } from "./task-chat-model";
@@ -48,7 +49,9 @@ export function TaskChatInteractionCard({
 }: TaskChatInteractionCardProps) {
   const interaction = item.interaction;
   if (presentation === "timeline" && showUnansweredQuestion && !shouldHideInteractionCard(interaction) && interaction.kind === "ask_user_questions" && interaction.status === "pending") {
-    const prompt = interaction.payload.questionSet?.questions[0]?.prompt ?? interaction.payload.questions[0]?.prompt ?? interaction.title ?? "Question";
+    const rawPrompt = interaction.payload.questionSet?.questions[0]?.prompt ?? interaction.payload.questions[0]?.prompt ?? interaction.title ?? "Question";
+    // Prompts often carry Markdown context; this row is a button and cannot render it.
+    const prompt = markdownToPlainText(rawPrompt) || "Question";
     return (
       <button
         type="button"
@@ -102,7 +105,7 @@ export function TaskChatInteractionCard({
           onClick={() => onReviewRequest?.(interaction.id)}
           className="group flex w-full items-center gap-2 rounded-sm px-1 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
           <CircleHelp aria-hidden className="h-3.5 w-3.5 shrink-0" />
-          <span className="min-w-0 flex-1"><span className="block text-xs">{label}</span><span className="block truncate">{interaction.summary ?? ("prompt" in interaction.payload ? interaction.payload.prompt : null)}</span></span>
+          <span className="min-w-0 flex-1"><span className="block text-xs">{label}</span><span className="block truncate">{interaction.summary ?? ("prompt" in interaction.payload && interaction.payload.prompt ? markdownToPlainText(interaction.payload.prompt) : null)}</span></span>
           <ChevronRight aria-hidden className="h-3 w-3 shrink-0" />
         </button>
       </div>
