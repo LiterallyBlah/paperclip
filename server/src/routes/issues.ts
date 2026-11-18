@@ -236,7 +236,11 @@ import {
   isReviewPathRecoveryIdempotencyConflict,
   REVIEW_PATH_RECOVERY_INSTRUCTION,
 } from "../services/recovery/review-path-recovery.js";
-import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
+import {
+  hydrateSuccessfulRunHandoffLiveness,
+  SUCCESSFUL_RUN_HANDOFF_LIVE_RUN_STATUSES,
+  SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
+} from "../services/successful-run-handoff-state.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
   resolveTaskWatchdogMutationScope,
@@ -335,7 +339,9 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  buildReturnToExecutorPatch,
   buildReviewEscalationClaimPatch,
+  EXECUTION_RETURN_TO_EXECUTOR_FORBIDDEN,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -16239,7 +16245,7 @@ export function issueRoutes(
     );
     if (!existing) return;
     if (!(await assertIssueReadAllowed(req, res, existing))) return;
-    assertCompanyAccess(req, existing.companyId);
+    // getAccessibleResource already applied the 404 gate and assertCompanyAccess.
     const actor = getActorInfo(req);
 
     const { updated, claim } = await db.transaction(async (tx) => {
@@ -16318,6 +16324,232 @@ export function issueRoutes(
     }
 
     res.json(updated);
+  });
+
+  // Administrative return of a pending execution stage to its return assignee
+  // without a decision. The issue goes back to `in_progress` under the return
+  // assignee with the execution state set to `changes_requested`, keeping the
+  // stage, participant, round count and decision history, so the next
+  // submission re-pends the same stage at the same count. No decision row is
+  // written and the policy is not touched. Allowed for a board member with
+  // company write access (not MCP OAuth) and for the company's review
+  // escalation delegate when it is neither the return assignee nor the
+  // current participant. Escalation holds keep the claim and decision paths.
+  const returnToExecutorBodySchema = z
+    .object({
+      reason: z.string().trim().min(1).max(10_000),
+      expectedStageId: z.string().uuid(),
+      expectedChangesRequestedCount: z.number().int().nonnegative().optional(),
+    })
+    .strict();
+
+  router.post("/issues/:id/execution/return-to-executor", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(
+      req,
+      res,
+      svc.getById(id),
+      "Issue not found",
+    );
+    if (!existing) return;
+    if (!(await assertIssueReadAllowed(req, res, existing))) return;
+    const body = returnToExecutorBodySchema.parse(req.body);
+    const deny = (reason: string): never => {
+      throw forbidden(EXECUTION_RETURN_TO_EXECUTOR_FORBIDDEN, {
+        code: "execution_return_forbidden",
+        reason,
+      });
+    };
+
+    // getAccessibleResource already applied the 404 gate and assertCompanyAccess
+    // (which refuses viewers on writes when memberships are known).
+    if (req.actor.type === "board") {
+      if (req.actor.source === "mcp_oauth") deny("mcp_oauth_not_allowed");
+      if (req.actor.source !== "local_implicit") {
+        const userId = req.actor.userId?.trim();
+        const membership = userId
+          ? await db
+              .select({ membershipRole: companyMemberships.membershipRole })
+              .from(companyMemberships)
+              .where(
+                and(
+                  eq(companyMemberships.companyId, existing.companyId),
+                  eq(companyMemberships.principalType, "user"),
+                  eq(companyMemberships.principalId, userId),
+                  eq(companyMemberships.status, "active"),
+                ),
+              )
+              .then((rows) => rows[0] ?? null)
+          : null;
+        if (!membership?.membershipRole || membership.membershipRole === "viewer") {
+          deny("board_write_access_required");
+        }
+      }
+    } else if (req.actor.type === "agent") {
+      if (!req.actor.agentId) deny("agent_identity_required");
+    } else {
+      deny("board_or_delegate_required");
+    }
+    const actor = getActorInfo(req);
+
+    const { updated, result, comment } = await db.transaction(async (tx) => {
+      const locked = await tx
+        .select()
+        .from(issueRows)
+        .where(and(eq(issueRows.id, id), eq(issueRows.companyId, existing.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!locked) throw notFound("Issue not found");
+
+      let authority: Parameters<typeof buildReturnToExecutorPatch>[0]["authority"] = {
+        type: "board",
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      };
+      if (actor.actorType === "agent") {
+        const delegateAgentId = await resolveReviewEscalationDelegateAgentId(
+          tx as unknown as Db,
+          locked.companyId,
+        );
+        if (!delegateAgentId || delegateAgentId !== actor.agentId) {
+          deny("actor_is_not_review_escalation_delegate");
+        }
+        authority = { type: "review_escalation_delegate", agentId: delegateAgentId! };
+      }
+
+      const result = buildReturnToExecutorPatch({
+        issue: locked,
+        policy: normalizeIssueExecutionPolicy(locked.executionPolicy ?? null),
+        authority,
+        expectedStageId: body.expectedStageId,
+        expectedChangesRequestedCount: body.expectedChangesRequestedCount,
+      });
+
+      const runIds = [locked.checkoutRunId, locked.executionRunId].filter(
+        (runId): runId is string => Boolean(runId),
+      );
+      if (runIds.length > 0) {
+        const liveRun = await tx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              inArray(heartbeatRuns.id, runIds),
+              inArray(heartbeatRuns.status, [...SUCCESSFUL_RUN_HANDOFF_LIVE_RUN_STATUSES]),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        if (liveRun) {
+          throw conflict("The issue has a live checkout or execution run; wait for it to finish", {
+            code: "execution_return_live_run",
+            runId: liveRun.id,
+          });
+        }
+      }
+
+      const updated = await svc.update(
+        id,
+        {
+          ...result.patch,
+          executionState: result.patch.executionState as unknown as Record<string, unknown>,
+          actorAgentId: actor.agentId ?? null,
+          actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        tx,
+      );
+      if (!updated) throw notFound("Issue not found");
+      const comment = await svc.addComment(
+        id,
+        body.reason,
+        {
+          agentId: actor.agentId ?? undefined,
+          userId: actor.actorType === "user" ? actor.actorId : undefined,
+          runId: actor.runId,
+          onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
+        },
+        { sourceTrust: await sourceTrustForActorWrite(locked, actor) },
+        tx as unknown as Db,
+      );
+      return { updated, result, comment };
+    });
+
+    try {
+      await issueReferencesSvc.syncComment(comment.id);
+      await externalObjectsSvc.syncCommentSafely(comment.id);
+    } catch (err) {
+      logger.warn({ err, issueId: updated.id, commentId: comment.id }, "failed to sync return-to-executor comment");
+    }
+
+    const changesRequestedCount = result.state.changesRequestedCount ?? 0;
+    await logActivity(db, {
+      companyId: updated.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "issue.execution_returned_to_executor",
+      entityType: "issue",
+      entityId: updated.id,
+      details: {
+        stageId: result.stage.id,
+        stageType: result.stage.type,
+        changesRequestedCount,
+        lastDecisionId: result.state.lastDecisionId ?? null,
+        previousParticipant: result.previousParticipant,
+        returnAssignee: result.returnAssignee,
+        reason: body.reason,
+        commentId: comment.id,
+        _previous: {
+          status: existing.status,
+          assigneeAgentId: existing.assigneeAgentId,
+          assigneeUserId: existing.assigneeUserId,
+        },
+      },
+    });
+
+    let wakeQueued = false;
+    const stageWake = buildExecutionStageWakeup({
+      issueId: updated.id,
+      previousState: result.state,
+      nextState: result.patch.executionState,
+      interruptedRunId: null,
+      requestedByActorType: actor.actorType,
+      requestedByActorId: actor.actorId,
+    });
+    if (stageWake) {
+      const idempotencyKey = `execution-return-to-executor:${updated.id}:${result.stage.id}:${changesRequestedCount}`;
+      try {
+        // One live wake per issue, stage and count: a wake with this key that
+        // is still queued is reused instead of enqueuing a duplicate.
+        const pendingWake = await db
+          .select({ id: agentWakeupRequests.id })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, updated.companyId),
+              eq(agentWakeupRequests.agentId, stageWake.agentId),
+              eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+              inArray(agentWakeupRequests.status, [...SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES]),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        const wake = pendingWake ?? await heartbeat.wakeup(stageWake.agentId, {
+          ...stageWake.wakeup,
+          payload: { ...stageWake.wakeup.payload, commentId: comment.id },
+          contextSnapshot: {
+            ...stageWake.wakeup.contextSnapshot,
+            commentId: comment.id,
+            wakeCommentId: comment.id,
+          },
+          idempotencyKey,
+        });
+        wakeQueued = wake !== null;
+      } catch (err) {
+        logger.warn({ err, issueId: updated.id }, "failed to wake return assignee after return to executor");
+      }
+    }
+
+    res.json({ issue: updated, commentId: comment.id, wakeQueued });
   });
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {
