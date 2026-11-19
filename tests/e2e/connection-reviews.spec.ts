@@ -2,6 +2,12 @@ import { expect, test, type APIRequestContext } from "@playwright/test";
 import { readFile, writeFile } from "node:fs/promises";
 import { startReviewProvider } from "../fixtures/connection-review-provider";
 
+// Fork difference (live LR-2 + Slice H, tool-content-guards.ts): a read-risk tool's
+// result is persisted without content, even after an approved review, so the
+// agent's continuation sees the size marker instead of the fixture page titles.
+// Upstream asserts the page title "Roadmap" here.
+const READ_RESULT_TEXT = "[content omitted:";
+
 type Json = Record<string, unknown>;
 type Seed = { companyId: string; prefix: string };
 type Agent = { id: string; name: string };
@@ -298,7 +304,7 @@ for (const journey of [
             ? "Review declined"
             : journey === "failure"
               ? "Read failed"
-              : "Roadmap",
+              : READ_RESULT_TEXT,
         );
       const replies = await json<Array<{ id: string; body: string; authorAgentId: string | null; createdByRunId: string | null }>>(await request.get(`/api/issues/${issue.id}/comments`));
       const reply = replies.find(comment => comment.authorAgentId === agent.id)!;
@@ -333,7 +339,7 @@ for (const journey of [
       const persistedReply = page.locator(`[id=${JSON.stringify(`comment-${reply.id}`)}]`);
       await expect(persistedReply).toBeVisible();
       await expect(persistedReply).toContainText(
-        journey === "decline" ? "Review declined" : journey === "failure" ? "Read failed" : "Roadmap",
+        journey === "decline" ? "Review declined" : journey === "failure" ? "Read failed" : READ_RESULT_TEXT,
       );
       await expect(page.getByTestId("task-chat-history-content")).toBeVisible({
         timeout: 30_000,
@@ -364,7 +370,7 @@ for (const journey of [
                 .join("\n"),
             { timeout: 45_000 },
           )
-          .toContain("Roadmap");
+          .toContain(READ_RESULT_TEXT);
         expect(calls()).toBe(2);
         expect(
           await json<unknown[]>(
