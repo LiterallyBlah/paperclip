@@ -21,7 +21,7 @@ import { getSecretProvider } from "../secrets/provider-registry.js";
 import { agentService } from "./agents.js";
 import { logActivity } from "./activity-log.js";
 import { publishInteractionCreatedPluginEvent } from "./plugin-decision-events.js";
-import { normalizeSecretKey, secretService } from "./secrets.js";
+import { assertNotRedactedPlaceholderSecretValue, normalizeSecretKey, secretService } from "./secrets.js";
 
 const CONFIG_PATH_RE = /^(?:env\.[A-Za-z_][A-Za-z0-9_]*|access\.[A-Za-z_][A-Za-z0-9_]*)$/;
 const SECRET_NAME_RE = /^[^/\s]+(?:\/[^/\s]+)*$/;
@@ -335,6 +335,7 @@ export function createSecretProposalsService(db: Db) {
     if (!SECRET_NAME_RE.test(name)) throw unprocessable("Secret name must be a slash-separated path without empty segments");
     if (!justification) throw unprocessable("Justification is required");
     if (!input.value) throw unprocessable("Secret value is required");
+    assertNotRedactedPlaceholderSecretValue(input.value);
     if (Buffer.byteLength(input.value, "utf8") > MAX_SECRET_VALUE_BYTES) {
       throw unprocessable(`Secret value must be at most ${MAX_SECRET_VALUE_BYTES} bytes`);
     }
@@ -586,6 +587,9 @@ export function createSecretProposalsService(db: Db) {
       material: proposal.valueCiphertext,
       externalRef: null,
     });
+    // A proposal stored before submission-time rejection existed may still
+    // hold the placeholder; never materialise it into a company secret.
+    assertNotRedactedPlaceholderSecretValue(value);
     const secrets = secretService(txDb);
     const providerConfigId = input.overrides?.providerConfigId ?? null;
     const providerConfig = providerConfigId

@@ -405,6 +405,14 @@ const SECRET_TEXT_HINTS = [
 ] as const;
 export const REDACTED_EVENT_VALUE = "***REDACTED***";
 
+/**
+ * True when `value` is exactly the read-side display placeholder (after
+ * trimming surrounding whitespace). Values that merely contain it are real.
+ */
+export function isRedactedPlaceholderValue(value: unknown): boolean {
+  return typeof value === "string" && value.trim() === REDACTED_EVENT_VALUE;
+}
+
 function maybeContainsSecretText(input: string) {
   const lower = input.toLowerCase();
   return (

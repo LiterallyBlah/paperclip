@@ -301,4 +301,15 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await other.service.read(other.scope)).toEqual({ runtime: "other agent connection" });
     expect(await secretService(db).getByName(companyId, "runtime")).toMatchObject({ id: companySecret.id });
   });
+
+  it("rejects the redacted display placeholder without storing or rotating anything", async () => {
+    const f = await fixture();
+    await expect(f.service.apply(f.request, pluginId, { runtime: "***REDACTED***" })).rejects.toThrow("Invalid agent instance secret changes");
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.ownerAgentId, f.agent.id))).toEqual([]);
+    await f.service.apply(f.request, pluginId, { runtime });
+    await expect(f.service.apply(f.request, pluginId, { runtime: " ***REDACTED*** " })).rejects.toThrow("Invalid agent instance secret changes");
+    const [stored] = await db.select().from(companySecrets).where(eq(companySecrets.ownerAgentId, f.agent.id));
+    expect(stored.latestVersion).toBe(1);
+    expect(await f.service.read(f.scope)).toEqual({ runtime });
+  });
 });

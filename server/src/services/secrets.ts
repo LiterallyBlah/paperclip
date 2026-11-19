@@ -48,6 +48,7 @@ import {
   updateSecretProviderConfigSchema,
 } from "@paperclipai/shared";
 import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { isRedactedPlaceholderValue } from "../redaction.js";
 import { logger } from "../middleware/logger.js";
 import {
   checkSecretProviders,
@@ -99,7 +100,23 @@ export const SANDBOX_CLEANUP_CONSUMER_ID = "environment-sandbox-cleanup";
 export const DEVICE_LOGIN_SECRET_CHECK_CONSUMER_ID = "device-login-secret-check";
 const SENSITIVE_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
-const REDACTED_SENTINEL = "***REDACTED***";
+/** Stable error code for a secret write whose value is the read-side display mask. */
+export const SECRET_VALUE_REDACTED_PLACEHOLDER_CODE = "secret_value_redacted_placeholder";
+
+/**
+ * Reads redact plain values to `REDACTED_EVENT_VALUE`. That placeholder is
+ * never a real secret value, so every secret value create/rotate rejects it
+ * before any row, version or binding is written. The message never echoes the
+ * submitted value.
+ */
+export function assertNotRedactedPlaceholderSecretValue(value: unknown): void {
+  if (isRedactedPlaceholderValue(value)) {
+    throw unprocessable(
+      "Secret value is the redacted display placeholder; enter the real value",
+      { code: SECRET_VALUE_REDACTED_PLACEHOLDER_CODE },
+    );
+  }
+}
 const COMING_SOON_SECRET_PROVIDERS: ReadonlySet<SecretProvider> = new Set([
   "gcp_secret_manager",
   "vault",
@@ -1934,7 +1951,7 @@ export function secretService(db: Db | DbTransaction) {
             `Strict secret mode requires secret references for sensitive key: ${key}`,
           );
         }
-        if (binding.value === REDACTED_SENTINEL) {
+        if (isRedactedPlaceholderValue(binding.value)) {
           throw unprocessable(`Refusing to persist redacted placeholder for key: ${key}`);
         }
         normalized[key] = binding;
@@ -2033,8 +2050,10 @@ export function secretService(db: Db | DbTransaction) {
     }
     const value = binding.value.trim();
     if (!value) return undefined;
-    if (value === REDACTED_SENTINEL) {
-      throw unprocessable(`Refusing to persist redacted placeholder for key: ${input.key}`);
+    if (isRedactedPlaceholderValue(value)) {
+      throw unprocessable(`Refusing to persist redacted placeholder for key: ${input.key}`, {
+        code: SECRET_VALUE_REDACTED_PLACEHOLDER_CODE,
+      });
     }
     const id = randomUUID();
     const adapterPart = normalizeSecretKey(input.adapterType ?? "adapter");
@@ -2085,6 +2104,7 @@ export function secretService(db: Db | DbTransaction) {
     },
     actor?: { userId?: string | null; agentId?: string | null },
   ) {
+    assertNotRedactedPlaceholderSecretValue(input.value);
     const existing = await getByName(companyId, input.name);
     if (existing) throw conflict(`Secret already exists: ${input.name}`);
     const key = normalizeSecretKey(input.key);
@@ -2214,6 +2234,7 @@ export function secretService(db: Db | DbTransaction) {
     actor?: { userId?: string | null; agentId?: string | null },
     instanceOwner?: InstanceSecretOwner,
   ) {
+    assertNotRedactedPlaceholderSecretValue(input.value);
     const existing = instanceOwner ? null : await getByName(companyId, input.name);
     if (existing) throw conflict(`Secret already exists: ${input.name}`);
     const key = normalizeSecretKey(input.key ?? input.name);
@@ -2435,6 +2456,7 @@ export function secretService(db: Db | DbTransaction) {
     },
     actor?: { userId?: string | null; agentId?: string | null },
   ) {
+    assertNotRedactedPlaceholderSecretValue(input.value);
     const secret = await getById(secretId);
     if (!secret) throw notFound("Secret not found");
     if (secret.status !== "active") throw unprocessable("Cannot rotate a non-active secret");
@@ -3020,6 +3042,7 @@ export function secretService(db: Db | DbTransaction) {
     },
     actor?: { userId?: string | null; agentId?: string | null },
   ) {
+    assertNotRedactedPlaceholderSecretValue(input.value);
     const definition = await resolveUserSecretDefinition(companyId, input);
     if (definition.status !== "active") {
       throw unprocessable("User secret definition is not active");
