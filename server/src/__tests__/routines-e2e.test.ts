@@ -163,11 +163,12 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     vi.doUnmock("../middleware/index.js");
     registerRoutineServiceMock();
     vi.doMock("../services/index.js", async () => {
-      const [{ accessService }, { documentAnnotationService }, { logActivity }, { routineService }] = await Promise.all([
+      const [{ accessService }, { documentAnnotationService }, { logActivity }, { routineService }, { folderService }] = await Promise.all([
         import("../services/access.js"), import("../services/document-annotations.js"),
         import("../services/activity-log.js"), import("../services/routines.js"),
+        import("../services/folders.js"),
       ]);
-      return { accessService, documentAnnotationService, logActivity, routineService };
+      return { accessService, documentAnnotationService, logActivity, routineService, folderService };
     });
     vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
     vi.clearAllMocks();

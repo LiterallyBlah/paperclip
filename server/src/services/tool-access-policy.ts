@@ -1264,6 +1264,35 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
     return { profiles: activeProfiles, entries };
   }
 
+  /**
+   * True when the connection's access was finished as "specific agents" (its
+   * managed `app:<connectionId>` profile is bound to agents only, or has no
+   * bindings and records `agentAccess: "specific_agents"`) and this agent is
+   * not one of them. The connection's profile is then not in this agent's
+   * effective set, so the connection-profile guard below does not see it; the
+   * connection must still stay closed to the agent even when it holds the
+   * default unscoped `tools:use` grant. (Live overlay privacy-a660b752.)
+   */
+  async function connectionRestrictedToOtherAgents(ctx: ToolAccessContext, cache?: ToolAccessDecisionCache): Promise<boolean> {
+    if (ctx.actorType !== "agent" || !ctx.agentId || !ctx.connectionId) return false;
+    const connectionId = ctx.connectionId;
+    const [profile] = await cachedRead(cache, `connection-app-profile:${ctx.companyId}:${connectionId}`, async () =>
+      db.select({ id: toolProfiles.id, metadata: toolProfiles.metadata }).from(toolProfiles).where(and(
+        eq(toolProfiles.companyId, ctx.companyId),
+        eq(toolProfiles.profileKey, `app:${connectionId}`),
+      )).limit(1));
+    if (!profile) return false;
+    const bindings = (await cachedRead(cache, `profile-bindings:${ctx.companyId}`, async () =>
+      db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, ctx.companyId))))
+      .filter((binding) => binding.profileId === profile.id);
+    if (bindings.some((binding) => binding.targetType !== "agent")) return false;
+    if (bindings.some((binding) => binding.targetId === ctx.agentId)) return false;
+    if (bindings.length > 0) return true;
+    // No bindings: restricted only when finish recorded "specific agents"
+    // (an empty selection, or the last listed agent removed later).
+    return isRecord(profile.metadata) && profile.metadata.agentAccess === "specific_agents";
+  }
+
   async function explicitGrant(ctx: ToolAccessContext, cache?: ToolAccessDecisionCache, options: { toolTargetedOnly?: boolean } = {}): Promise<boolean> {
     const principalType = ctx.actorType === "agent" ? "agent" : ctx.actorType === "user" ? "user" : null;
     const principalId = ctx.actorType === "agent" ? ctx.agentId : ctx.actorId;
@@ -1680,7 +1709,7 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
       profileState.profiles.some((profile) => isConnectionAccessProfile(profile, ctx.connectionId))
       || profileState.entries.some((entry) => entry.connectionId === ctx.connectionId || profileEntryMatches(entry, ctx))
     );
-    if (await explicitGrant(ctx, cache, { toolTargetedOnly: governedByConnectionProfile })) {
+    if (await explicitGrant(ctx, cache, { toolTargetedOnly: governedByConnectionProfile || await connectionRestrictedToOtherAgents(ctx, cache) })) {
       return decision("allow", "allow_explicit_grant", "Tool access allowed by explicit grant.", effectiveProfileIds, [], { redactionPlan: redaction.redactionPlan });
     }
 
