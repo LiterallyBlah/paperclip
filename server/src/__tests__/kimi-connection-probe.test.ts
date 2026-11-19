@@ -24,7 +24,9 @@ vi.mock("node:child_process", async importOriginal => {
     spawn: (file: string, args: string[], options: Parameters<typeof actual.spawn>[2]) => {
       if (file !== "ssh") return actual.spawn(file, args, options);
       mocks.wire.push({ file, args, stdin: true });
-      return actual.spawn(process.execPath, ["-e", 'process.stdout.write(require("node:fs").readFileSync(0,"utf8"))'], options);
+      // Fork SSH transport (5c88ea00c): stdin carries one private launch frame and stays open; emulate the
+      // remote launcher by reading that frame and delivering its command stdin, instead of waiting for EOF.
+      return actual.spawn(process.execPath, ["-e", 'let b="";process.stdin.on("data",c=>{b+=c;const i=b.indexOf("\\n");if(i<0)return;process.stdout.write(JSON.parse(b.slice(0,i)).stdin);process.exit(0);});'], options);
     },
   };
 });
