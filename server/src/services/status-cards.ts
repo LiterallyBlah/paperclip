@@ -1189,7 +1189,8 @@ export function statusCardService(
       .innerJoin(issues, and(eq(issues.id, statusCards.generatingIssueId), eq(issues.companyId, statusCards.companyId)))
       .where(and(isNull(statusCards.archivedAt), inArray(issues.status, [...STALLED_GENERATION_ISSUE_STATUSES])));
     for (const issue of stalled) {
-      await finalizeStatusCardsForStalledGeneration(db, issue as Parameters<typeof finalizeStatusCardsForStalledGeneration>[1]);
+      // v2026.1117.0 registers the evaluation work signal inside a transaction.
+      await db.transaction(tx => finalizeStatusCardsForStalledGeneration(tx, issue as Parameters<typeof finalizeStatusCardsForStalledGeneration>[1]));
     }
 
     const parked = await db.select().from(statusCards).where(and(
@@ -1212,7 +1213,7 @@ export function statusCardService(
       if (consecutiveAbandoned === 0) continue;
       const retryAt = abandonedGenerationRetryAt(card.refreshPolicy, consecutiveAbandoned, recent[0]!.finishedAt ?? now);
       if (!retryAt) continue;
-      const [updated] = await db.update(statusCards).set({ nextEvalAt: retryAt })
+      const [updated] = await mutate(card.companyId, tx => tx.update(statusCards).set({ nextEvalAt: retryAt })
         .where(and(
           eq(statusCards.id, card.id),
           isNull(statusCards.archivedAt),
@@ -1220,7 +1221,7 @@ export function statusCardService(
           isNull(statusCards.nextEvalAt),
           eq(statusCards.state, "error"),
         ))
-        .returning({ id: statusCards.id });
+        .returning({ id: statusCards.id }));
       if (updated) rearmed += 1;
     }
     return { released: stalled.length, rearmed };
