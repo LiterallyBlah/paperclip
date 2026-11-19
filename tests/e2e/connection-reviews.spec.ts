@@ -316,7 +316,9 @@ for (const journey of [
         await expect(page.getByRole("button", { name: "Show result details" })).toBeVisible();
         await expect(page.locator("pre")).not.toBeVisible();
         await page.getByRole("button", { name: "Show result details" }).click();
-        await expect(page.locator("pre")).toContainText('"content":');
+        // LR-2: the stored read-risk result is the content-omitted marker, not the raw payload.
+        await expect(page.locator("pre")).toContainText(READ_RESULT_TEXT);
+        await expect(page.locator("pre")).not.toContainText('"content":');
         await page.getByRole("button", { name: "Hide result details" }).click();
       }
       expect(calls()).toBe(journey === "decline" ? 0 : 1);
