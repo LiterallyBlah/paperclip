@@ -7,6 +7,7 @@ import {
   type IssueCommentPresentation,
   type RunLivenessState,
 } from "@paperclipai/shared";
+import { isStandingEventInboxQuietWait } from "./standing-event-inbox.js";
 import { withRecoveryContext } from "./status-only-context.js";
 import {
   agentLinkRow,
@@ -90,7 +91,7 @@ type IssueRow = Pick<
   | "assigneeUserId"
   | "executionState"
   | "originKind"
->;
+> & Partial<Pick<typeof issues.$inferSelect, "executionPolicy">>;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 type NoticeIssue = Pick<typeof issues.$inferSelect, "id" | "identifier" | "title" | "status">;
 type NoticeRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "status" | "agentId">;
@@ -515,6 +516,9 @@ export function decideSuccessfulRunHandoff(input: {
   if (issue.executionState) return { kind: "skip", reason: "issue has execution policy state" };
   if (isPluginManagedIssueLifecycle(issue)) {
     return { kind: "skip", reason: "issue lifecycle is owned by a plugin" };
+  }
+  if (isStandingEventInboxQuietWait(issue, run)) {
+    return { kind: "skip", reason: "standing event inbox waits for delivered events" };
   }
   if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };

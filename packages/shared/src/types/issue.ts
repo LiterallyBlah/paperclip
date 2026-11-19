@@ -801,6 +801,13 @@ export interface IssueExecutionPolicy {
    * default. Human decisions reset the round counter.
    */
   maxReviewRounds?: number | null;
+  /**
+   * Explicit per-issue opt-in: this `todo`/`in_progress` issue is a standing
+   * event inbox. Its owner is woken by delivered comments, so a quiet
+   * successful run is a valid non-executing wait rather than a missing
+   * disposition. Failed runs still recover normally.
+   */
+  standingEventInbox?: boolean;
 }
 
 export interface IssueExecutionMonitorMaintenanceWait {

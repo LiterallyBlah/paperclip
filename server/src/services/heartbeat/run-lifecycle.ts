@@ -1606,7 +1606,9 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
           title: issues.title,
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
           executionState: issues.executionState,
+          executionPolicy: issues.executionPolicy,
           projectId: issues.projectId,
         })
         .from(issues)
@@ -1823,6 +1825,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         assigneeAgentId: issues.assigneeAgentId,
         assigneeUserId: issues.assigneeUserId,
         executionState: issues.executionState,
+        executionPolicy: issues.executionPolicy,
         monitorNextCheckAt: issues.monitorNextCheckAt,
         projectId: issues.projectId,
         originKind: issues.originKind,

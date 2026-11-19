@@ -474,6 +474,7 @@ export const issueExecutionPolicySchema = z.object({
     .optional()
     .nullable()
     .default(null),
+  standingEventInbox: z.boolean().optional(),
 });
 
 export const issueExecutionMonitorStateSchema = z.object({

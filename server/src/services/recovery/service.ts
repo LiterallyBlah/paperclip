@@ -174,6 +174,10 @@ import {
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
 import {
+  STANDING_EVENT_INBOX_DURABLE_REASON,
+  isStandingEventInboxQuietWait,
+} from "./standing-event-inbox.js";
+import {
   SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON,
   sandboxProviderPluginRemedy,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
@@ -1479,6 +1483,7 @@ export function recoveryService(
     if (issue.monitorNextCheckAt) return true;
     if (issue.status === "in_review" && latestRun?.status === "succeeded" &&
       (await listExternalReviewWaits(db, issue.companyId, [issue.id])).length > 0) return true;
+    if (latestRun?.status === "succeeded" && isStandingEventInboxQuietWait(issue, latestRun)) return true;
     if (issue.status === "in_progress" && latestRun?.status === "succeeded" && latestRun.agentId === issue.assigneeAgentId &&
       await hasCommittedNativePlanWait(db, { companyId: issue.companyId, issueId: issue.id, runId: latestRun.id, agentId: latestRun.agentId })) return true;
     if (
@@ -3190,6 +3195,23 @@ export function recoveryService(
     });
   }
 
+  /**
+   * A standing event inbox waits for delivered comments. A quiet run on it is
+   * a valid non-executing wait, so any open or exhausted disposition repair is
+   * settled here (owner-independent, no board step) instead of retried.
+   */
+  async function settleStandingEventInboxDispositionRepair(
+    issue: typeof issues.$inferSelect,
+    latestRun: LatestIssueRun | typeof heartbeatRuns.$inferSelect | null,
+  ) {
+    if (!isStandingEventInboxQuietWait(issue, latestRun)) return false;
+    await resolveDispositionRepairActionAsCovered(
+      issue,
+      `durable_path_restored:${STANDING_EVENT_INBOX_DURABLE_REASON}`,
+    );
+    return true;
+  }
+
   async function ensureDispositionRepairAction(input: {
     issue: RecoveryIssue;
     latestRun: LatestIssueRun;
@@ -3599,6 +3621,18 @@ export function recoveryService(
         continue;
       }
 
+      if (
+        action.kind === "deliberate_wait_without_target" &&
+        (await settleStandingEventInboxDispositionRepair(
+          issue,
+          await getLatestIssueRun(issue.companyId, issue.id),
+        ))
+      ) {
+        result.resolved += 1;
+        result.issueIds.push(issue.id);
+        continue;
+      }
+
       const wakePolicy = parseObject(action.wakePolicy);
       const wakePolicyType = readNonEmptyString(wakePolicy.type);
       if (
@@ -3964,6 +3998,8 @@ export function recoveryService(
     // The next sweep after release evaluates the issue again normally.
     if (await isAutomaticRecoverySuppressedByPauseHold(db, current.companyId, current.id, treeControlSvc))
       return "skipped";
+    if (await settleStandingEventInboxDispositionRepair(current, latestRun))
+      return "covered";
 
     const episode = options.legacyEpisode ?? (
       parseObject(parseObject(latestRun?.contextSnapshot).legacyDispositionEpisode).id && latestRun

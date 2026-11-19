@@ -4,6 +4,7 @@ import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai
 import type { RunLivenessState } from "@paperclipai/shared";
 import { withRecoveryContext } from "./status-only-context.js";
 import { RECOVERY_REASON_KINDS } from "./origins.js";
+import { isStandingEventInboxQuietWait } from "./standing-event-inbox.js";
 
 export const RUN_LIVENESS_CONTINUATION_REASON = RECOVERY_REASON_KINDS.runLivenessContinuation;
 export const DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS = 2;
@@ -19,7 +20,7 @@ type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = Pick<
   typeof issues.$inferSelect,
   "id" | "companyId" | "identifier" | "title" | "status" | "assigneeAgentId" | "executionState" | "projectId"
->;
+> & Partial<Pick<typeof issues.$inferSelect, "executionPolicy" | "assigneeUserId">>;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 
 export type RunContinuationDecision =
@@ -121,6 +122,9 @@ export function decideRunLivenessContinuation(input: {
   }
   if (issue.executionState) {
     return { kind: "skip", reason: "issue is blocked by execution policy state" };
+  }
+  if (isStandingEventInboxQuietWait(issue, run)) {
+    return { kind: "skip", reason: "standing event inbox waits for delivered events" };
   }
   if (!CONTINUATION_AGENT_STATUSES.has(agent.status)) {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };

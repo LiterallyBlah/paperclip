@@ -3995,4 +3995,80 @@ describe("issue comment reopen routes", () => {
       ),
     );
   });
+
+  describe("standing event inbox delivery", () => {
+    const inboxPolicy = { mode: "normal", commentRequired: true, stages: [], standingEventInbox: true };
+    const notifierAgentId = "33333333-3333-4333-8333-333333333333";
+    const ownerAgentId = "22222222-2222-4222-8222-222222222222";
+
+    function arrangeInbox(status: "todo" | "in_progress", authorAgentId: string) {
+      const issue = { ...makeIssue(status), executionPolicy: inboxPolicy };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(
+        async (_id: string, patch: Record<string, unknown>) => makeIssueUpdateReceipt(issue, patch),
+      );
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-1",
+        issueId: issue.id,
+        companyId: "company-1",
+        body: "Completion notice delivered.",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId,
+        authorUserId: null,
+      });
+      mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: input.action !== "tasks:manage_active_checkouts",
+        action: input.action,
+        reason: input.action === "issue:comment" ? "allow_visible_issue_write" : "allow_explicit_grant",
+        explanation: "Allowed by the shared visible-issue write rule.",
+      }));
+      return issue;
+    }
+
+    it.each(["todo", "in_progress"] as const)(
+      "wakes the unchanged %s inbox owner exactly once for a non-assignee delivery comment",
+      async (status) => {
+        const issue = arrangeInbox(status, notifierAgentId);
+        const res = await request(
+          await installActor(createApp(), { ...agentActor(notifierAgentId), runId: "77777777-7777-4777-8777-777777777777" }),
+        )
+          .post(`/api/issues/${issue.id}/comments`)
+          .send({ body: "Completion notice delivered." });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+        await waitForWakeup(() =>
+          expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+            ownerAgentId,
+            expect.objectContaining({
+              reason: "issue_commented",
+              payload: expect.objectContaining({ commentId: "comment-1", mutation: "comment" }),
+            }),
+          ),
+        );
+        // Give any duplicate wake path a chance to fire before counting.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+        expect(mockIssueService.update).not.toHaveBeenCalledWith(
+          issue.id,
+          expect.objectContaining({ status: expect.anything() }),
+        );
+        expect(mockIssueService.update).not.toHaveBeenCalledWith(
+          issue.id,
+          expect.objectContaining({ assigneeAgentId: expect.anything() }),
+        );
+      },
+    );
+
+    it("does not wake the inbox owner for its own comment", async () => {
+      const issue = arrangeInbox("in_progress", ownerAgentId);
+      const res = await request(await installActor(createApp(), agentActor(ownerAgentId)))
+        .post(`/api/issues/${issue.id}/comments`)
+        .send({ body: "Handled the delivered notice." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+  });
 });
