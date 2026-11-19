@@ -9,7 +9,8 @@ import { createToolGatewayService } from "../services/tool-gateway.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 // BLA-1574: discovery for a delegated task (A on X created Y for B) must list
-// ordinary managed connections, and must keep refusing when X carries chat authority.
+// ordinary managed connections, and no chat authority from X may reach B. On v2026.1117.0
+// upstream #17340 covers this, so the fork's run-origin change is dropped; these tests stay.
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("tool gateway delegated discovery", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -94,10 +95,30 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(tools.some(tool => tool.connectionId === f.endpoint.connectionId)).toBe(false);
   });
 
-  it("still refuses discovery with today's 403 when the delegating context is a GitHub guest chat request", async () => {
+  // On v2026.1117.0 the guest refusal is scoped to the session's own task (upstream #17340,
+  // ee29e2850): a guest request on X confers nothing on Y, and B on Y gets no chat tool from X.
+  it("gives B no chat tool and no guest authority from a GitHub guest request on X", async () => {
     const f = await delegation();
     const message = await guestMessageOnX(f);
     await db.update(runIdentityContexts).set({ messageId: message }).where(eq(runIdentityContexts.id, f.contextA.id));
+    const service = gateway();
+    const session = await service.createSession({ companyId: f.company.id, agentId: f.agentB.id, runId: f.runB2.id });
+    const tools = await service.listToolsForSession(session.token);
+    expect(tools.some(tool => tool.connectionId === f.endpoint.connectionId)).toBe(false);
+    expect(tools.filter(tool => /github|slack|speko/i.test(String(tool.providerType)) && tool.connectionId)).toEqual([]);
+  });
+
+  it("refuses discovery with a 403 when Y itself is GitHub-guest-sponsored and B's chain continues A's task", async () => {
+    const f = await delegation();
+    const bot = await connection(f.company.id, "B's GitHub bot", "rest_api");
+    const [endpoint] = await db.insert(chatEndpoints).values({ companyId: f.company.id, connectionId: bot.connection.id, provider: "github", publicId: randomUUID(), assignedAgentId: f.agentB.id, status: "active" }).returning();
+    const [conversation] = await db.insert(chatConversations).values({ companyId: f.company.id, endpointId: endpoint.id, issueId: f.taskY.id, externalConversationId: randomUUID(), externalLabel: "Synthetic guest thread on Y" }).returning();
+    const [comment] = await db.insert(issueComments).values({ companyId: f.company.id, issueId: f.taskY.id, authorType: "user", authorUserId: "requester", body: "@bot please review" }).returning();
+    const [delivery] = await db.insert(chatDeliveries).values({
+      companyId: f.company.id, endpointId: endpoint.id, providerEventId: randomUUID(), deduplicationKey: randomUUID(), eventKind: "mention",
+      normalizedEvent: { githubAuthority: { guest: true } },
+    }).returning();
+    await db.insert(chatMessageLinks).values({ companyId: f.company.id, endpointId: endpoint.id, conversationId: conversation.id, deliveryId: delivery.id, commentId: comment.id, providerMessageId: randomUUID(), direction: "inbound" });
     const service = gateway();
     const session = await service.createSession({ companyId: f.company.id, agentId: f.agentB.id, runId: f.runB2.id });
     await expect(service.listToolsForSession(session.token)).rejects.toMatchObject({ status: 403, message: "Chat tools cannot be inherited by another task" });
