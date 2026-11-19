@@ -559,7 +559,8 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
     const nonMemberUpdates = await request(apps.nonMember).get(`/api/status-cards/${created.body.id}/updates`);
     expect(JSON.stringify(nonMemberUpdates.body)).not.toContain(PRIVATE_TITLE);
 
-    // Cadence: a reactive card is re-evaluated at most 60 s after each tick.
+    // Cadence: v2026.1117.0 evaluates a reactive card on change events, not
+    // by polling. An idle tick leaves no polling deadline behind.
     const reactive = { ...defaultStatusCardRefreshPolicy, mode: "reactive" as const, debounceSeconds: 60 };
     const t0 = new Date(Date.now() + 1000);
     await db.update(statusCards).set({ refreshPolicy: reactive, nextEvalAt: new Date(t0.getTime() - 1) })
@@ -570,15 +571,16 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
     expect(await service.tickDueStatusCards(t0)).toMatchObject({ evaluated: 1, enqueued: [] });
     expect((await db.select({ id: issues.id }).from(issues)).length).toBe(issueCountBefore);
     const afterIdle = await service.getById(created.body.id);
-    expect(afterIdle!.nextEvalAt!.getTime() - t0.getTime()).toBe(60_000);
+    expect(afterIdle!.nextEvalAt).toBeNull();
+    const changed = new Set([afterIdle!.companyId]);
 
     // A change to an underlying (private) task triggers a reactive update once
     // the debounce passes.
     await db.update(issues).set({ status: "in_progress", updatedAt: new Date() }).where(eq(issues.id, privateIssue.id));
     const t1 = new Date(t0.getTime() + 60_000);
-    expect(await service.tickDueStatusCards(t1)).toMatchObject({ evaluated: 1, enqueued: [] });
+    expect(await service.tickDueStatusCards(t1, changed)).toMatchObject({ evaluated: 1, enqueued: [] });
     const t2 = new Date(t1.getTime() + 61_000);
-    const tick = await service.tickDueStatusCards(t2);
+    const tick = await service.tickDueStatusCards(t2, changed);
     expect(tick.enqueued).toHaveLength(1);
     const updateIssue = tick.enqueued[0]!.generatingIssue;
     expect(updateIssue).toMatchObject({

@@ -51,7 +51,11 @@ function fakeDb() {
   const chain: Record<string, unknown> = {};
   chain.set = () => chain;
   chain.where = async () => [];
-  return { update: () => chain } as unknown as Db;
+  // v2026.1117.0 flushes output progress inside db.transaction and signals
+  // active-run silence on that transaction; the fake runs it in place.
+  const db: Record<string, unknown> = { update: () => chain, execute: async () => [] };
+  db.transaction = async (fn: (tx: unknown) => Promise<unknown>) => fn(db);
+  return db as unknown as Db;
 }
 
 function prepareRedactor() {

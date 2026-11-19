@@ -76,9 +76,14 @@ function isReopenableGenerationStatus(status: string) {
 
 function abandonedGenerationRetryAt(policy: StatusCardRow["refreshPolicy"], consecutiveAbandoned: number, abandonedAt: Date) {
   if (consecutiveAbandoned < 1 || consecutiveAbandoned > STATUS_CARD_ABANDONED_RETRY_LIMIT) return null;
-  const cadence = nextStatusCardEvaluationAt(policy, new Date(0));
-  if (!cadence) return null;
-  const baseMs = Math.max(cadence.getTime(), STATUS_CARD_ABANDONED_BACKOFF_MIN_MS);
+  // v2026.1117.0 schedules reactive cards by change events, so
+  // nextStatusCardEvaluationAt() is null for them. The retry base keeps the
+  // card's own cadence: interval minutes, or the reactive debounce (<= 60 s).
+  if (policy.mode === "manual") return null;
+  const cadenceMs = policy.mode === "interval"
+    ? (policy.intervalMinutes ?? 15) * 60_000
+    : Math.min(policy.debounceSeconds ?? 60, 60) * 1000;
+  const baseMs = Math.max(cadenceMs, STATUS_CARD_ABANDONED_BACKOFF_MIN_MS);
   const delayMs = Math.max(baseMs, Math.min(baseMs * 2 ** (consecutiveAbandoned - 1), STATUS_CARD_ABANDONED_BACKOFF_CAP_MS));
   return new Date(abandonedAt.getTime() + delayMs);
 }
