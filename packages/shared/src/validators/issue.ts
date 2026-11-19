@@ -1251,6 +1251,12 @@ export const connectionIntentPayloadSchema = z
     }).strict().optional(),
     upstreamService: z.object({ slug: z.string().min(1).max(120), name: z.string().min(1).max(160), selectionInteractionId: z.string().guid().optional() }).strict().optional(),
     purpose: z.enum(["ai", "channel"]).optional(),
+    repairConnectionId: z.string().guid().optional(),
+    linkedIssues: z.array(z.object({
+      issueId: z.string().guid(),
+      agentId: z.string().guid(),
+      sourceRunId: z.string().guid(),
+    }).strict()).max(100).optional(),
     version: z.literal(1),
     serviceSlug: z.string().trim().min(1).max(120),
     serviceName: z.string().trim().min(1).max(160),
@@ -1260,7 +1266,8 @@ export const connectionIntentPayloadSchema = z
     requestingAgentName: z.string().trim().min(1).max(160),
     phase: connectionIntentPhaseSchema,
   })
-  .strict();
+  .strict()
+  .refine(value => (!value.repairConnectionId && !value.linkedIssues) || value.purpose === "ai", "Only AI authentication repair cards name a repaired connection");
 
 export const connectionIntentResultSchema = z
   .object({
