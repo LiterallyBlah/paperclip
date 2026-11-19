@@ -76,7 +76,7 @@ async function startOutput(redactor = prepareRedactor(), declaredKeys: Set<strin
     run, runId, issueId: null,
     runLogStore: {
       begin: async () => ({ store: "local_file", logRef: "fixture" }),
-      append: async (_handle, entry) => { stored.push({ stream: entry.stream, chunk: entry.chunk }); return entry.chunk.length; },
+      append: async (_handle: unknown, entry: { stream: string; chunk: string }) => { stored.push({ stream: entry.stream, chunk: entry.chunk }); return entry.chunk.length; },
     } as never,
     identityRedactor: redactor,
     secretKeys: declaredKeys,

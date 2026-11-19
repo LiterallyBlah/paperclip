@@ -10,7 +10,6 @@ import { shouldHideInteractionCard } from "@/lib/issue-thread-interactions";
 import { markdownToPlainText } from "@/lib/markdown-plain-text";
 import { TaskChatCompactInteractionCard } from "./TaskChatCompactInteractionCard";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
-import { markdownToPlainText } from "@/lib/markdown-plain-text";
 import type { TaskChatInteractionItem } from "./task-chat-model";
 import { useCoordinatorWorkspaceEnabled } from "@/hooks/useCoordinatorWorkspaceEnabled";
 

@@ -57,7 +57,7 @@ const OPEN_TITLE = "Synthetic open item";
 const PRIVATE_CHANGE_SUMMARY = `Covered ${PRIVATE_TITLE} moving forward`;
 const NON_MEMBER = "synthetic-non-member";
 const MEMBER = "synthetic-member";
-const VALID_QUERY = { scope: "issues", status: ["todo", "in_progress"], sort: "updated", limit: 20, offset: 0 };
+const VALID_QUERY = { scope: "issues", status: ["todo", "in_progress"], sort: "updated", limit: 20, offset: 0 } as unknown as (typeof statusCards.$inferSelect.queries)[number];
 
 function sha256(value: string) {
   return createHash("sha256").update(value).digest("hex");

@@ -108,7 +108,7 @@ describeEmbeddedPostgres("decision-triage delegate (routes, real database)", () 
     await db.insert(companies).values({
       id: companyId, name: "T Co", issuePrefix: `T${companyId.slice(0, 5).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
-      interactionResolverGovernance: options.delegate === false ? {} : { decisionTriageDelegateAgentId: ids.oracle },
+      interactionResolverGovernance: (options.delegate === false ? {} : { decisionTriageDelegateAgentId: ids.oracle }) as never,
     });
     const agentRow = (id: string, name: string, status = "idle") => ({
       id, companyId, name, role: "engineer", status, adapterType: "codex_local",
@@ -264,7 +264,7 @@ describeEmbeddedPostgres("decision-triage delegate (routes, real database)", () 
     it("refuses a delegate configured in another company", async () => {
       const s = await seed({ delegate: false });
       const foreign = await seed();
-      await db.update(companies).set({ interactionResolverGovernance: { decisionTriageDelegateAgentId: foreign.ids.oracle } })
+      await db.update(companies).set({ interactionResolverGovernance: { decisionTriageDelegateAgentId: foreign.ids.oracle } as never })
         .where(eq(companies.id, s.companyId));
       const source = await s.issue({});
       const action = await s.recovery(source);

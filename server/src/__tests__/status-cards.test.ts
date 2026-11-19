@@ -1530,7 +1530,7 @@ describeEmbeddedPostgres("status card routes", () => {
 
   // ------------------------------------------------ abandoned generations (BLA-1691)
 
-  const BLOCKED_QUERY = { scope: "issues", status: ["blocked", "done"], updatedWithin: "7d", sort: "updated", limit: 20, offset: 0 } as const;
+  const BLOCKED_QUERY = { scope: "issues", status: ["blocked", "done"], updatedWithin: "7d", sort: "updated", limit: 20, offset: 0 } as unknown as (typeof statusCards.$inferSelect.queries)[number];
   const INTERVAL_POLICY = { ...defaultStatusCardRefreshPolicy, mode: "interval" as const, intervalMinutes: 15 };
   const MINUTE = 60 * 1000;
 

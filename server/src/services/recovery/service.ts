@@ -3162,7 +3162,7 @@ export function recoveryService(
   }
 
   async function resolveDispositionRepairActionAsCovered(
-    issue: RecoveryIssue,
+    issue: Pick<RecoveryIssue, "id" | "companyId" | "identifier">,
     reason: string,
   ) {
     const active = await recoveryActionsSvc.getActiveForIssue(
@@ -3201,7 +3201,7 @@ export function recoveryService(
    * settled here (owner-independent, no board step) instead of retried.
    */
   async function settleStandingEventInboxDispositionRepair(
-    issue: typeof issues.$inferSelect,
+    issue: Pick<RecoveryIssue, "id" | "companyId" | "identifier" | "status" | "executionPolicy" | "assigneeAgentId" | "assigneeUserId">,
     latestRun: LatestIssueRun | typeof heartbeatRuns.$inferSelect | null,
   ) {
     if (!isStandingEventInboxQuietWait(issue, latestRun)) return false;
@@ -3567,7 +3567,7 @@ export function recoveryService(
     const rows = await db
       .select({
         action: issueRecoveryActions,
-        issue: { ...dispositionRepairIssueFields, projectWorkspaceId: issues.projectWorkspaceId },
+        issue: { ...dispositionRepairIssueFields, identifier: issues.identifier, projectWorkspaceId: issues.projectWorkspaceId },
       })
       .from(issueRecoveryActions)
       .innerJoin(
