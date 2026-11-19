@@ -924,3 +924,107 @@ describe("EnvironmentVariablesEditor", () => {
     expect(match?.querySelector<HTMLElement>("[title]")?.getAttribute("title")).toBe(cloudMigrationKey);
   });
 });
+
+describe("Store as secret with a masked (redacted) value", () => {
+  // Agent config reads return every plain env value as the display mask
+  // ("***REDACTED***"). Converting such a row must never submit the mask as the
+  // new secret's value; the user must enter the real value.
+  const MASK = "***REDACTED***";
+  let container: HTMLDivElement;
+  let root: Root | null = null;
+  const secrets = [makeSecret("s1", { name: "GITHUB_TOKEN", latestVersion: 3 })];
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+  });
+
+  afterEach(async () => {
+    flushSync(() => root?.unmount());
+    root = null;
+    container.remove();
+    await flush();
+    for (const child of [...document.body.children]) child.remove();
+    document.body.style.pointerEvents = "";
+    vi.restoreAllMocks();
+  });
+
+  function setInputValue(input: HTMLInputElement, value: string) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    setter.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function clickStoreAndBind() {
+    const submit = [...document.querySelectorAll<HTMLButtonElement>("button")].find((el) =>
+      el.textContent?.includes("Store & bind"),
+    );
+    expect(submit, "Store & bind button should render").toBeTruthy();
+    submit!.click();
+  }
+
+  async function openStorePopoverFor(value: string, onCreateSecret: (name: string, value: string) => Promise<CompanySecret>) {
+    root = createRoot(container);
+    flushSync(() =>
+      root!.render(
+        <EnvironmentVariablesEditor
+          value={{ STRIPE_API_KEY: { type: "plain", value } }}
+          secrets={secrets}
+          onChange={() => {}}
+          onCreateSecret={onCreateSecret}
+        />,
+      ),
+    );
+    const storeButton = container.querySelector<HTMLButtonElement>('button[title^="This value looks sensitive"]');
+    expect(storeButton, "sensitive Store-as-secret affordance should render").toBeTruthy();
+    storeButton!.click();
+    await flush();
+    expect(document.body.textContent).toContain("Store value as secret");
+    return document.querySelector<HTMLInputElement>('input[aria-label="Secret value"]')!;
+  }
+
+  it("never submits the display mask as the new secret value", async () => {
+    const onCreateSecret = vi.fn(async () => secrets[0]);
+    const valueField = await openStorePopoverFor(MASK, onCreateSecret);
+    clickStoreAndBind();
+    await flush();
+    const submittedValues = onCreateSecret.mock.calls.map((call) => (call as unknown[])[1]);
+    expect(submittedValues).not.toContain(MASK);
+    expect(valueField.value).not.toBe(MASK);
+  });
+
+  it("asks for the real value when the current value is masked and stores what the user enters", async () => {
+    const onCreateSecret = vi.fn(async () => secrets[0]);
+    const valueField = await openStorePopoverFor(MASK, onCreateSecret);
+    expect(valueField.readOnly).toBe(false);
+    expect(valueField.value).toBe("");
+    expect(document.body.textContent).toContain("current value is hidden");
+    setInputValue(valueField, "synthetic-entered-value");
+    await flush();
+    clickStoreAndBind();
+    await flush();
+    expect(onCreateSecret).toHaveBeenCalledTimes(1);
+    expect(onCreateSecret).toHaveBeenCalledWith("stripe_api_key", "synthetic-entered-value");
+  });
+
+  it("rejects re-typing the mask itself (whitespace-trimmed)", async () => {
+    const onCreateSecret = vi.fn(async () => secrets[0]);
+    const valueField = await openStorePopoverFor(MASK, onCreateSecret);
+    setInputValue(valueField, `  ${MASK}  `);
+    await flush();
+    clickStoreAndBind();
+    await flush();
+    expect(onCreateSecret).not.toHaveBeenCalled();
+  });
+
+  it("still carries a real typed value forward read-only, including values that merely contain the mask", async () => {
+    const onCreateSecret = vi.fn(async () => secrets[0]);
+    const legit = `prefix-${MASK}-suffix-✓`;
+    const valueField = await openStorePopoverFor(legit, onCreateSecret);
+    expect(valueField.readOnly).toBe(true);
+    expect(valueField.value).toBe(legit);
+    clickStoreAndBind();
+    await flush();
+    expect(onCreateSecret).toHaveBeenCalledWith("stripe_api_key", legit);
+  });
+});
