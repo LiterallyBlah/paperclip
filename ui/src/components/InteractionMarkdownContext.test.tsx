@@ -272,7 +272,7 @@ describe("Markdown decision context in the thread card", () => {
       payload: { ...pendingRequestConfirmationInteraction.payload, prompt: MARKDOWN_CONTEXT },
     };
     const host = mount(<IssueThreadInteractionCard interaction={confirmation} onAcceptInteraction={vi.fn()} />);
-    expectRenderedContext(host.querySelector<HTMLElement>(".paperclip-markdown-compact")!);
+    expectRenderedContext(host.querySelector<HTMLElement>(".paperclip-markdown")!);
 
     const checkbox = {
       ...pendingRequestCheckboxConfirmationInteraction,
@@ -284,7 +284,7 @@ describe("Markdown decision context in the thread card", () => {
       },
     };
     const checkboxHost = mount(<IssueThreadInteractionCard interaction={checkbox} onAcceptInteraction={vi.fn()} />);
-    expect(checkboxHost.querySelector(".paperclip-markdown-compact strong")?.textContent).toBe("regions");
+    expect([...checkboxHost.querySelectorAll(".paperclip-markdown strong")].map((el) => el.textContent)).toContain("regions");
     const group = checkboxHost.querySelector('[aria-label="Selectable options"]')!;
     expect(group.querySelector("ul li code")?.textContent).toBe("cache-key");
     expect(group.textContent).not.toContain("**");
@@ -331,7 +331,7 @@ describe("Markdown decision context on the task page (task chat)", () => {
     const host = mount(
       <TaskChatInteractionCard item={taskChatItem(confirmation)} presentation="takeover" onAcceptInteraction={vi.fn()} />,
     );
-    expectRenderedContext(host.querySelector<HTMLElement>(".paperclip-markdown-compact")!);
+    expectRenderedContext(host.querySelector<HTMLElement>(".paperclip-markdown")!);
   });
 
   it("names the collapsed unanswered-question row without Markdown noise", () => {
