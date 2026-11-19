@@ -209,6 +209,25 @@ export async function validateExecutionReconciliation(input: {
   return run;
 }
 
+/**
+ * Delivery owner of a stopped pending stage's recovery: the stage's current
+ * agent participant, woken once per issue, stage and review round.
+ */
+export type PendingStageParticipantDeliveryOwner = {
+  kind: "pending_stage_participant";
+  agentId: string;
+  stageId: string;
+  changesRequestedCount: number;
+  idempotencyKey: string;
+};
+
+export function pendingStageRecoveryWakeKey(
+  issueId: string,
+  stage: { stageId: string; changesRequestedCount: number },
+) {
+  return `stopped-stage-recovery:${issueId}:${stage.stageId}:${stage.changesRequestedCount}`;
+}
+
 /** Durable delivery marker lives on the existing source-scoped recovery action. */
 export async function markExecutionReconciliation(
   db: Db,
@@ -218,13 +237,21 @@ export async function markExecutionReconciliation(
   >,
   decision: ExecutionReconciliation,
   actorId: string,
-  deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
+  deliveryOwner?:
+    | { kind: "chat_failed_run_retry"; actionId: string }
+    | PendingStageParticipantDeliveryOwner,
   options?: { workspaceRepairOnly?: boolean; continuationAgentId?: string },
 ) {
   if (options?.workspaceRepairOnly && (deliveryOwner || !hasRequiredWorkspaceRecovery(action.evidence))) {
     throw conflict("Workspace repair must target the retained source without a continuation owner.");
   }
-  if (deliveryOwner) {
+  if (deliveryOwner?.kind === "pending_stage_participant") {
+    // The route delivers this continuation itself through the stage wake.
+    // The generic reconciled-execution worker never delivers "delegated".
+    if (deliveryOwner.idempotencyKey !== pendingStageRecoveryWakeKey(action.sourceIssueId, deliveryOwner)) {
+      throw conflict("The pending stage continuation owner is no longer valid.");
+    }
+  } else if (deliveryOwner) {
     const [retry] = await db
       .select()
       .from(chatActions)
