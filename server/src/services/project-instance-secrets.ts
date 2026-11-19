@@ -13,6 +13,7 @@ import {
 import type { ResourceLifecycleEvent } from "@paperclipai/plugin-sdk";
 import { z } from "zod";
 import { secretService } from "./secrets.js";
+import { isRedactedPlaceholderValue } from "../redaction.js";
 import { persistActivity, type ActivityPublication } from "./activity-log.js";
 
 export type ProjectSecretSnapshot = { revision: string };
@@ -30,6 +31,7 @@ export function validateProjectInstanceSecretChanges(
         (value !== null &&
           (typeof value !== "string" ||
             !value.trim() ||
+            isRedactedPlaceholderValue(value) ||
             Buffer.byteLength(value) > 131_072)),
     )
   ) {
