@@ -102,6 +102,10 @@ export function createCodexJsonlParser() {
       summary: finalMessage?.trim() ?? "",
       // Codex includes cache hits in input_tokens; Paperclip stores them separately.
       usage: { ...usage, inputTokens: Math.max(0, usage.inputTokens - usage.cachedInputTokens) },
+      // The terminal counters exactly as Codex reported them (input includes
+      // cache hits). On a resumed thread these are thread totals, not this
+      // execution's usage; see resolveCodexExecutionUsage.
+      rawUsage: usageReported ? { ...usage } : null,
       usageBasis: "per_run" as const,
       errorMessage,
       sawProtocolEvent,
