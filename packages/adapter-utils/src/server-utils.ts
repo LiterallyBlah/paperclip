@@ -10,6 +10,10 @@ import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
 } from "./local-process-sandbox.js";
+import {
+  planAgentIsolatedLaunch,
+  SERVER_SECRET_ENV_KEYS,
+} from "./agent-isolation.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
@@ -106,6 +110,8 @@ interface SpawnTarget {
   args: string[];
   cwd?: string;
   env?: Record<string, string | undefined>;
+  /** BLA-433: the child env is exactly `env` (isolated launch), not merged. */
+  replaceEnv?: boolean;
   cleanup?: () => Promise<void>;
 }
 
@@ -3642,6 +3648,9 @@ export function sanitizeInheritedPaperclipEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
+  // BLA-433: server-process secrets (loaded from the instance .env) must never
+  // be inherited by agent or tool processes.
+  for (const key of SERVER_SECRET_ENV_KEYS) delete env[key];
   for (const key of Object.keys(env)) {
     if (AGENT_IDENTITY_ENV_KEYS.includes(key.toUpperCase())) {
       delete env[key];
@@ -3760,6 +3769,10 @@ async function resolveSpawnTarget(
     timeoutSec?: number;
     graceSec?: number;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
+    /** BLA-433: the adapter's per-run env (never the merged server env). */
+    adapterEnv?: Record<string, string> | null;
+    /** BLA-433: server-assigned run id (runChildProcess's first argument). */
+    runId?: string | null;
   } = {},
 ): Promise<SpawnTarget> {
   const remote = options.remoteExecution ?? null;
@@ -3793,6 +3806,31 @@ async function resolveSpawnTarget(
 
   const resolved = await resolveCommandPath(command, cwd, env);
   const executable = resolved ?? command;
+
+  // BLA-433: per-agent OS identity. Fails closed (throws) when isolation is
+  // enabled and a protected launch cannot be isolated; returns null when the
+  // launch is not in scope or isolation is not enabled.
+  const isolated = planAgentIsolatedLaunch({
+    command,
+    resolvedCommand: resolved,
+    args,
+    cwd,
+    env: options.adapterEnv ?? {},
+    baseEnv: process.env,
+    localProcessSandbox: options.localProcessSandbox ?? null,
+    remote: false,
+    // Server-assigned run id (runChildProcess's first argument), never env/config.
+    runId: typeof options.runId === "string" ? options.runId : null,
+  });
+  if (isolated) {
+    return {
+      command: isolated.command,
+      args: isolated.args,
+      env: isolated.env,
+      replaceEnv: true,
+      cleanup: isolated.cleanup,
+    };
+  }
 
   if (options.localProcessSandbox) {
     if (!resolved) {
@@ -4889,9 +4927,13 @@ export async function runChildProcess(
       timeoutSec: opts.timeoutSec,
       graceSec: opts.graceSec,
       localProcessSandbox: opts.localProcessSandbox ?? null,
+      adapterEnv: opts.env ?? {},
+      runId,
     })
       .then((target) => {
-        const childEnv = { ...mergedEnv, ...target.env };
+        const childEnv: NodeJS.ProcessEnv = target.replaceEnv
+          ? { ...target.env }
+          : { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }

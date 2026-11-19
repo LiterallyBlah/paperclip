@@ -567,6 +567,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   const promptBundle = await prepareClaudePromptBundle({
     companyId: agent.companyId,
+    agentId: agent.id, // BLA-433 (B2): per-agent bundle path
     skills: mountableSkillEntries,
     instructionsContents: combinedInstructionsContents,
     onLog,

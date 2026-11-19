@@ -1,5 +1,6 @@
 import { pluginRunnerAiConnectionRequiredTestResult } from "../services/plugin-runner-ai-connection.js";
 import { HttpError } from "../errors.js";
+import { loadAgentIsolationConfig } from "@paperclipai/adapter-utils/agent-isolation";
 import type { AdapterRuntimeCommandSpec, ServerAdapterModule } from "./types.js";
 import { parseAdapterModelsEnv } from "../services/adapter-models-env.js";
 import { validateAiApiKey } from "../services/ai-api-key-test.js";
@@ -432,6 +433,20 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
     };
   },
   async testEnvironment(context) {
+    // BLA-433 (B1): native-runner probes launch agent runtimes outside the
+    // isolated launcher. Refuse them while per-agent OS isolation is enabled.
+    if (loadAgentIsolationConfig()) {
+      return {
+        adapterType: "paperclip_runner",
+        status: "fail" as const,
+        testedAt: new Date().toISOString(),
+        checks: [{
+          code: "agent_os_isolation_enabled",
+          level: "error" as const,
+          message: "Paperclip Runner is refused while per-agent OS isolation is enabled.",
+        }],
+      };
+    }
     let profile: ReturnType<typeof resolvePaperclipRunnerProviderProfile>;
     try {
       profile = resolvePaperclipRunnerProviderProfile(context.config, { companyId: context.companyId });
@@ -1064,7 +1079,65 @@ const piLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: piAgentConfigurationDoc,
 };
 
-const adaptersByType = new Map<string, ServerAdapterModule>();
+// BLA-433 (P2-B1): while per-agent OS isolation is enabled, adapter
+// environment probes run with no agent identity (adapterConfig.command in
+// adapterConfig.cwd), i.e. as the server uid. Refuse them for every adapter
+// that is not a network-only built-in, the same way the Runner probe is
+// refused. Applied on every registration path (built-in, external, hot
+// install, fallback restore) because they all go through this map.
+const NETWORK_ONLY_TEST_ADAPTERS = new Set(["http", "openclaw_gateway", "cursor_cloud"]);
+const guardedTestEnvironmentAdapters = new WeakSet<object>();
+
+export function guardLocalAdapterTestEnvironment<T extends ServerAdapterModule>(adapter: T): T {
+  if (
+    !adapter ||
+    typeof adapter !== "object" ||
+    typeof adapter.testEnvironment !== "function" ||
+    guardedTestEnvironmentAdapters.has(adapter) ||
+    NETWORK_ONLY_TEST_ADAPTERS.has(adapter.type)
+  ) {
+    return adapter;
+  }
+  const original = adapter.testEnvironment;
+  const guarded: ServerAdapterModule["testEnvironment"] = async function (
+    this: unknown,
+    context,
+    ...rest: unknown[]
+  ) {
+    if (loadAgentIsolationConfig()) {
+      return {
+        adapterType: context?.adapterType ?? adapter.type,
+        status: "fail" as const,
+        testedAt: new Date().toISOString(),
+        checks: [{
+          code: "agent_os_isolation_enabled",
+          level: "error" as const,
+          message:
+            "Local adapter environment probes are refused while per-agent OS isolation is enabled (they would run as the server uid).",
+        }],
+      };
+    }
+    return (original as (...args: unknown[]) => ReturnType<ServerAdapterModule["testEnvironment"]>)
+      .call(this, context, ...rest);
+  };
+  let out: T = adapter;
+  try {
+    (adapter as { testEnvironment: ServerAdapterModule["testEnvironment"] }).testEnvironment = guarded;
+    if (adapter.testEnvironment !== guarded) throw new Error("not writable");
+  } catch {
+    out = { ...adapter, testEnvironment: guarded }; // frozen/non-writable module object
+  }
+  guardedTestEnvironmentAdapters.add(out);
+  return out;
+}
+
+class GuardedAdapterMap extends Map<string, ServerAdapterModule> {
+  override set(type: string, adapter: ServerAdapterModule): this {
+    return super.set(type, guardLocalAdapterTestEnvironment(adapter));
+  }
+}
+
+const adaptersByType: Map<string, ServerAdapterModule> = new GuardedAdapterMap();
 
 // For builtin types that are overridden by an external adapter, we keep the
 // original builtin so it can be restored when the override is deactivated.

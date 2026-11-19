@@ -1,3 +1,4 @@
+import { AgentIsolationError, loadAgentIsolationConfig } from "@paperclipai/adapter-utils/agent-isolation";
 import { formatCommandForDisplay } from "./workspace-command-display.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
@@ -3123,6 +3124,15 @@ export class WorkspaceCommandExitError extends Error {
   }
 }
 
+// BLA-433: workspace provision/seed/teardown shells run agent/repo-controlled
+// commands as the server uid. Refuse them while per-agent OS isolation is
+// enabled (fail closed). An unsafe isolation config throws as well.
+function assertWorkspaceShellAllowedUnderIsolation(input: { label?: string; command: string }) {
+  if (loadAgentIsolationConfig()) {
+    throw new AgentIsolationError(`refusing workspace command "${input.label ?? input.command}": it would run as the server uid`);
+  }
+}
+
 async function runWorkspaceCommand(input: {
   command: string;
   resolvedCommand?: string;
@@ -3131,6 +3141,7 @@ async function runWorkspaceCommand(input: {
   label: string;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }) {
+  assertWorkspaceShellAllowedUnderIsolation(input);
   const shell = resolveShell();
   const proc = await executeProcess({
     command: shell,
@@ -3291,6 +3302,8 @@ async function recordWorkspaceCommandOperation(
     await runWorkspaceCommand(input);
     return null;
   }
+  // BLA-433: the recorded path runs the same shell; refuse it the same way.
+  assertWorkspaceShellAllowedUnderIsolation(input);
 
   let stdout = "";
   let stderr = "";
@@ -6303,6 +6316,11 @@ function createProvisioningRuntimeServiceRecord(
 }
 
 async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): Promise<LocalRuntimeServiceStart> {
+  // BLA-433: these shells run agent/repo-controlled commands as the server
+  // uid. Refuse them while per-agent OS isolation is enabled (fail closed).
+  if (loadAgentIsolationConfig()) {
+    throw new AgentIsolationError("refusing local runtime service: it would run as the server uid");
+  }
   const leaseRunId = input.leaseRunId === undefined ? input.runId : input.leaseRunId;
   const startedByRunId = input.startedByRunId === undefined ? input.runId : input.startedByRunId;
   const identity = resolveRuntimeServiceReuseIdentity({

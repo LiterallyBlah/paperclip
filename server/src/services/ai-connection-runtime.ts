@@ -4,6 +4,7 @@ import { OPENROUTER_ATTRIBUTION_HEADERS, openRouterClaudeHeaders } from "@paperc
 import { createHash } from "node:crypto";
 import { HttpError, unprocessable } from "../errors.js";
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm } from "node:fs/promises";
+import { AI_HOME_BINDING_MARKER } from "@paperclipai/adapter-utils/agent-isolation";
 import os from "node:os";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
@@ -359,6 +360,15 @@ export async function prepareManagedAiRuntime(
     if (harness === "antigravity_runtime") home = await realpath(home);
     const providerHome = path.join(home, "provider");
     await mkdir(providerHome, { mode: 0o700 });
+    // BLA-433 (B2): server-written binding marker. The isolated launcher hands
+    // this per-run home only to the agent named here (stays server-owned).
+    if (typeof input.agentId === "string" && input.agentId) {
+      await writeFile(
+        path.join(home, AI_HOME_BINDING_MARKER),
+        JSON.stringify({ version: 1, agentId: input.agentId, companyId: input.companyId }),
+        { mode: 0o600, flag: "wx" },
+      );
+    }
     if (retainedCleanupScope) releaseCredentialHome = bindRetainedAiCredentialHome(providerHome, retainedCleanupScope);
     const env: Record<string, unknown> = {
       ...stripAiAuthBindings(input.config.env),

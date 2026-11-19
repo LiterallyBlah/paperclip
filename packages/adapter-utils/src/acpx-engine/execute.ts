@@ -14,6 +14,7 @@ import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { parseFrontmatterMarkdown } from "@paperclipai/shared";
 import { fileURLToPath } from "node:url";
+import { assertAgentEngineAllowedUnderIsolation } from "../agent-isolation.js";
 import type {
   AdapterBillingType,
   AdapterExecutionContext,
@@ -4087,6 +4088,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
   const engine = resolveEngineSettings(deps);
 
   return async function executeAcpxEngine(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+    // BLA-433 (B1): the ACP engine spawns agent processes itself (acpx
+    // runtime), outside runChildProcess and the isolated launcher. Refuse it
+    // while per-agent OS isolation is enabled: no same-uid fallback.
+    assertAgentEngineAllowedUnderIsolation("ACP (acpx)");
     let billingIdentity: AcpxEngineBillingIdentity | null = null;
     try {
       billingIdentity = (await deps.resolveBillingIdentity?.(ctx)) ?? null;

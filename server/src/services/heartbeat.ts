@@ -44,6 +44,7 @@ import { createRunLogWriterAuthority } from "./heartbeat/run-log-authority.js";
 import { createHeartbeatRunOutput } from "./heartbeat/run-output.js";
 import { readRecoverableRunLog } from "./native-runtime/native-run-log-recovery.js";
 import { observabilitySecretValues } from "@paperclipai/adapter-utils/agent-observability";
+import { registerRunWorkspaces } from "@paperclipai/adapter-utils/agent-isolation";
 import { prepareHeartbeatSession, resolveHeartbeatAdapterSession } from "./heartbeat/session-preparation.js";
 import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
@@ -3168,6 +3169,13 @@ export function heartbeatService(
         })(),
       };
       context.paperclipWorkspaces = buildRunWorkspaceHints(resolvedWorkspace);
+      // BLA-433 (B3): record the workspaces the SERVER resolved for this run
+      // (never adapter config), so the isolated launcher hands exactly these
+      // to the run's agent uid. Keyed by the server-assigned run id.
+      registerRunWorkspaces(run.id, agent.id, [
+        executionWorkspace.cwd,
+        (context.paperclipWorkspace as { agentHome?: unknown }).agentHome,
+      ]);
       // Emit exactly one requested-vs-synced observability line for the referenced-project set. A run
       // with no referenced project stays silent, so this adds no noise to the anchor-only default. The
       // per-drop human warning already rides `runtimeWorkspaceWarnings`; this line carries the counts

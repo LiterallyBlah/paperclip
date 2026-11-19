@@ -1,3 +1,4 @@
+import { loadAgentIsolationConfig } from "@paperclipai/adapter-utils/agent-isolation";
 import {
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeAuthoritativeIssueStatus,
@@ -88,6 +89,21 @@ export class NativeRuntimeEligibilityError extends NativeRunnerSelectionError {
   }
 }
 
+/**
+ * BLA-433 (B1): Paperclip Runner native runs (fresh and persisted) launch
+ * agent processes outside runChildProcess and the isolated launcher, so they
+ * are refused while per-agent OS isolation is enabled. An unsafe isolation
+ * config throws AgentIsolationError (fail closed).
+ */
+function assertNativeRunnerAllowedUnderIsolation(): void {
+  if (loadAgentIsolationConfig()) {
+    throw ineligible(
+      "agent_os_isolation_enabled",
+      "Paperclip Runner native runs are refused while per-agent OS isolation is enabled.",
+    );
+  }
+}
+
 function ineligible(
   code: string,
   reason: string,
@@ -122,6 +138,9 @@ export function resolveNativeRuntimeMode(input: {
       reason: "direct_adapter",
     };
   }
+  // BLA-433 (B1): the native runner launches agent processes outside the
+  // isolated launcher. Refuse it while per-agent OS isolation is enabled.
+  assertNativeRunnerAllowedUnderIsolation();
   let runnerProfile: PaperclipRunnerProviderProfile;
   try {
     runnerProfile = resolvePaperclipRunnerProviderProfile(input.adapterConfig, { companyId: input.agent.companyId });
@@ -213,6 +232,9 @@ export function resolveHeartbeatRuntimeMode(input: {
 }): HeartbeatRuntimeResolution {
   if (input.persisted.runtimeModeResolvedAt) {
     if (input.persisted.runtimeMode === "native") {
+      // BLA-433 (B1): the native runner launches agent processes outside the
+      // isolated launcher. Refuse it while per-agent OS isolation is enabled.
+      assertNativeRunnerAllowedUnderIsolation();
       return {
         kind: "native",
         resolverVersion: NATIVE_RUNTIME_RESOLVER_VERSION,
@@ -304,6 +326,9 @@ export function resolveHeartbeatNativeRuntimeMode(input: {
 }): NativeRuntimeResolution {
   if (input.persisted.runtimeModeResolvedAt) {
     if (input.persisted.runtimeMode === "native") {
+      // BLA-433 (B1): the native runner launches agent processes outside the
+      // isolated launcher. Refuse it while per-agent OS isolation is enabled.
+      assertNativeRunnerAllowedUnderIsolation();
       if (input.agent.adapterType !== "paperclip_runner") {
         throw ineligible(
           "paperclip_runner_adapter_binding_mismatch",
