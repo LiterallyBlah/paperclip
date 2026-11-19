@@ -238,8 +238,10 @@ export function satisfiedConnectionIntentService(db: Db) {
             const interaction = await issueThreadInteractionService(txDb).getById(retired.id);
             if (interaction) await enqueueTerminalIssueInteractionChatPublications(txDb, interaction);
             await tx.update(issues).set({ updatedAt: now }).where(and(eq(issues.id, task.id), eq(issues.companyId, task.companyId)));
-            await tx.insert(connectionIntentDeliveries).values({ interactionId: intent.id, companyId: task.companyId }).onConflictDoNothing();
-            await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+            if (continues) {
+              await tx.insert(connectionIntentDeliveries).values({ interactionId: intent.id, companyId: task.companyId }).onConflictDoNothing();
+              await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+            }
             await logActivity(txDb, { companyId: task.companyId, actorType: "system", actorId: "connection-reconciliation",
               action: "issue.thread_interaction_resolved", entityType: "issue", entityId: task.id,
               details: { interactionId: intent.id, interactionKind: "connection_intent", status: "expired",
