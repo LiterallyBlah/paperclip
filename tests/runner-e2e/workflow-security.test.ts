@@ -62,24 +62,19 @@ describe("public repository paid workflow security", () => {
 
   });
 
-  it("uses the reviewed master branch for the first-party trusted PR workflow", async () => {
+  // Fork (LiterallyBlah/paperclip, 6d3919833): pr.yml runs the trusted CI from the commit under
+  // test, because the fork has no reviewed upstream master or AWS runner group to pin to.
+  // Upstream asserts one call to paperclipai/paperclip/...pr-trusted.yml@master here.
+  it("runs the fork's trusted PR workflow from the commit under test, never from upstream", async () => {
     const ordinaryPrWorkflow = await readFile(
       path.join(repositoryRoot, ".github/workflows/pr.yml"),
       "utf8",
     );
-    const trustedWorkflowCalls = [
-      ...ordinaryPrWorkflow.matchAll(
-        /^\s+uses:\s+(paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml)@([^\s#]+)$/gmu,
-      ),
-    ];
-
-    expect(trustedWorkflowCalls).toHaveLength(1);
-    expect(trustedWorkflowCalls[0]?.[1]).toBe(
-      "paperclipai/paperclip/.github/workflows/pr-trusted.yml",
-    );
-    expect(trustedWorkflowCalls[0]?.[2]).toBe(
-      ordinaryPrTrustedWorkflowRevision,
-    );
+    const remoteTrustedCalls = [...ordinaryPrWorkflow.matchAll(/^\s+uses:\s+[^\s#]+\/pr-trusted\.yml@/gmu)];
+    const localTrustedCalls = [...ordinaryPrWorkflow.matchAll(/^\s+uses:\s+\.\/\.github\/workflows\/pr-trusted\.yml$/gmu)];
+    expect(remoteTrustedCalls).toHaveLength(0);
+    expect(localTrustedCalls).toHaveLength(1);
+    expect(ordinaryPrTrustedWorkflowRevision).toBe("master");
   });
 
   // PR #18348 added the ninth pr-trusted bootstrap, in the Vitest selection job.

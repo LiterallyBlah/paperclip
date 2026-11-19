@@ -116,6 +116,9 @@ describeIssueRecovery("issue recovery production producers and deadlines", () =>
     const failures = await completingProvider(f, () => taskWatchdogService(state.db).disableForIssue(f.companyId, source.id));
     await start(); await quiet();
     await compete();
+    // Fork (live): a stopped verdict waits out a 15 s hand-off settle window after the subtree's
+    // last transition. Age the finished subtree past it so this covers upstream's dispatch path.
+    await state.db.update(issues).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(issues.id, source.id));
     const watchdog = await taskWatchdogService(state.db).upsertForIssue(f.companyId, source.id, { agentId: f.agentId });
     let reviewId: string | undefined;
     await vi.waitFor(async () => {

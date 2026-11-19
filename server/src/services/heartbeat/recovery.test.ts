@@ -322,6 +322,8 @@ describePostgres("heartbeat recovery module ownership", () => {
         await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, run.id));
         await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id));
         await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id));
+        // Fork 3aeb312b5 also records issue.updated for a recovery escalation that blocks the issue.
+        await db.delete(activityLog).where(eq(activityLog.runId, run.id));
         await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
       },
     };
