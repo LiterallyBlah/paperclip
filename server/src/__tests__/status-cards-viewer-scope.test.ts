@@ -22,7 +22,7 @@ import {
   statusCards,
   statusCardUpdates,
 } from "@paperclipai/db";
-import { defaultStatusCardRefreshPolicy } from "@paperclipai/shared";
+import { companySearchQuerySchema, defaultStatusCardRefreshPolicy } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
 import { statusCardRoutes } from "../routes/status-cards.js";
 import { withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
@@ -208,9 +208,9 @@ describeEmbeddedPostgres("status card viewer scope", () => {
       createdByUserId: "synthetic-owner",
       interestPrompt: "Synthetic scope prompt",
       documentId: document.id,
-      queries: [{ scope: "issues", status: ["todo"], sort: "updated", limit: 20, offset: 0 }],
+      queries: [companySearchQuerySchema.parse({ scope: "issues", status: ["todo"], sort: "updated", limit: 20, offset: 0 })],
       queryVersion: 1,
-      refreshPolicy: { mode: "manual" },
+      refreshPolicy: defaultStatusCardRefreshPolicy,
       state: "active",
       fingerprint: { [openIssue.id]: entry(openIssue), [privateIssue.id]: entry(privateIssue) },
       mentionedIssueIds: [openIssue.id, privateIssue.id].sort(),
@@ -331,7 +331,7 @@ describeEmbeddedPostgres("status card viewer scope", () => {
       companyId: company.id,
       createdByUserId: "synthetic-owner",
       interestPrompt: "Synthetic scope prompt",
-      queries: [{ scope: "issues", status: ["todo"], sort: "updated", limit: 20, offset: 0 }],
+      queries: [companySearchQuerySchema.parse({ scope: "issues", status: ["todo"], sort: "updated", limit: 20, offset: 0 })],
       queryVersion: 1,
       refreshPolicy: defaultStatusCardRefreshPolicy,
       state: "active",

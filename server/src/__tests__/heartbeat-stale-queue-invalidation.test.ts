@@ -2001,6 +2001,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(wakeup).toMatchObject({ status: "skipped", error: expect.stringContaining("no longer in_progress") });
     expect(issue?.status).toBe("todo");
     expect(countExecuteCallsForRun(runId)).toBe(0);
+  });
+
   describe("interaction_pending addressee wakes on another assignee's issue", () => {
     async function seedAddresseeFixture() {
       const { companyId, agentId: assigneeAgentId } = await seedCompanyAndAgent({ agentName: "Assignee" });
@@ -2028,7 +2030,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         payload: { version: 1, questions: [{ id: "q1", prompt: "Proceed?", selectionMode: "single",
           options: [{ id: "yes", label: "Yes" }] }] } as never,
         dismissedAt: input.dismissed ? new Date() : null,
-      }).returning();
+      } as typeof issueThreadInteractions.$inferInsert).returning();
       return row.id;
     }
 
@@ -2163,9 +2165,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       const [before] = await db.select().from(issues).where(eq(issues.id, f.issueId));
       let checkoutStatus: number | null = null;
       let wakePayload: Record<string, unknown> = {};
-      mockAdapterExecute.mockImplementationOnce(async ({ runId, context }: {
-        runId: string; context: { paperclipWake: Record<string, unknown> };
-      }) => {
+      mockAdapterExecute.mockImplementationOnce(async (execution: AdapterExecutionContext) => {
+        const { runId } = execution;
+        const context = execution.context as { paperclipWake: Record<string, unknown> };
         wakePayload = context.paperclipWake;
         // The addressee is still refused the task itself (#16563's 409).
         await issueService(db).checkout(f.issueId, f.addresseeAgentId, ["in_progress"], runId)
@@ -2268,7 +2270,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       await heartbeat.resumeQueuedRuns();
       expect(await settledRun(runId)).toMatchObject({ status: "succeeded" });
       const call = mockAdapterExecute.mock.calls.find(([context]) => context?.runId === runId)!;
-      expect(call[0].context.paperclipWake.addressedInteraction).toMatchObject({ id: interactionId });
+      expect((call[0] as unknown as { context: { paperclipWake: Record<string, unknown> } }).context.paperclipWake.addressedInteraction).toMatchObject({ id: interactionId });
     });
 
     it.each([
@@ -2312,7 +2314,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         addresseeAgentId: f.addresseeAgentId, createdByAgentId: f.assigneeAgentId, ...card });
       const { runId } = await seedQueuedRun({ companyId: f.companyId, agentId: f.addresseeAgentId, issueId: f.issueId,
         wakeReason: "interaction_pending", invocationSource: "automation",
-        contextExtras: { interactionId, interactionKind: card.kind ?? "ask_user_questions", source: "issue.interaction.created" } });
+        contextExtras: { interactionId, interactionKind: ("kind" in card ? card.kind : undefined) ?? "ask_user_questions", source: "issue.interaction.created" } });
       await heartbeat.resumeQueuedRuns();
       await expectNeverDispatched(runId, "issue_assignee_changed");
     });

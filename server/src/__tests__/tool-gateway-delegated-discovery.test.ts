@@ -21,7 +21,7 @@ const support = await getEmbeddedPostgresTestSupport();
   }, 30_000);
   afterAll(async () => { await tempDb?.cleanup(); }, 60_000);
 
-  async function connection(companyId: string, name: string, transport = "mcp_remote") {
+  async function connection(companyId: string, name: string, transport: typeof toolConnections.$inferInsert.transport = "mcp_remote") {
     const [application] = await db.insert(toolApplications).values({ companyId, applicationKey: `app-${randomUUID().slice(0, 8)}`, name: `${name} ${randomUUID()}`, type: "mcp_http", status: "active" }).returning();
     const [row] = await db.insert(toolConnections).values({
       companyId, applicationId: application.id, name, uid: `test/${randomUUID()}`, transport, status: "active", enabled: true,
