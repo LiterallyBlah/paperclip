@@ -612,11 +612,20 @@ function realpathOrResolvedPath(filePath: string): string {
   }
 }
 
-const isDirectRun =
-  Boolean(process.argv[1]) &&
-  realpathOrResolvedPath(process.argv[1]) === realpathOrResolvedPath(fileURLToPath(import.meta.url));
+/**
+ * True only when this file itself is the process entry point (`muse-acp` bin).
+ * When a bundler (e.g. the `paperclipai` CLI esbuild bundle) inlines this module,
+ * `import.meta.url` is the bundle's URL, which equals `process.argv[1]` for the
+ * host CLI. The basename check stops the bridge from hijacking that process.
+ */
+export function isMuseAcpDirectRun(entryPath: string | undefined, moduleUrl: string): boolean {
+  if (!entryPath) return false;
+  const modulePath = realpathOrResolvedPath(fileURLToPath(moduleUrl));
+  if (!/^muse-acp\.(?:[cm]?js|ts)$/.test(path.basename(modulePath))) return false;
+  return realpathOrResolvedPath(entryPath) === modulePath;
+}
 
-if (isDirectRun) {
+if (isMuseAcpDirectRun(process.argv[1], import.meta.url)) {
   main().catch((err) => {
     console.error("[muse-acp] Fatal error:", err);
     process.exit(1);
