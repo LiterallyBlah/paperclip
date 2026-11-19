@@ -384,7 +384,10 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     return db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
   }
 
-  it("counts and backs off held monitor fires until maxAttempts clears them through recovery", async () => {
+  // v2026.1117.0 keeps a wake_owner monitor armed until its recovery wake is
+  // admitted; while the hold gates that wake, the exhausted monitor must still
+  // back off instead of re-firing every tick (BLA-1924 port of 772dfcb54).
+  it("counts and backs off held monitor fires and keeps a held wake_owner recovery bounded", async () => {
     const fixture = await seedFixture({ monitor: { maxAttempts: 3, recoveryPolicy: "wake_owner" } });
     const { issueId, agentId, nextCheckAt } = fixture;
     await holdIssueExecution(fixture);
@@ -412,22 +415,24 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       dueAt = issue.monitorNextCheckAt!;
     }
 
-    await heartbeat.tickTimers(dueAt);
-    const cleared = await readIssue(issueId);
-    expect(cleared.monitorNextCheckAt).toBeNull();
-    expect(normalizeIssueExecutionPolicy(cleared.executionPolicy)?.monitor ?? null).toBeNull();
-    expect(parseIssueExecutionState(cleared.executionState)?.monitor).toMatchObject({
-      status: "cleared", clearReason: "max_attempts_exhausted",
-    });
-    // The owner recovery wake goes through the unchanged recovery path; the active
-    // execution hold still gates it (coalesced into the hold's skipped request).
+    // At the limit the recovery wake is attempted but the hold still gates it,
+    // so the monitor stays armed and each further fire moves the check forward.
+    for (let extra = 0; extra < 3; extra += 1) {
+      await heartbeat.tickTimers(dueAt);
+      const held = await readIssue(issueId);
+      expect(held.monitorWakeRequestedAt).toBeNull();
+      expect(held.monitorNextCheckAt!.getTime()).toBeGreaterThan(dueAt.getTime());
+      expect(held.monitorNextCheckAt!.getTime() - dueAt.getTime()).toBeLessThanOrEqual(30 * 60_000);
+      await heartbeat.tickTimers(new Date(dueAt.getTime() + 1_000));
+      expect((await readIssue(issueId)).monitorNextCheckAt!.getTime()).toBe(held.monitorNextCheckAt!.getTime());
+      dueAt = held.monitorNextCheckAt!;
+    }
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakes.filter((wake) => wake.status !== "skipped")).toHaveLength(0);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
     const actions = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).map((row) => row.action);
-    expect(actions.filter((action) => action === "issue.monitor_deferred")).toHaveLength(3);
-    expect(actions).toContain("issue.monitor_exhausted");
-    expect(actions).toContain("issue.monitor_recovery_wake_queued");
+    expect(actions.filter((action) => action === "issue.monitor_deferred")).toHaveLength(6);
+    expect(actions).not.toContain("issue.monitor_exhausted");
     expect(actions).not.toContain("issue.monitor_triggered");
   });
 
@@ -438,31 +443,24 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     const heartbeat = heartbeatService(db);
 
     let dueAt = new Date(nextCheckAt.getTime() + 60_000);
+    // Every fire, including those after the deferred-fire bound (where 1117's
+    // wake_owner recovery is attempted and gated by the hold), moves the check
+    // forward by a bounded delay. The monitor is never re-claimed every tick.
     let fires = 0;
-    for (; fires < 40; fires += 1) {
+    for (; fires < 14; fires += 1) {
       await heartbeat.tickTimers(dueAt);
       const issue = await readIssue(issueId);
-      if (!issue.monitorNextCheckAt) break;
-      expect(issue.monitorNextCheckAt.getTime()).toBeGreaterThan(dueAt.getTime());
-      expect(issue.monitorNextCheckAt.getTime() - dueAt.getTime()).toBeLessThanOrEqual(30 * 60_000);
-      dueAt = issue.monitorNextCheckAt;
+      expect(issue.monitorNextCheckAt).not.toBeNull();
+      expect(issue.monitorNextCheckAt!.getTime()).toBeGreaterThan(dueAt.getTime());
+      expect(issue.monitorNextCheckAt!.getTime() - dueAt.getTime()).toBeLessThanOrEqual(30 * 60_000);
+      dueAt = issue.monitorNextCheckAt!;
     }
-    expect(fires).toBeLessThan(40);
-    const cleared = await readIssue(issueId);
-    expect(cleared.monitorNextCheckAt).toBeNull();
-    expect(parseIssueExecutionState(cleared.executionState)?.monitor).toMatchObject({
-      status: "cleared", clearReason: "dispatch_deferred_exhausted",
-    });
-    // The owner recovery wake goes through the unchanged recovery path; the active
-    // execution hold still gates it (coalesced into the hold's skipped request).
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakes.filter((wake) => wake.status !== "skipped")).toHaveLength(0);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
     const actions = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).map((row) => row.action);
-    expect(actions.filter((action) => action === "issue.monitor_deferred")).toHaveLength(10);
-    expect(actions).toContain("issue.monitor_exhausted");
-    expect(actions).toContain("issue.monitor_recovery_wake_queued");
-    expect(fires).toBe(10);
+    expect(actions.filter((action) => action === "issue.monitor_deferred")).toHaveLength(14);
+    expect(actions).not.toContain("issue.monitor_exhausted");
   });
 
   it("does not clobber a monitor replaced while a held fire is being deferred", async () => {

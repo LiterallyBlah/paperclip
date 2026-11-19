@@ -524,9 +524,22 @@ export function createHeartbeatScheduling(
     if (input.recoveryPolicy === "wake_owner") {
       try {
         if (!await recover()) {
+          // Upstream keeps a wake_owner monitor armed until its owner wake is
+          // admitted. A scheduled fire must still move the check forward, or a
+          // held owner re-claims the exhausted monitor on every tick (BLA-1924).
+          const deferredCount = issueMonitorDeferredCount(input.claimed) + 1;
+          const deferral = input.activitySource === "scheduled"
+            ? {
+                patch: buildIssueMonitorDeferredPatch({
+                  issue: input.claimed, policy: input.policy, deferredCount,
+                  nextCheckAt: new Date(input.now.getTime() + issueMonitorDeferralDelayMs(deferredCount)),
+                }),
+                deferredCount,
+              }
+            : undefined;
           await releaseIssueMonitorWithDiagnostic(input.claimed, input, {
             action: "issue.monitor_deferred", reason: "monitor_recovery_deferred",
-          });
+          }, deferral);
           return { outcome: "skipped" as const, reason: "monitor_recovery_deferred" };
         }
       } catch (error) {

@@ -21,7 +21,7 @@ import { idleWorkSnapshot, readTaskDrain, startTaskDrain, stopTaskDrain } from "
 import { conflict } from "../../errors.js";
 import { createHeartbeatRunPreparation } from "./run-preparation.js";
 import { createHeartbeatRunState } from "./run-state.js";
-import { createHeartbeatScheduling, type HeartbeatSchedulingDependencies } from "./scheduling.js";
+import { createHeartbeatScheduling, ISSUE_MONITOR_DEFERRAL_BASE_DELAY_MS, type HeartbeatSchedulingDependencies } from "./scheduling.js";
 import { readIdleSleepSafety } from "../idle-sleep-safety.js";
 import { PaperclipRunnerToolAuthority } from "../native-runtime/paperclip-runner-tool-authority.js";
 import { finalizeNativeRun } from "../native-runtime/native-run-finalizer.js";
@@ -772,7 +772,8 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
       await advance(5000);
       expect(f.deps.enqueueWakeup).toHaveBeenCalledOnce();
       expect(coordinator!.nextWakeAt()).not.toBeNull();
-      await advance(30_000);
+      // The deferred fire moves the row ISSUE_MONITOR_DEFERRAL_BASE_DELAY_MS ahead (772dfcb54 port).
+      await advance(ISSUE_MONITOR_DEFERRAL_BASE_DELAY_MS);
       await vi.waitFor(async () => expect((await readIssue(f.issue.id)).monitorNextCheckAt).toBeNull());
       expect(f.deps.enqueueWakeup).toHaveBeenCalledTimes(2);
       await quiet();
