@@ -45,11 +45,13 @@ const TRIAGE_NUDGE_WINDOW_MS = 30 * 60 * 1000;
 const triageNudgeBodySchema = z.object({
   reason: z.string().trim().min(1).max(10_000),
 }).strict();
-import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { executionBlockerPredicate, getExecutionBlocker } from "../services/execution-blocker.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
+  pendingStageRecoveryWakeKey,
+  type PendingStageParticipantDeliveryOwner,
 } from "../services/execution-recovery-resolution.js";
 import {
   storedSteeringAcknowledgement,
@@ -7470,9 +7472,12 @@ export function issueRoutes(
       executionRunId?: string | null;
       executionState?: unknown;
     };
-    recoveryAction: NonNullable<
-      Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>
+    recoveryAction: Pick<
+      NonNullable<Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>>,
+      "returnOwnerAgentId"
     >;
+    /** Stopped pending-stage recovery: the caller proved the stage's agent participant is the owner. */
+    preservePendingAgentStage?: boolean;
   }) {
     const returnOwnerAgentId = input.recoveryAction.returnOwnerAgentId;
     if (
@@ -7510,6 +7515,7 @@ export function issueRoutes(
       );
     }
     if (
+      !input.preservePendingAgentStage &&
       parseIssueExecutionState(input.issue.executionState)?.status === "pending"
     ) {
       throw conflict(
@@ -7529,6 +7535,7 @@ export function issueRoutes(
       throw conflict(
         "Safe recovery hand-back blocked by active subtree pause hold",
         {
+          code: "recovery_pause_hold_active",
           issueId: input.issue.id,
           holdId: activePauseHold.holdId,
           rootIssueId: activePauseHold.rootIssueId,
@@ -7543,6 +7550,7 @@ export function issueRoutes(
           project.pauseReason === "budget"
             ? "Project is paused because its budget hard-stop was reached"
             : "Project is paused",
+          { code: "recovery_project_paused", issueId: input.issue.id, projectId: input.issue.projectId },
         );
       }
     }
@@ -7578,6 +7586,223 @@ export function issueRoutes(
         },
       );
     }
+  }
+
+  /**
+   * BLA-1787: verified recovery of a stopped pending execution stage. The
+   * source run belongs to the stage's current agent participant, who is also
+   * the assignee and the hold's return owner. The issue keeps its status,
+   * policy and whole execution state: no decision row, no hand-back to the
+   * return assignee. Only the no-replay holds proven to belong to that exact
+   * source run are cleared, and the participant gets one stage wake (post
+   * commit) keyed by issue, stage and review round. Every refusal throws
+   * before any write, so the transaction leaves no state change.
+   */
+  async function reconcileStoppedPendingStage(input: {
+    req: Request;
+    tx: Db;
+    issue: typeof issueRows.$inferSelect;
+    action: typeof issueRecoveryActions.$inferSelect;
+    decision: NonNullable<z.infer<typeof resolveIssueRecoveryActionSchema>["executionReconciliation"]>;
+    outcome: string;
+    resolutionNote: string | null;
+    actorId: string;
+    competingActionId: string | null;
+  }) {
+    const { tx, issue, action, decision } = input;
+    const refuse = (message: string, code: string, details: Record<string, unknown> = {}) =>
+      conflict(message, { code, issueId: issue.id, recoveryActionId: action.id, ...details });
+    if (input.outcome !== "restored") {
+      throw refuse("A stopped pending stage can only be restored to its current participant.",
+        "stage_recovery_outcome_invalid");
+    }
+    if (input.competingActionId) {
+      throw refuse("Another recovery action is active for this task. Resolve it first.",
+        "stage_recovery_competing_action", { activeRecoveryActionId: input.competingActionId });
+    }
+    const state = parseIssueExecutionState(issue.executionState);
+    const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+    const participant = state?.status === "pending" ? state.currentParticipant ?? null : null;
+    const stage = state?.currentStageId
+      ? policy?.stages.find((candidate) => candidate.id === state.currentStageId) ?? null
+      : null;
+    if (issue.status !== "in_review" || state?.status !== "pending" || !participant || !stage ||
+        stage.type !== state.currentStageType) {
+      throw refuse("The task has no pending execution stage to resume.", "stage_recovery_stage_not_pending");
+    }
+    if (participant.type !== "agent" || !participant.agentId) {
+      // A human reviewer or approver decides on their own; recovery never wakes or bypasses them.
+      throw refuse("A human stage participant cannot be resumed by recovery.", "stage_recovery_human_participant");
+    }
+    const participantAgentId = participant.agentId;
+    if (issue.assigneeAgentId !== participantAgentId || action.returnOwnerAgentId !== participantAgentId) {
+      throw refuse("The stage participant, task owner or recovery owner changed. Refresh the task.",
+        "stage_recovery_owner_changed", {
+          participantAgentId, assigneeAgentId: issue.assigneeAgentId, returnOwnerAgentId: action.returnOwnerAgentId,
+        });
+    }
+    const sourceRunId = action.evidence.runId ?? action.evidence.sourceRunId;
+    if (typeof sourceRunId !== "string" || decision.runId !== sourceRunId) {
+      throw refuse("The reconciliation does not name this recovery action's source run.",
+        "stage_recovery_source_mismatch");
+    }
+    const [sourceRun] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sourceRunId),
+    ));
+    if (!sourceRun || sourceRun.agentId !== participantAgentId) {
+      throw refuse("The source run does not belong to the current stage participant.",
+        "stage_recovery_owner_changed", { sourceRunId });
+    }
+    if (issue.checkoutRunId || issue.executionRunId) {
+      throw refuse("The task still has a live checkout or execution run.", "stage_recovery_run_live", {
+        checkoutRunId: issue.checkoutRunId ?? null, executionRunId: issue.executionRunId ?? null,
+      });
+    }
+    // Existing source, owner, terminal-run and stopped-provider proof.
+    try {
+      await validateExecutionReconciliation({
+        db: tx, companyId: issue.companyId, issueId: issue.id, agentId: participantAgentId,
+        sourceRunId, decision, recoveryAction: action,
+      });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        throw refuse(error.message, "stage_recovery_source_unverified", { sourceRunId });
+      }
+      throw error;
+    }
+
+    // Every effective hold on the task must be a no-replay hold of this exact
+    // source run. Anything else is unrelated or uncertain and stays in force.
+    const holds = await tx.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, issue.companyId),
+      eq(issueRecoveryActions.sourceIssueId, issue.id),
+      executionBlockerPredicate(),
+    )).for("update");
+    const unverified = holds.filter((hold) => {
+      const automatic = hold.evidence.automaticRecovery as { replay?: unknown; runId?: unknown } | undefined;
+      const holdRunId = hold.evidence.runId ?? hold.evidence.sourceRunId;
+      return !(
+        ["resolved", "cancelled"].includes(hold.status) &&
+        automatic?.replay === "blocked" &&
+        (automatic.runId === undefined || automatic.runId === sourceRunId) &&
+        holdRunId === sourceRunId &&
+        requiresExecutionReconciliation(hold.cause) &&
+        hold.evidence.executionReconciliation === undefined &&
+        !hasRequiredWorkspaceRecovery(hold.evidence) &&
+        hold.evidence.workspaceRestoreFailure === undefined &&
+        (hold.returnOwnerAgentId == null || hold.returnOwnerAgentId === participantAgentId) &&
+        (hold.evidence.reviewParticipantAgentId === undefined ||
+          hold.evidence.reviewParticipantAgentId === participantAgentId)
+      );
+    });
+    if (unverified.length || !holds.some((hold) => hold.id === action.id)) {
+      throw refuse("The task has holds that do not belong to this stopped source run.",
+        "stage_recovery_unrelated_hold", { sourceRunId, unrelatedHoldIds: unverified.map((hold) => hold.id) });
+    }
+
+    const owner = await agentsSvc.getById(participantAgentId);
+    if (!owner || owner.companyId !== issue.companyId || owner.status === "paused" || owner.status === "terminated") {
+      throw refuse("The stage participant is unavailable.", "stage_recovery_participant_unavailable");
+    }
+    const readiness = await svc.getDependencyReadiness(issue.id, tx);
+    if (readiness.unresolvedBlockerCount > 0) {
+      throw refuse("Resolve the task's blockers first.", "stage_recovery_blocked");
+    }
+    const [pendingInteraction] = await tx.select({ id: issueThreadInteractions.id })
+      .from(issueThreadInteractions).where(and(
+        eq(issueThreadInteractions.companyId, issue.companyId),
+        eq(issueThreadInteractions.issueId, issue.id),
+        eq(issueThreadInteractions.status, "pending"),
+        activeIssueInteractionCondition(),
+      )).limit(1);
+    if (pendingInteraction) {
+      throw refuse("Respond to the pending question or confirmation first.", "stage_recovery_interaction_pending");
+    }
+    // Owner, live-lock, pause, project, governed approval and budget gates.
+    await assertSafeRecoveryHandBackGates({
+      req: input.req, issue, recoveryAction: action, preservePendingAgentStage: true,
+    });
+
+    const changesRequestedCount = state.changesRequestedCount ?? 0;
+    const idempotencyKey = pendingStageRecoveryWakeKey(issue.id, { stageId: stage.id, changesRequestedCount });
+    const [duplicate] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, issue.companyId),
+      eq(agentWakeupRequests.agentId, participantAgentId),
+      eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+    )).limit(1);
+    if (duplicate) {
+      throw refuse("This stage round was already resumed once.", "stage_recovery_duplicate_delivery",
+        { wakeupRequestId: duplicate.id });
+    }
+
+    const deliveryOwner = {
+      kind: "pending_stage_participant" as const,
+      agentId: participantAgentId, stageId: stage.id, changesRequestedCount, idempotencyKey,
+    };
+    const now = new Date();
+    for (const hold of holds) {
+      await markExecutionReconciliation(tx, hold, decision, input.actorId, deliveryOwner);
+      await tx.update(issueRecoveryActions).set({
+        outcome: "restored", resolutionNote: input.resolutionNote, updatedAt: now,
+      }).where(and(eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.id, hold.id)));
+    }
+    const remaining = await getExecutionBlocker(tx, issue.companyId, issue.id, { admittingAgentId: participantAgentId });
+    if (remaining) {
+      throw refuse("Another hold still stops this stage participant.", "stage_recovery_hold_remaining",
+        { remainingRecoveryActionId: remaining.recoveryActionId ?? null });
+    }
+    const [recoveryAction] = await tx.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    return {
+      recoveryAction: recoveryAction!,
+      clearedHoldIds: holds.map((hold) => hold.id),
+      wake: { ...buildPendingStageParticipantWakeup(issue.id, state)!, idempotencyKey },
+    };
+  }
+
+  /**
+   * A replay of a stopped pending-stage recovery whose post-commit wake never
+   * created a request. Redelivers the same keyed wake while the stage, round,
+   * participant and owner are unchanged and nothing holds the participant.
+   * Returns null (plain replay, no write) in every other case.
+   */
+  async function redeliverStoppedPendingStage(input: {
+    req: Request;
+    tx: Db;
+    issue: typeof issueRows.$inferSelect;
+    action: typeof issueRecoveryActions.$inferSelect;
+    decision: NonNullable<z.infer<typeof resolveIssueRecoveryActionSchema>["executionReconciliation"]>;
+  }) {
+    const { tx, issue, action } = input;
+    const owner = action.evidence.continuationDeliveryOwner as PendingStageParticipantDeliveryOwner | undefined;
+    const recorded = action.evidence.executionReconciliation as { runId?: unknown } | undefined;
+    const state = parseIssueExecutionState(issue.executionState);
+    if (owner?.kind !== "pending_stage_participant" || action.evidence.continuationRunId ||
+        recorded?.runId !== input.decision.runId || state?.status !== "pending" ||
+        state.currentStageId !== owner.stageId || (state.changesRequestedCount ?? 0) !== owner.changesRequestedCount ||
+        state.currentParticipant?.type !== "agent" || state.currentParticipant.agentId !== owner.agentId ||
+        issue.assigneeAgentId !== owner.agentId || action.returnOwnerAgentId !== owner.agentId ||
+        owner.idempotencyKey !== pendingStageRecoveryWakeKey(issue.id, owner) ||
+        issue.checkoutRunId || issue.executionRunId) return null;
+    const [delivered] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, issue.companyId),
+      eq(agentWakeupRequests.agentId, owner.agentId),
+      eq(agentWakeupRequests.idempotencyKey, owner.idempotencyKey),
+    )).limit(1);
+    if (delivered) return null;
+    if (await getExecutionBlocker(tx, issue.companyId, issue.id, { admittingAgentId: owner.agentId })) return null;
+    await assertSafeRecoveryHandBackGates({
+      req: input.req, issue, recoveryAction: action, preservePendingAgentStage: true,
+    });
+    const holds = await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, issue.companyId),
+      eq(issueRecoveryActions.sourceIssueId, issue.id),
+      sql`${issueRecoveryActions.evidence}->'continuationDeliveryOwner'->>'idempotencyKey' = ${owner.idempotencyKey}`,
+    ));
+    return {
+      recoveryAction: action,
+      clearedHoldIds: holds.map((hold) => hold.id),
+      wake: { ...buildPendingStageParticipantWakeup(issue.id, state)!, idempotencyKey: owner.idempotencyKey },
+    };
   }
 
   async function resolveActiveIssueRun(issue: {
@@ -10106,6 +10331,14 @@ export function issueRoutes(
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
               assertBoard(req);
+              if (sourceIssueStatus === "in_review" && lockedIssue.status === "in_review") {
+                const stageRecovery = await reconcileStoppedPendingStage({
+                  req, tx: tx as unknown as Db, issue: lockedIssue, action: settled,
+                  decision: executionReconciliation, outcome, resolutionNote: resolutionNote ?? null,
+                  actorId: actor.actorId, competingActionId: activeRecoveryAction?.id ?? null,
+                });
+                return { issue: lockedIssue, ...stageRecovery, stageRecovery: true as const };
+              }
               if (
                 activeRecoveryAction ||
                 sourceIssueStatus !== "todo" ||
@@ -10122,6 +10355,12 @@ export function issueRoutes(
                 .returning();
               activeRecoveryAction = issueRecoveryActionReadModel(reopened!);
             } else {
+              const redelivery = executionReconciliation && outcome === "restored" &&
+                sourceIssueStatus === "in_review" && lockedIssue.status === "in_review"
+                ? await redeliverStoppedPendingStage({ req, tx: tx as unknown as Db, issue: lockedIssue,
+                  action: settled, decision: executionReconciliation })
+                : null;
+              if (redelivery) return { issue: lockedIssue, ...redelivery, stageRecovery: true as const };
               return {
                 issue: lockedIssue,
                 recoveryAction: settled,
@@ -10539,6 +10778,66 @@ export function issueRoutes(
 
         return { issue, recoveryAction, chatRetry };
       });
+      if ("stageRecovery" in result) {
+        const { wake } = result;
+        let continuationRunId: string | null = null;
+        try {
+          const run = await heartbeat.wakeup(wake.agentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: wake.reason,
+            payload: wake.payload,
+            idempotencyKey: wake.idempotencyKey,
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: wake.contextSnapshot,
+          });
+          continuationRunId = run?.id ?? null;
+        } catch (err) {
+          logger.warn({ err, issueId: result.issue.id }, "failed to wake the stage participant after stopped-stage recovery");
+        }
+        if (continuationRunId) {
+          await db.update(issueRecoveryActions).set({
+            evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({ continuationRunId })}::jsonb`,
+          }).where(and(
+            eq(issueRecoveryActions.companyId, result.issue.companyId),
+            inArray(issueRecoveryActions.id, result.clearedHoldIds),
+          ));
+        }
+        await logActivity(db, {
+          companyId: result.issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.recovery_action_resolved",
+          entityType: "issue",
+          entityId: result.issue.id,
+          details: {
+            identifier: result.issue.identifier,
+            recoveryActionId: result.recoveryAction.id,
+            outcome: "restored",
+            stageRecovery: {
+              clearedHoldIds: result.clearedHoldIds,
+              participantAgentId: wake.agentId,
+              idempotencyKey: wake.idempotencyKey,
+              continuationRunId,
+            },
+          },
+        });
+        res.json({
+          issue: result.issue,
+          recoveryAction: result.recoveryAction,
+          stageRecovery: {
+            clearedHoldIds: result.clearedHoldIds,
+            participantAgentId: wake.agentId,
+            idempotencyKey: wake.idempotencyKey,
+            continuationRunId,
+          },
+        });
+        return;
+      }
       if (result.replayed) {
         res.json({
           issue: "workspaceRepairOnly" in result
