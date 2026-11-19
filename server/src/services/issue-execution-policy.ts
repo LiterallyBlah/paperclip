@@ -420,8 +420,10 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
   const reviewPreset = parsed.data.reviewPreset;
   const authorizationPolicy = parsed.data.authorizationPolicy;
 
+  const standingEventInbox = parsed.data.standingEventInbox === true;
+
   if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy
-    && parsed.data.maxReviewRounds == null) return null;
+    && parsed.data.maxReviewRounds == null && !standingEventInbox) return null;
 
   return {
     mode: parsed.data.mode ?? "normal",
@@ -431,6 +433,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     ...(reviewPreset ? { reviewPreset } : {}),
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
     ...(parsed.data.maxReviewRounds != null ? { maxReviewRounds: parsed.data.maxReviewRounds } : {}),
+    ...(standingEventInbox ? { standingEventInbox: true } : {}),
   };
 }
 
