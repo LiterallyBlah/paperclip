@@ -117,6 +117,11 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   }
   async function card(mode: "manual" | "reactive" | "interval" = "reactive", refreshPolicy = policy(mode)) {
     const cards = statusCardService(db);
+    // Fork (BLA-1487 B1, retained live status-card privacy): generation acts for one
+    // active responsible user and refuses with 422 when the company has none, so each
+    // card's company gets the active board owner the upstream fixture leaves implicit.
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board-user", membershipRole: "owner", status: "active" })
+      .onConflictDoNothing();
     const created = await cards.create(companyId, { interestPrompt: "Blockers", titlePinned: false, agentId, refreshPolicy }, actor);
     const compile = await cards.requestCompile(created.id, actor);
     await writeback(created.id, compile.generatingIssue.id, true);
@@ -873,13 +878,22 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       expect((await statusCardService(db).getById(created.id))!.state).toBe("error");
     });
     const failed = (await statusCardService(db).getById(created.id))!;
-    expect(failed).toMatchObject({ state: "error", generatingIssueId: null, nextEvalAt: null, nextEvalReason: null });
+    // Fork (BLA-1691, retained live behaviour): a non-manual card left in `error` by an
+    // abandoned generation is re-armed once on a bounded backoff (>= 60 s, capped at 2 h,
+    // at most three in a row) instead of waiting for a manual refresh. Upstream leaves
+    // nextEvalAt null here.
+    expect(failed).toMatchObject({ state: "error", generatingIssueId: null, nextEvalReason: null });
     expect(errors.length).toBeGreaterThan(0);
     const history = await db.select().from(statusCardUpdates).where(eq(statusCardUpdates.cardId, created.id));
     const ledger = history.find(row => row.status === "failed")!;
     expect(ledger.finishedAt).toBeInstanceOf(Date);
+    const retryDelay = failed.nextEvalAt!.getTime() - ledger.finishedAt!.getTime();
+    expect(retryDelay).toBeGreaterThanOrEqual(60_000);
+    expect(retryDelay).toBeLessThanOrEqual(2 * 60 * 60_000);
     expect((await db.select().from(issues).where(eq(issues.id, ledger.generationIssueId!)))[0]?.status).toBe("cancelled");
-    const count = wakeup.mock.calls.length; await quiet(); expect(wakeup).toHaveBeenCalledTimes(count);
+    // Fork (BLA-1691): the only armed wake is that bounded retry deadline.
+    const count = wakeup.mock.calls.length; await settled(); expect(wakeup).toHaveBeenCalledTimes(count);
+    expect(coordinator!.nextWakeAt()).toBe(failed.nextEvalAt!.getTime());
     // An explicit ordinary refresh is still the user's supported retry action.
     const retry = await statusCardService(db).requestRefresh(created.id, { trigger: "manual", actor });
     expect(retry.generatingIssue).toBeTruthy(); await writeback(created.id, retry.generatingIssue!.id); await quiet();
