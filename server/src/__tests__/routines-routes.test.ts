@@ -127,6 +127,10 @@ const mockAnnotationService = vi.hoisted(() => ({
 
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
+  // Slice H F-H1: routine writes that set a project ask project:read. This
+  // mocked suite models an actor that may read the project; the deny path is
+  // covered against real Postgres in routines-e2e.test.ts ("Slice H F-H1: ...").
+  decide: vi.fn(async () => ({ allowed: true })),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -176,7 +180,15 @@ async function createApp(actor: Record<string, unknown>) {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", routineRoutes({} as any));
+  // BLA-140 LR-1: routine reads now ask the project read predicate. This mocked
+  // suite models an actor that may read the routine's project; the deny path is
+  // covered against real Postgres in routines-e2e.test.ts ("LR-1: ...").
+  const readableProjectRows = [{ id: projectId, companyId }];
+  const query: any = {
+    from: () => query, where: () => query, limit: () => query,
+    then: (resolve: any, reject: any) => Promise.resolve(readableProjectRows).then(resolve, reject),
+  };
+  app.use("/api", routineRoutes({ select: () => query } as any));
   app.use(errorHandler);
   return app;
 }

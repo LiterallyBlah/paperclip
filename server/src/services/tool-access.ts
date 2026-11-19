@@ -3392,6 +3392,9 @@ export function toolAccessService(
             metadata: {
               source: "app_gallery_finish",
               connectionId: connection.id,
+              // Explicit record of the finish choice. An empty or later-emptied
+              // specific-agents list must stay closed to unlisted agents.
+              agentAccess: input.access === "all_agents" ? "all_agents" : "specific_agents",
             },
             updatedAt: new Date(),
           })
@@ -3411,6 +3414,9 @@ export function toolAccessService(
             metadata: {
               source: "app_gallery_finish",
               connectionId: connection.id,
+              // Explicit record of the finish choice. An empty or later-emptied
+              // specific-agents list must stay closed to unlisted agents.
+              agentAccess: input.access === "all_agents" ? "all_agents" : "specific_agents",
             },
           })
           .returning();

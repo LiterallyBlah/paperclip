@@ -839,6 +839,41 @@ function inferToolRisk(toolName: string): ToolGatewayDescriptor["risk"] {
   return "read";
 }
 
+/**
+ * Slice H (LR-2 residual): only results of tools whose risk is not `read` keep
+ * the bounded pre-LR-2 content summary in storage, so an approved action or an
+ * ask-first test call can be delivered from it. Read-tool results stay
+ * content-free.
+ */
+function retainsResultSummary(tool: Pick<ToolGatewayDescriptor, "risk">) {
+  return tool.risk !== "read";
+}
+
+const UPSTREAM_HANDOFF_ID = /^[A-Za-z0-9._:-]{1,256}$/;
+
+/**
+ * Slice H (LR-2 residual c): the durable part of a provider hand-off. Only the
+ * kind and opaque identifiers are kept; `expiresAt` is normalised to ISO.
+ * Excluded because they can carry upstream free text: `links` (one-time
+ * codes), `message` (provider prompt text) and `requestedSchema` (provider
+ * titles/descriptions). Identifiers must match a strict id charset (no
+ * whitespace), so free text cannot ride in them either.
+ */
+function durableUpstreamHandoff(value: unknown): ToolUpstreamPending | null {
+  const pending = asRecord(value);
+  if (!pending || (pending.kind !== "approval" && pending.kind !== "authorization")) return null;
+  const out: ToolUpstreamPending = { kind: pending.kind, links: [] };
+  for (const key of ["executionId", "elicitationId", "resumeTool"] as const) {
+    const id = pending[key];
+    if (typeof id === "string" && UPSTREAM_HANDOFF_ID.test(id)) out[key] = id;
+  }
+  if (typeof pending.expiresAt === "string") {
+    const at = Date.parse(pending.expiresAt);
+    if (Number.isFinite(at)) out.expiresAt = new Date(at).toISOString();
+  }
+  return out;
+}
+
 function riskFromCatalogEntry(
   entry: Pick<
     typeof toolCatalogEntries.$inferSelect,
@@ -1233,10 +1268,13 @@ export function createToolGatewayService(
     for (const [id, value] of upstreamHandoffs) if (value.expires <= Date.now()) upstreamHandoffs.delete(id);
     while (upstreamHandoffs.size >= 256) upstreamHandoffs.delete(upstreamHandoffs.keys().next().value!);
     upstreamHandoffs.set(invocationId, { pending, expires: Date.now() + 15 * 60_000 });
-    const summary = (await validateToolContent({
-      value: { upstreamPending: { ...pending, links: [] } }, direction: "result", sensitiveMode: "redact", promptInjectionMode: "ignore",
-    })).summary;
-    await db.update(toolInvocations).set({ resultSummary: summary }).where(eq(toolInvocations.id, invocationId));
+    // Slice H (LR-2 residual c): persist only the kind and identifiers that
+    // recovery needs, built here rather than through the tool-result
+    // summariser (which now omits content). Links, the upstream `message` and
+    // the upstream `requestedSchema` can carry provider free text and stay out.
+    const record = { upstreamPending: durableUpstreamHandoff(pending) };
+    if (!record.upstreamPending) return;
+    await db.update(toolInvocations).set({ resultSummary: summarizeToolValue(record) }).where(eq(toolInvocations.id, invocationId));
   }
   function recoverUpstreamHandoff(invocation: typeof toolInvocations.$inferSelect): ToolUpstreamPending | undefined {
     if (invocation.errorCode !== "provider_interaction_required") return undefined;
@@ -1244,9 +1282,7 @@ export function createToolGatewayService(
     if (cached && cached.expires > Date.now()) return cached.pending;
     upstreamHandoffs.delete(invocation.id);
     const stored = asRecord(storedInvocationResult(invocation));
-    const pending = asRecord(stored?.upstreamPending);
-    if (!pending || !["approval", "authorization"].includes(String(pending.kind))) return undefined;
-    return { ...pending, links: [] } as unknown as ToolUpstreamPending;
+    return durableUpstreamHandoff(stored?.upstreamPending) ?? undefined;
   }
   const runtimeSupervisor = createToolRuntimeSupervisor(db, {
     deploymentMode: options.deploymentMode,
@@ -7703,6 +7739,7 @@ export function createToolGatewayService(
         direction: "result",
         sensitiveMode: "redact",
         promptInjectionMode: "block", classifier: resultClassifier(args.session, args.tool, args.invocationId, { signal: args.signal, approvedAction: Boolean(args.session.approvedInvocationId) }),
+        retainResultSummary: retainsResultSummary(args.tool),
       });
       const providerResult = asRecord(resultValidation.value);
       if (providerResult?.error) {
@@ -8516,6 +8553,7 @@ export function createToolGatewayService(
         direction: "result",
         sensitiveMode: "redact",
         promptInjectionMode: "block", classifier: resultClassifier(session, tool, invocation.id, { approvedAction: true }),
+        retainResultSummary: retainsResultSummary(tool),
       });
       const resultRecord = asRecord(resultValidation.value);
       if (resultRecord?.error)
@@ -10463,6 +10501,7 @@ export function createToolGatewayService(
         const resultValidation = await validateToolContent({
           value: result, direction: "result", sensitiveMode: "redact",
           promptInjectionMode: "block", classifier: resultClassifier(session, tool, null, { signal: input.signal }),
+          retainResultSummary: retainsResultSummary(tool),
         }).catch(async (error: unknown) => {
           if (error instanceof ToolContentValidationError) {
             await writeToolCallEvent({ session, eventType: "call_failed", outcome: "failure", toolName: tool.name,
@@ -11240,6 +11279,7 @@ export function createToolGatewayService(
           direction: "result",
           sensitiveMode: "redact",
           promptInjectionMode: "block", classifier: resultClassifier(session, tool, invocationId, { approvedAction: Boolean(input.approvedActionRequestId), signal: input.signal }),
+          retainResultSummary: retainsResultSummary(tool),
         });
         const completedAt = new Date();
         const validatedMcpResult = connectedMcpExecution
@@ -11654,6 +11694,7 @@ export function createToolGatewayService(
           direction: "result",
           sensitiveMode: "redact",
           promptInjectionMode: "block", classifier: resultClassifier(sessionLike, tool, invocationId, { signal: input.signal }),
+          retainResultSummary: retainsResultSummary(tool),
         });
         await db
           .update(toolInvocations)

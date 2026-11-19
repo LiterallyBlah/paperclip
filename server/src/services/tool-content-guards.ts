@@ -307,17 +307,170 @@ export function summarizeToolValue(value: unknown) {
   };
 }
 
+/**
+ * LR-2: the persisted summary of a tool *result* carries no result content.
+ * Size, hash and redacted-field markers are computed exactly as in
+ * summarizeToolValue; only the content `summary` becomes a fixed marker.
+ * Argument summaries keep the summarizeToolValue form.
+ */
+export function summarizeToolResultValue(value: unknown): ReturnType<typeof summarizeToolValue> {
+  const full = summarizeToolValue(value);
+  return { ...full, summary: `[content omitted: ${full.sizeBytes} bytes]` };
+}
+
+type PromptInjectionDetection = { findings: string[]; detectorMetadata: PromptInjectionDetectorMetadata };
+
+async function detectPromptInjection(
+  value: unknown,
+  classifier?: (content: string) => Promise<PromptInjectionModelOutcome>,
+): Promise<PromptInjectionDetection> {
+  const redactedValue = isPlainObject(value) ? redactEventPayload(value) : value;
+  // Wrapping allows the existing recursive redactor to handle root arrays and
+  // strings, without changing the tool return value or its historical hash.
+  const outbound = redactSensitiveText(stableSerialize(redactEventPayload({ value })?.value));
+  // A verdict cannot cover text hidden from the model but still delivered to
+  // the caller by the legacy return contract. Fall back before dispatch, so a
+  // secret-named field cannot conceal instructions behind a safe verdict.
+  const outcome: PromptInjectionModelOutcome | undefined = classifier
+    ? outbound !== stableSerialize(redactedValue)
+      ? { status: "unavailable", reason: "input_redaction_mismatch" }
+      : await classifier(outbound)
+    : undefined;
+  if (outcome?.status === "classified") {
+    return {
+      findings: outcome.findings,
+      detectorMetadata: { detector: "model", model: outcome.model, invocationId: outcome.invocationId, policyVersion: outcome.policyVersion },
+    };
+  }
+  return {
+    findings: scanPromptInjection(value),
+    detectorMetadata: { detector: "regex", ...(outcome ? { fallbackReason: outcome.reason, model: outcome.model, invocationId: outcome.invocationId } : {}) },
+  };
+}
+
+/** MCP content-block metadata key a connector may set to name the item a block carries (for example a message id). */
+export const TOOL_RESULT_ITEM_REF_META_KEY = "paperclip.ing/item-ref";
+const ITEM_REF_PATTERN = /^[A-Za-z0-9._:@-]{1,128}$/;
+
+export type WithheldToolResultItem = { index: number; ref?: string; findings: string[] };
+
+function isMcpContentBlock(value: unknown): value is Record<string, unknown> {
+  if (!isPlainObject(value) || typeof value.type !== "string") return false;
+  return value.type !== "text" || typeof value.text === "string";
+}
+
+/** Same text join as the gateway's MCP result normalizer. */
+function joinMcpContentBlocks(blocks: Record<string, unknown>[]) {
+  return blocks.map((block) => (block.type === "text" ? block.text as string : JSON.stringify(block))).join("\n");
+}
+
+type ToolResultItemList = {
+  blocks: Record<string, unknown>[];
+  /** Everything in the result except the item blocks and the text derived from them. */
+  outside: unknown;
+  rebuild: (blocks: Record<string, unknown>[]) => Record<string, unknown>;
+};
+
+/**
+ * Recognises the two result shapes with real item boundaries: a raw MCP result
+ * (`{ content: Block[] }`) and the gateway's normalized MCP result
+ * (`{ content: joinedText, data: { content: Block[], ... } }`, where the text
+ * must be exactly the join of the blocks). Any other shape has no item list.
+ */
+function toolResultItemList(value: unknown): ToolResultItemList | null {
+  if (!isPlainObject(value)) return null;
+  const isBlockList = (blocks: unknown): blocks is Record<string, unknown>[] =>
+    Array.isArray(blocks) && blocks.length >= 2 && blocks.every(isMcpContentBlock);
+  if (isBlockList(value.content)) {
+    return {
+      blocks: value.content,
+      outside: { ...value, content: [] },
+      rebuild: (blocks) => ({ ...value, content: blocks }),
+    };
+  }
+  const data = value.data;
+  if (typeof value.content === "string" && isPlainObject(data) && isBlockList(data.content)
+    && joinMcpContentBlocks(data.content) === value.content) {
+    return {
+      blocks: data.content,
+      outside: { ...value, content: "", data: { ...data, content: [] } },
+      rebuild: (blocks) => ({ ...value, content: joinMcpContentBlocks(blocks), data: { ...data, content: blocks } }),
+    };
+  }
+  return null;
+}
+
+function itemRefOf(block: Record<string, unknown>): string | undefined {
+  const meta = block._meta;
+  const ref = isPlainObject(meta) ? meta[TOOL_RESULT_ITEM_REF_META_KEY] : undefined;
+  if (typeof ref !== "string" || !ITEM_REF_PATTERN.test(ref) || scanPromptInjection(ref).length > 0) return undefined;
+  return ref;
+}
+
+function withheldItemPlaceholder(item: WithheldToolResultItem) {
+  return {
+    type: "text",
+    text: JSON.stringify({
+      paperclip_content_guard: {
+        status: "withheld",
+        reason: "prompt_injection_blocked",
+        message: "This item was withheld by the content guard. Its content is not available to this caller.",
+        findings: item.findings,
+        item_index: item.index,
+        ...(item.ref ? { item_ref: item.ref } : {}),
+      },
+    }),
+  };
+}
+
+/**
+ * Per-item result guard. Returns the result with only the matching items
+ * replaced by placeholders, or null when the match cannot be confined to
+ * separate items (no item list, a match outside the items, no single item
+ * matching, every item matching, or a match left after withholding).
+ */
+async function withholdMatchingItems(
+  value: unknown,
+  classifier?: (content: string) => Promise<PromptInjectionModelOutcome>,
+): Promise<{ value: Record<string, unknown>; withheldItems: WithheldToolResultItem[] } | null> {
+  const list = toolResultItemList(value);
+  if (!list) return null;
+  if ((await detectPromptInjection(list.outside, classifier)).findings.length > 0) return null;
+  const withheldItems: WithheldToolResultItem[] = [];
+  for (const [index, block] of list.blocks.entries()) {
+    const { findings } = await detectPromptInjection(block, classifier);
+    if (findings.length > 0) withheldItems.push({ index, ...(itemRefOf(block) ? { ref: itemRefOf(block) } : {}), findings });
+  }
+  if (withheldItems.length === 0 || withheldItems.length === list.blocks.length) return null;
+  const withheldByIndex = new Map(withheldItems.map((item) => [item.index, item]));
+  const rewritten = list.rebuild(list.blocks.map((block, index) => {
+    const withheld = withheldByIndex.get(index);
+    return withheld ? withheldItemPlaceholder(withheld) : block;
+  }));
+  // The delivered result must pass the same detector as a whole.
+  if ((await detectPromptInjection(rewritten, classifier)).findings.length > 0) return null;
+  return { value: rewritten, withheldItems };
+}
+
 export async function validateToolContent(input: {
   value: unknown;
   direction: "arguments" | "result";
   sensitiveMode?: "redact" | "block";
   promptInjectionMode?: "redact" | "block" | "ignore";
   classifier?: (content: string) => Promise<PromptInjectionModelOutcome>;
+  /**
+   * Slice H: keep the bounded pre-LR-2 content summary for a result. Callers
+   * set this only for tools whose risk level is not `read`, so approved
+   * actions and ask-first test calls can be delivered from storage. Read-tool
+   * results (every Proton connector tool) stay content-free. Default false.
+   */
+  retainResultSummary?: boolean;
 }) {
   const sensitiveMode = input.sensitiveMode ?? "redact";
   const promptInjectionMode = input.promptInjectionMode ?? (input.direction === "result" ? "block" : "ignore");
-  const redactedValue = isPlainObject(input.value) ? redactEventPayload(input.value) : input.value;
-  const redactedSummary = summarizeToolValue(redactedValue);
+  let redactedValue = isPlainObject(input.value) ? redactEventPayload(input.value) : input.value;
+  const summarize = input.direction === "result" && !input.retainResultSummary ? summarizeToolResultValue : summarizeToolValue;
+  let redactedSummary = summarize(redactedValue);
   const findings: string[] = [];
 
   if (redactedSummary.redactedFields?.length) {
@@ -329,35 +482,27 @@ export async function validateToolContent(input: {
 
   let promptFindings: string[] = [];
   let detectorMetadata: PromptInjectionDetectorMetadata | undefined;
+  let withheldItems: WithheldToolResultItem[] | undefined;
   if (promptInjectionMode !== "ignore") {
-    // Wrapping allows the existing recursive redactor to handle root arrays and
-    // strings, without changing the tool return value or its historical hash.
-    const outbound = redactSensitiveText(stableSerialize(redactEventPayload({ value: input.value })?.value));
-    // A verdict cannot cover text hidden from the model but still delivered to
-    // the caller by the legacy return contract. Fall back before dispatch, so a
-    // secret-named field cannot conceal instructions behind a safe verdict.
-    const outcome: PromptInjectionModelOutcome | undefined = input.classifier
-      ? outbound !== stableSerialize(redactedValue)
-        ? { status: "unavailable", reason: "input_redaction_mismatch" }
-        : await input.classifier(outbound)
-      : undefined;
-    if (outcome?.status === "classified") {
-      promptFindings = outcome.findings;
-      detectorMetadata = { detector: "model", model: outcome.model, invocationId: outcome.invocationId, policyVersion: outcome.policyVersion };
-    } else {
-      promptFindings = scanPromptInjection(input.value);
-      detectorMetadata = { detector: "regex", ...(outcome ? { fallbackReason: outcome.reason, model: outcome.model, invocationId: outcome.invocationId } : {}) };
-    }
+    ({ findings: promptFindings, detectorMetadata } = await detectPromptInjection(input.value, input.classifier));
   }
   if (promptFindings.length > 0) {
     findings.push(...promptFindings);
     if (promptInjectionMode === "block") {
-      throw new ToolContentValidationError(
-        "Tool result contained prompt-injection instructions and was blocked",
-        "prompt_injection_blocked",
-        promptFindings,
-        detectorMetadata,
-      );
+      // A result made of separate items loses only the matching items; every
+      // other result (and every request) is still blocked as a whole.
+      const confined = input.direction === "result" ? await withholdMatchingItems(input.value, input.classifier) : null;
+      if (!confined) {
+        throw new ToolContentValidationError(
+          "Tool result contained prompt-injection instructions and was blocked",
+          "prompt_injection_blocked",
+          promptFindings,
+          detectorMetadata,
+        );
+      }
+      withheldItems = confined.withheldItems;
+      redactedValue = redactEventPayload(confined.value);
+      redactedSummary = summarize(redactedValue);
     }
   }
 
@@ -366,5 +511,6 @@ export async function validateToolContent(input: {
     summary: redactedSummary,
     findings,
     detectorMetadata,
+    ...(withheldItems ? { withheldItems } : {}),
   };
 }

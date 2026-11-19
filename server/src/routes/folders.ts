@@ -9,8 +9,9 @@ import {
   updateFolderSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { badRequest, forbidden } from "../errors.js";
+import { badRequest, forbidden, notFound } from "../errors.js";
 import { folderService, logActivity } from "../services/index.js";
+import { routineHiddenForWrite } from "../services/routine-reference-access.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
 export function folderRoutes(db: Db) {
@@ -104,6 +105,11 @@ export function folderRoutes(db: Db) {
   router.post("/companies/:companyId/folders/items/move", validate(moveFolderItemSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    // Slice H F-H2: moving a routine is a routine write, so a routine the actor
+    // may not read gets the same "not found" as a random routine id.
+    if (req.body.kind === "routine" && await routineHiddenForWrite(db, req.actor, companyId, req.body.itemId)) {
+      throw notFound("Routine not found");
+    }
     const moved = await svc.moveItem(companyId, req.body);
     const actor = getActorInfo(req);
     await logActivity(db, {
