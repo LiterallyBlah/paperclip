@@ -7,6 +7,10 @@ import { startReviewProvider } from "../fixtures/connection-review-provider";
 // agent's continuation sees the size marker instead of the fixture page titles.
 // Upstream asserts the page title "Roadmap" here.
 const READ_RESULT_TEXT = "[content omitted:";
+// A later task under a standing "always" approval runs the tool live with no
+// review card, so the agent receives the real result; only the stored/reviewed
+// paths carry the omission marker.
+const LIVE_READ_RESULT_TEXT = "Roadmap";
 
 type Json = Record<string, unknown>;
 type Seed = { companyId: string; prefix: string };
@@ -372,7 +376,7 @@ for (const journey of [
                 .join("\n"),
             { timeout: 45_000 },
           )
-          .toContain(READ_RESULT_TEXT);
+          .toContain(LIVE_READ_RESULT_TEXT);
         expect(calls()).toBe(2);
         expect(
           await json<unknown[]>(
