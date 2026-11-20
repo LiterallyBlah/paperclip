@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 
-export type TaskDrainState = { startedAt: Date; expiresAt: Date | null; ownerId?: string };
+/**
+ * `operationId` names one maintenance operation (this drain) in its audit
+ * rows, so its exit can re-dispatch the work it ended exactly once.
+ */
+export type TaskDrainState = { startedAt: Date; expiresAt: Date | null; ownerId?: string; operationId?: string };
 let taskDrainState: TaskDrainState | null = null;
 
 export function readTaskDrain(now: Date): TaskDrainState | null {
@@ -11,6 +15,7 @@ export function readTaskDrain(now: Date): TaskDrainState | null {
 export function computeTaskDrain(opts: { ttlMs?: number | null; purpose?: "idle" } = {}): TaskDrainState {
   const startedAt = new Date();
   return { startedAt, expiresAt: opts.ttlMs == null ? null : new Date(startedAt.getTime() + opts.ttlMs),
+    operationId: randomUUID(),
     ...(opts.purpose === "idle" ? { ownerId: randomUUID() } : {}) };
 }
 

@@ -2,6 +2,7 @@ import { loginCleanupSchedule } from "./services/login-cleanup-state.js";
 import { registerLoginCleanupWork } from "./services/login-cleanup-work.js";
 import { timeStartupRecovery } from "./startup-recovery-timing.js";
 import { skillSourceSyncService } from "./services/skill-source-sync.js";
+import { maintenanceRedispatchService } from "./services/maintenance-redispatch.js";
 import {
   SKILL_VERSION_RETENTION_INTERVAL_MS,
   SKILL_VERSION_RETENTION_STARTUP_DELAY_MS,
@@ -1654,6 +1655,20 @@ async function startServerWithDatabaseTeardown(
 
         const promotion = await timeStartupRecovery("scheduled_retries", () => heartbeat.promoteDueScheduledRetries());
         await timeStartupRecovery("queued_runs", () => heartbeat.resumeQueuedRuns());
+        // A task drain that a restart ended has no stop row. Close it and
+        // re-dispatch, once, the work its window ended. This runs after the
+        // orphan reap and queued-run resume, so their retries and resumed
+        // runs count as live continuations and are not dispatched twice.
+        await timeStartupRecovery("maintenance_redispatch", async () => {
+          const companyIds = (await db.select({ id: companies.id }).from(companies)).map((row) => row.id);
+          const result = await maintenanceRedispatchService(db, {
+            wakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts),
+          }).closeDrainEndedByRestart(companyIds);
+          if (result.marked) {
+            logger.info({ operationId: result.operation?.operationId, counts: result.manifest?.counts ?? null },
+              "startup closed a task drain ended by restart");
+          }
+        }).catch((err: unknown) => logger.error({ err }, "startup maintenance re-dispatch failed"));
         const recoveredGoalActions = await timeStartupRecovery("goal_actions", () => heartbeat.recoverPendingSessionGoalActions());
         if (
           recoveredGoalActions.enqueued > 0 ||
