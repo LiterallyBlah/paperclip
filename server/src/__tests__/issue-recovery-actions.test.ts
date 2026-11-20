@@ -1208,6 +1208,38 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     ]);
   });
 
+  it("gives an ownerless provider-quota stranding to the board on both the action and its recovery event", async () => {
+    const { companyId, sourceIssue } = await seedCompany();
+    await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, sourceIssue.id));
+    const [unassigned] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: unassigned!,
+      previousStatus: "in_progress",
+      latestRun: null,
+      recoveryCause: "provider_quota",
+    });
+
+    expect(updated?.status).toBe("blocked");
+    const [action] = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // No return owner means no quota monitor can resume it: a person decides.
+    expect(action).toMatchObject({ cause: "provider_quota", ownerType: "board", ownerAgentId: null,
+      returnOwnerAgentId: null, monitorPolicy: null });
+    expect(action!.evidence).toMatchObject({ routingPolicy: "board_escalation_no_takeover_v1" });
+    const [event] = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId), eq(activityLog.entityId, sourceIssue.id),
+      eq(activityLog.action, "issue.updated"),
+      sql`${activityLog.details}->>'recoveryActionId' = ${action!.id}`,
+    ));
+    expect(event?.details).toMatchObject({ recoveryOwnerType: "board", recoveryOwnerAgentId: null,
+      routingPolicy: "board_escalation_no_takeover_v1" });
+    const notices = await db.select().from(issueComments).where(and(
+      eq(issueComments.issueId, sourceIssue.id), eq(issueComments.authorType, "system")));
+    expect(JSON.stringify(notices.map((notice) => notice.metadata))).toContain("Board decision required");
+  });
+
   it("schedules another provider-quota monitor after a prior quota monitor fired", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     await db.update(issues).set({ monitorAttemptCount: 1 }).where(eq(issues.id, sourceIssueId));
