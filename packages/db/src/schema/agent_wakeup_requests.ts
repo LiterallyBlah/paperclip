@@ -96,6 +96,12 @@ export const agentWakeupRequests = pgTable(
       .on(table.companyId, table.idempotencyKey)
       .concurrently()
       .where(sql`${table.idempotencyKey} LIKE 'tree-hold-resume:%' AND ${table.status} <> 'skipped'`),
+    // One maintenance-exit re-dispatch per operation and task, whatever the
+    // wake's later status: a skipped or cancelled wake still spends it.
+    maintenanceRedispatchIdempotencyUq: uniqueIndex("agent_wakeup_requests_maintenance_redispatch_uq")
+      .on(table.companyId, table.idempotencyKey)
+      .concurrently()
+      .where(sql`${table.idempotencyKey} LIKE 'maintenance_redispatch:%'`),
     chatCompletionIdempotencyUq: uniqueIndex("agent_wakeup_requests_chat_completion_uq")
       .on(table.companyId, table.idempotencyKey)
       .where(sql`${table.idempotencyKey} LIKE 'chat-completion:%'`),

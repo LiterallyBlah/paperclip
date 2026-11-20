@@ -43,6 +43,7 @@ import { timeStartupRecovery } from "./startup-recovery-timing.js";
 import { runtimeAssetRetention } from "./services/native-runtime/runtime-asset-retention.js";
 import { skillPackageWork } from "./services/skill-package-work.js";
 import { skillSourceSyncService } from "./services/skill-source-sync.js";
+import { maintenanceRedispatchService } from "./services/maintenance-redispatch.js";
 import {
   skillVersionRetentionService,
 } from "./services/skill-version-retention.js";
@@ -1734,6 +1735,20 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
+        // A task drain that a restart ended has no stop row. Close it and
+        // re-dispatch, once, the work its window ended. Live runs, retries and
+        // queued wakes are skipped, and the idempotency key keeps it to one
+        // wake per operation and task.
+        await timeStartupRecovery("maintenance_redispatch", async () => {
+          const companyIds = (await db.select({ id: companies.id }).from(companies)).map((row) => row.id);
+          const result = await maintenanceRedispatchService(db, {
+            wakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts),
+          }).closeDrainEndedByRestart(companyIds);
+          if (result.marked) {
+            logger.info({ operationId: result.operation?.operationId, counts: result.manifest?.counts ?? null },
+              "startup closed a task drain ended by restart");
+          }
+        }).catch((err: unknown) => logger.error({ err }, "startup maintenance re-dispatch failed"));
         const recoveredGoalActions = await timeStartupRecovery("goal_actions", () => heartbeat.recoverPendingSessionGoalActions()).catch(err => {
           logger.error({ err }, "startup session-goal action recovery failed");
           return { enqueued: 0, invalid: 0 };
