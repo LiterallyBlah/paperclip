@@ -253,6 +253,66 @@ export function isHandedOffExecutorHold(
     state.currentParticipant.agentId === admittingAgentId;
 }
 
+const UUID_TEXT = z.string().guid();
+const HELD_WAKE_LOOKUP_CHUNK = 500;
+
+/**
+ * Deferred wakes that a blocking recovery hold keeps from ever running.
+ *
+ * A `deferred_issue_execution` wake is promoted only when admission finds no
+ * execution blocker for its agent. While a recovery-action hold (a no-replay or
+ * reconciliation hold) stands, nothing promotes the wake, so it must not count as
+ * a live path for coverage. The check uses the admission rule itself
+ * (`getExecutionBlocker` scoped to the wake's agent), so a hold that does not
+ * gate that agent, or a transient wait on another active execution, still counts
+ * as covered. A hold whose saved-source continuation is already queued is
+ * progressing on its own and is not treated as dead.
+ */
+export async function listDeferredWakeIdsBehindHold(
+  db: Db,
+  companyId: string,
+  wakes: ReadonlyArray<{ id?: string | null; issueId: string | null; agentId?: string | null; status: string }>,
+): Promise<Set<string>> {
+  const behind = new Set<string>();
+  const deferred = wakes.filter((wake): wake is typeof wake & { id: string; issueId: string; agentId: string } =>
+    wake.status === "deferred_issue_execution" && typeof wake.id === "string" &&
+    typeof wake.agentId === "string" && typeof wake.issueId === "string" &&
+    UUID_TEXT.safeParse(wake.issueId).success);
+  if (deferred.length === 0) return behind;
+  const issueIds = [...new Set(deferred.map((wake) => wake.issueId))];
+  const heldIssueIds = new Set<string>();
+  for (let index = 0; index < issueIds.length; index += HELD_WAKE_LOOKUP_CHUNK) {
+    const rows = await db.select({ issueId: issueRecoveryActions.sourceIssueId }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, companyId),
+      inArray(issueRecoveryActions.sourceIssueId, issueIds.slice(index, index + HELD_WAKE_LOOKUP_CHUNK)),
+      executionBlockerPredicate(),
+    ));
+    for (const row of rows) heldIssueIds.add(row.issueId);
+  }
+  if (heldIssueIds.size === 0) return behind;
+  const verdicts = new Map<string, boolean>();
+  for (const wake of deferred) {
+    if (!heldIssueIds.has(wake.issueId)) continue;
+    const key = `${wake.issueId}:${wake.agentId}`;
+    let held = verdicts.get(key);
+    if (held === undefined) {
+      const blocker = await getExecutionBlocker(db, companyId, wake.issueId, { admittingAgentId: wake.agentId });
+      held = Boolean(blocker?.recoveryActionId) && blocker?.workspaceReconstructionPending !== true;
+      verdicts.set(key, held);
+    }
+    if (held) behind.add(wake.id);
+  }
+  return behind;
+}
+
+/** Drops deferred wakes that a blocking recovery hold keeps from running. */
+export async function withoutDeferredWakesBehindHold<
+  T extends { id?: string | null; issueId: string | null; agentId?: string | null; status: string },
+>(db: Db, companyId: string, wakes: T[]): Promise<T[]> {
+  const behind = await listDeferredWakeIdsBehindHold(db, companyId, wakes);
+  return behind.size === 0 ? wakes : wakes.filter((wake) => !(wake.id && behind.has(wake.id)));
+}
+
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: {
   conversationResetCommentId?: string | null;
   /** The agent being admitted; scopes holds that belong to another agent's continuation. */

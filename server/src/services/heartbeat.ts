@@ -1657,6 +1657,7 @@ export function heartbeatService(
     nextAgentTimerAt,
     tickIssueMonitors,
     nextIssueMonitorAt,
+    reconcileTriggeredIssueMonitors,
     recoverActiveSessionGoals,
     recoverPendingSessionGoalActions,
   } = createHeartbeatScheduling(db, {
@@ -4345,6 +4346,7 @@ export function heartbeatService(
     wakeup: trackWakeup,
     dispatchPendingNativeStatusWakeups,
     triggerIssueMonitor,
+    reconcileTriggeredIssueMonitors,
 
     reportRunActivity: clearDetachedRunWarning,
     registerExternalConversationSettlementWork: (

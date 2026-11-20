@@ -13,6 +13,7 @@ import {
   agentSessionGoalActions,
   agents,
   activityLog,
+  agentWakeupRequests,
 } from "@paperclipai/db";
 import {
   type IssueExecutionMonitorPolicy,
@@ -59,6 +60,7 @@ import {
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
 import { logger } from "../../middleware/logger.js";
+import { withoutDeferredWakesBehindHold } from "../execution-blocker.js";
 import { failRunnerGoalAction } from "../runner-goals.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
 import { supportsUnscopedTimerHeartbeat } from "../heartbeat-policy.js";
@@ -73,6 +75,9 @@ import type { NativeSessionGoalControl } from "../../vendor/paperclip-runner/ind
 type HeartbeatQueue = ReturnType<typeof createHeartbeatQueue>;
 type RunPreparation = ReturnType<typeof createHeartbeatRunPreparation>;
 
+
+/** A fired monitor's woken run gets this long to appear before the record is settled. */
+const TRIGGERED_MONITOR_SETTLE_MS = 10 * 60 * 1000;
 export interface HeartbeatSchedulingDependencies
   extends Pick<HeartbeatRetryDependencies, "getRun" | "getAgent" | "getWorktreeExecutionCutoff">,
     Pick<HeartbeatQueue, "enqueueWakeup" | "parseHeartbeatPolicy" | "nextTimerHeartbeatAt" | "claimDueTimerHeartbeat">,
@@ -1128,6 +1133,135 @@ export function createHeartbeatScheduling(
     }
   }
 
+  /**
+   * A fired monitor keeps `executionState.monitor.status = "triggered"` with no
+   * nextCheckAt until the run it woke re-arms or clears it. While that run (or
+   * any other continuation of the issue) is live, the record is accurate. Once
+   * nothing can continue the issue, it no longer describes a wait and must not
+   * read as one, so it is settled to `cleared` with the existing `triggered`
+   * reason. Cumulative attemptCount, lastTriggeredAt, maxAttempts, timeoutAt and
+   * the other monitor metadata are kept (a later re-arm still counts against
+   * them), and the dispatch activity history is untouched.
+   */
+  async function reconcileTriggeredIssueMonitors(now = new Date()) {
+    const settledBefore = new Date(now.getTime() - TRIGGERED_MONITOR_SETTLE_MS);
+    const candidates = await db
+      .select({ ...issueMonitorDispatchColumns, updatedAt: issues.updatedAt })
+      .from(issues)
+      .where(and(
+        sql`${issues.executionState} -> 'monitor' ->> 'status' = 'triggered'`,
+        triggeredMonitorWithoutContinuation(settledBefore),
+      ))
+      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      .limit(50);
+    if (candidates.length === 0) return { checked: 0, cleared: 0 };
+
+    // A deferred wake outside a recovery hold will still run, so it continues
+    // the issue; one that a hold keeps parked does not.
+    const deferredRows = await db
+      .select({
+        id: agentWakeupRequests.id,
+        companyId: agentWakeupRequests.companyId,
+        agentId: agentWakeupRequests.agentId,
+        status: agentWakeupRequests.status,
+        issueId: sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`,
+      })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        inArray(sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`, candidates.map((row) => row.id)),
+      ));
+    const continuedIssueIds = new Set<string>();
+    for (const companyId of new Set(deferredRows.map((row) => row.companyId))) {
+      const live = await withoutDeferredWakesBehindHold(db, companyId,
+        deferredRows.filter((row) => row.companyId === companyId));
+      for (const row of live) if (row.issueId) continuedIssueIds.add(row.issueId);
+    }
+
+    let cleared = 0;
+    for (const candidate of candidates) {
+      if (continuedIssueIds.has(candidate.id)) continue;
+      const patch = buildIssueMonitorClearedPatch({
+        issue: candidate,
+        policy: normalizeIssueExecutionPolicy(candidate.executionPolicy ?? null),
+        clearReason: "triggered",
+        clearedAt: now,
+      });
+      const monitorState = parseIssueExecutionState(patch.executionState)?.monitor ?? null;
+      if (!monitorState) continue;
+      const updated = await db
+        .update(issues)
+        .set({
+          // Only the monitor record changes; review state and policy are kept.
+          executionState: sql`jsonb_set(${issues.executionState}, '{monitor}', ${JSON.stringify(monitorState)}::jsonb)`,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issues.id, candidate.id),
+          eq(issues.companyId, candidate.companyId),
+          eq(issues.updatedAt, candidate.updatedAt),
+          sql`${issues.executionState} -> 'monitor' ->> 'status' = 'triggered'`,
+          triggeredMonitorWithoutContinuation(settledBefore),
+        ))
+        .returning({ id: issues.id });
+      if (updated.length === 0) continue;
+      cleared += 1;
+      await logActivity(db, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "heartbeat_scheduler",
+        agentId: null,
+        runId: null,
+        action: "issue.monitor_cleared",
+        entityType: "issue",
+        entityId: candidate.id,
+        details: {
+          identifier: candidate.identifier,
+          reason: "triggered",
+          source: "triggered_without_continuation",
+          lastTriggeredAt: monitorState.lastTriggeredAt ?? null,
+          attemptCount: monitorState.attemptCount,
+          maxAttempts: monitorState.maxAttempts ?? null,
+          timeoutAt: monitorState.timeoutAt ?? null,
+          notes: monitorState.notes ?? null,
+        },
+      });
+    }
+    return { checked: candidates.length, cleared };
+  }
+
+  /**
+   * The issue holds no schedule of its own and has nothing that can continue
+   * it: no execution lock, no queued/running/retrying run, no queued or claimed
+   * wake, and no native finalization still settling.
+   */
+  function triggeredMonitorWithoutContinuation(settledBefore: Date) {
+    return and(
+      notInArray(issues.status, ["done", "cancelled"]),
+      isNull(issues.monitorNextCheckAt),
+      isNull(issues.monitorWakeRequestedAt),
+      isNull(issues.executionRunId),
+      isNull(issues.checkoutRunId),
+      sql`coalesce(jsonb_typeof(${issues.executionPolicy} -> 'monitor'), 'null') = 'null'`,
+      sql`coalesce(${issues.monitorLastTriggeredAt}, ${issues.updatedAt}) <= ${settledBefore.toISOString()}::timestamptz`,
+      sql`not exists (select 1 from ${heartbeatRuns} live_run
+        where live_run.company_id = ${issues.companyId}
+          and live_run.status in ('queued', 'running', 'scheduled_retry')
+          and (live_run.native_issue_id = ${issues.id}
+            or live_run.context_snapshot ->> 'issueId' = ${issues.id}::text
+            or live_run.context_snapshot ->> 'taskId' = ${issues.id}::text))`,
+      sql`not exists (select 1 from ${agentWakeupRequests} live_wake
+        where live_wake.company_id = ${issues.companyId}
+          and live_wake.status in ('queued', 'claimed')
+          and (live_wake.payload ->> 'issueId' = ${issues.id}::text
+            or live_wake.payload ->> 'taskId' = ${issues.id}::text))`,
+      sql`not exists (select 1 from ${nativeRunFinalizations} settling
+        where settling.company_id = ${issues.companyId}
+          and settling.issue_id = ${issues.id}
+          and settling.phase not in ('committed', 'applied', 'terminal_failure'))`,
+    );
+  }
+
   function noActiveNativeMonitorRun() {
     return sql`not exists (select 1 from ${heartbeatRuns} monitor_run
       where monitor_run.company_id = ${issues.companyId}
@@ -1328,7 +1462,13 @@ export function createHeartbeatScheduling(
     if (!canContinue() || (await getSchedulingSuppression(true)).suppressed) {
       return { checked: 0, triggered: 0, skipped: 0 };
     }
-    return tickDueIssueMonitors(now, canContinue);
+    const issueMonitors = await tickDueIssueMonitors(now, canContinue);
+    try {
+      await reconcileTriggeredIssueMonitors(now);
+    } catch (err) {
+      logger.error({ err }, "triggered issue monitor reconciliation failed");
+    }
+    return issueMonitors;
   }
 
   async function nextIssueMonitorAt(): Promise<number | null> {
@@ -1597,6 +1737,7 @@ export function createHeartbeatScheduling(
     nextAgentTimerAt,
     tickIssueMonitors,
     nextIssueMonitorAt,
+    reconcileTriggeredIssueMonitors,
     recoverActiveSessionGoals,
     recoverPendingSessionGoalActions,
   };
