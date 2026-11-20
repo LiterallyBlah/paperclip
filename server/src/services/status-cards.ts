@@ -939,6 +939,7 @@ export function statusCardService(
       updatesLastHour: recent.filter((row) => row.kind !== "compile" && row.finishedAt).length,
       tokensToday: Number(daily[0]?.tokens ?? 0),
       manual: forceRun,
+      lastGeneratedAt: card.lastGeneratedAt,
     });
     if (decision.action !== "run") {
       const [next] = await db.update(statusCards).set({
