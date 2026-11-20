@@ -165,6 +165,25 @@ export function chooseStatusCardUpdateKind(input: {
   return "incremental" as const;
 }
 
+/**
+ * Smallest gap kept between two reactive generations of one card. Watched
+ * issues change every few minutes on a busy card, which is longer than the
+ * card's trailing debounce, so without a floor each single change became its
+ * own model run. Changes that arrive inside the window are coalesced into the
+ * next generation; nothing is dropped (the stored fingerprint stays the diff
+ * baseline until a summary is written).
+ */
+export const STATUS_CARD_REACTIVE_MIN_SPACING_SECONDS = 20 * 60;
+
+/**
+ * Minimum spacing between reactive generations: the card's hourly cap spread
+ * evenly (3600 / maxUpdatesPerHour), but never below the server floor.
+ */
+export function statusCardReactiveSpacingSeconds(policy: StatusCardRefreshPolicy) {
+  const perHour = Math.max(1, policy.maxUpdatesPerHour ?? 6);
+  return Math.max(Math.ceil(3600 / perHour), STATUS_CARD_REACTIVE_MIN_SPACING_SECONDS);
+}
+
 export function evaluateStatusCardPolicy(input: {
   policy: StatusCardRefreshPolicy;
   now: Date;
@@ -172,6 +191,8 @@ export function evaluateStatusCardPolicy(input: {
   updatesLastHour: number;
   tokensToday: number;
   manual: boolean;
+  /** When the card's last summary was written; reactive runs keep a minimum gap after it. */
+  lastGeneratedAt?: Date | null;
 }) {
   const cap = input.policy.dailyTokenCap ?? 100_000;
   if (!input.manual && input.tokensToday >= cap) return { action: "pause_budget" as const };
@@ -180,7 +201,14 @@ export function evaluateStatusCardPolicy(input: {
   if (input.policy.mode === "manual") return { action: "wait" as const };
   if (input.policy.mode === "reactive") {
     if (input.updatesLastHour >= (input.policy.maxUpdatesPerHour ?? 6)) return { action: "wait" as const };
-    const dueAt = new Date((input.lastChangeAt ?? input.now).getTime() + (input.policy.debounceSeconds ?? 60) * 1000);
+    // Trailing debounce: wait until the pending change set has been stable for
+    // debounceSeconds. Coalescing: and until the minimum spacing since the last
+    // generation has passed, so a burst becomes one run.
+    const debouncedAt = (input.lastChangeAt ?? input.now).getTime() + (input.policy.debounceSeconds ?? 60) * 1000;
+    const spacedAt = input.lastGeneratedAt
+      ? input.lastGeneratedAt.getTime() + statusCardReactiveSpacingSeconds(input.policy) * 1000
+      : 0;
+    const dueAt = new Date(Math.max(debouncedAt, spacedAt));
     if (dueAt > input.now) return { action: "wait" as const, dueAt };
   }
   return { action: "run" as const };
