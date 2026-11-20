@@ -14667,7 +14667,16 @@ export function issueRoutes(
       }
       const enteringBlocked =
         existing.status !== "blocked" && updateFields.status === "blocked";
-      if (enteringBlocked) {
+      // A task that stays blocked can lose its last real wait through a later
+      // edit: an emptied blocker list or a cleared unblock descriptor. That
+      // leaves a narrative-only block nothing will ever wake, so it takes the
+      // same check as entering blocked.
+      const droppingBlockedWait =
+        existing.status === "blocked" &&
+        nextStatus === "blocked" &&
+        (Array.isArray(req.body.blockedByIssueIds) ||
+          (req.body.unblockDescriptor === null && existing.unblockDescriptor != null));
+      if (enteringBlocked || droppingBlockedWait) {
         const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
           ? [...new Set(req.body.blockedByIssueIds as string[])]
           : null;
@@ -14715,15 +14724,47 @@ export function issueRoutes(
             .limit(1)
             .then((rows) => rows[0] ?? null),
         ]);
+        // A person who owns the task, or the current human stage participant,
+        // is a native human wait the board already sees.
+        const nextAssigneeUserId =
+          updateFields.assigneeUserId !== undefined
+            ? updateFields.assigneeUserId
+            : existing.assigneeUserId;
+        const nextExecutionState = parseIssueExecutionState(
+          updateFields.executionState !== undefined
+            ? updateFields.executionState
+            : existing.executionState,
+        );
+        const humanWait =
+          Boolean(nextAssigneeUserId) ||
+          (nextExecutionState?.status === "pending" &&
+            nextExecutionState.currentParticipant?.type === "user");
+        // An active recovery action that already holds a blocked task is its
+        // own board-visible wait; editing the task's links must not fail on it.
+        const recoveryHeld =
+          droppingBlockedWait &&
+          (activeRecoveryActionBeforeUpdate ??
+            (await recoveryActionsSvc.getActiveForIssue(
+              existing.companyId,
+              existing.id,
+            ))) != null;
+        const effectiveDescriptor = enteringBlocked
+          ? descriptor
+          : updateFields.unblockDescriptor !== undefined
+            ? updateFields.unblockDescriptor
+            : existing.unblockDescriptor;
         if (
           !hasUnresolvedBlocker &&
           !pendingInteraction &&
           !pendingApproval &&
-          !descriptor
+          !humanWait &&
+          !recoveryHeld &&
+          !effectiveDescriptor
         ) {
           res.status(422).json({
-            error:
-              "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
+            error: enteringBlocked
+              ? "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor"
+              : "A blocked task must keep unresolved blockers, a pending interaction/approval, or unblockDescriptor; move it out of blocked instead",
           });
           return;
         }
