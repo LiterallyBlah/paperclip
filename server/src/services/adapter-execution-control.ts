@@ -9,7 +9,36 @@ export function createAdapterExecutionControl() {
   const settled = new Promise<void>((resolve) => {
     finish = resolve;
   });
-  return { controller, settled, phases, finish: () => { phases.finish(); finish(); } };
+  return {
+    controller,
+    settled,
+    phases,
+    // What the adapter reported when it returned after an abort. The run row
+    // has usually left "running" by then, so the late result write is skipped;
+    // the shutdown drain reads this to record whether the stop was confirmed.
+    cancellationOutcome: null as AdapterCancellationOutcome | null,
+    finish: () => { phases.finish(); finish(); },
+  };
+}
+
+export type AdapterCancellationOutcome = {
+  executionCancellation?: Record<string, unknown>;
+  executionRecovery?: Record<string, unknown>;
+};
+
+/** Keeps only the stop evidence of a result returned after an abort. */
+export function readAdapterCancellationOutcome(result: {
+  resultJson?: Record<string, unknown> | null;
+  executionRecovery?: unknown;
+} | null | undefined): AdapterCancellationOutcome | null {
+  const cancellation = result?.resultJson?.executionCancellation;
+  const recovery = result?.executionRecovery ?? result?.resultJson?.executionRecovery;
+  const outcome: AdapterCancellationOutcome = {};
+  if (cancellation && typeof cancellation === "object" && !Array.isArray(cancellation))
+    outcome.executionCancellation = cancellation as Record<string, unknown>;
+  if (recovery && typeof recovery === "object" && !Array.isArray(recovery))
+    outcome.executionRecovery = recovery as Record<string, unknown>;
+  return outcome.executionCancellation || outcome.executionRecovery ? outcome : null;
 }
 
 export const adapterExecutionControls = new Map<
