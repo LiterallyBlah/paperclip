@@ -801,7 +801,7 @@ const support = await getEmbeddedPostgresTestSupport();
       const message = await issueService(db).addComment(chat.id, "Old topic", { userId: "local-board" });
       const run = await runFor(chat.id, message.id);
       await prepareConversationTurn(db, run);
-      await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, run.id));
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
       const previousSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
       process.env.PAPERCLIP_AGENT_JWT_SECRET = "test-conversation-cancellation-secret";
       try {

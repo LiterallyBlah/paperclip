@@ -13,6 +13,7 @@ import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { assertCompanyAccess } from "../routes/authz.js";
+import { AGENT_RUN_AUTH_FINISHED_GRACE_MS } from "../middleware/agent-run-authentication.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -34,7 +35,8 @@ function createDbState(input: {
   agent: { id: string; companyId: string; status?: string; lifecycleHolds?: string[] };
   agentKey?: { id: string; agentId: string; companyId: string; keyHash: string; responsibleUserId?: string | null };
   run?: { id: string; companyId: string; agentId: string; responsibleUserId?: string | null;
-    status?: string; contextSnapshot?: Record<string, unknown>; resultJson?: Record<string, unknown> };
+    status?: string; contextSnapshot?: Record<string, unknown>; resultJson?: Record<string, unknown>;
+    finishedAt?: Date | null };
 }) {
   const activity: Array<Record<string, unknown>> = [];
   const agentRow = {
@@ -63,6 +65,7 @@ function createDbState(input: {
         status: input.run.status ?? "running",
         contextSnapshot: input.run.contextSnapshot ?? {},
         resultJson: input.run.resultJson ?? {},
+        finishedAt: input.run.finishedAt ?? null,
       }
     : null;
 
@@ -105,6 +108,9 @@ function createApp(db: any, deploymentMode: "authenticated" | "local_trusted" = 
     }),
   );
   app.get("/actor", (req, res) => {
+    res.json(req.actor);
+  });
+  app.post("/actor-write", (req, res) => {
     res.json(req.actor);
   });
   app.post("/api/routine-triggers/public/:publicId/fire", (req, res) => {
@@ -195,6 +201,8 @@ describe("agent auth middleware", () => {
     const { db } = createDbState({ agent: { id: agentId, companyId }, run: {
       id: runId, companyId, agentId, status, contextSnapshot: { conversationMode },
       resultJson: requested ? { executionCancellation: { state: "requested" } } : {},
+      // A cancelled run always records when it finished; this one just did.
+      finishedAt: status === "cancelled" ? new Date() : null,
     } });
     const token = createLocalAgentJwt(agentId, companyId, "grok_local", runId, null);
     const client = createApp(db);
@@ -592,5 +600,163 @@ describe("agent auth middleware", () => {
       entityId: keyId,
       details: { method: "GET", url: `/companies/${companyId}/protected` },
     });
+  });
+});
+
+describe("run-bound agent JWT revocation after the run finishes", () => {
+  const originalSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+  const originalTtl = process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS;
+  const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+  const terminalStatuses = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"] as const;
+  const pastGrace = () => new Date(Date.now() - AGENT_RUN_AUTH_FINISHED_GRACE_MS - 60_000);
+  const insideGrace = () => new Date(Date.now() - Math.floor(AGENT_RUN_AUTH_FINISHED_GRACE_MS / 2));
+
+  beforeEach(() => {
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "auth-middleware-secret";
+    process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS = "3600";
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+  });
+
+  afterEach(() => {
+    if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret;
+    if (originalTtl === undefined) delete process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS;
+    else process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS = originalTtl;
+    if (originalInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+    else process.env.PAPERCLIP_INSTANCE_ID = originalInstanceId;
+  });
+
+  function fixture(run: { status: string; finishedAt?: Date | null; conversationMode?: boolean } | null,
+    adapterType = "codex_local") {
+    const agentId = randomUUID();
+    const companyId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId }, ...(run ? { run: {
+      id: runId, companyId, agentId, status: run.status, finishedAt: run.finishedAt ?? null,
+      contextSnapshot: { conversationMode: run.conversationMode === true },
+    } } : {}) });
+    const token = createLocalAgentJwt(agentId, companyId, adapterType, runId, null);
+    const endpoint = `/companies/${companyId}/issues/${randomUUID()}`;
+    const client = createApp(db);
+    return {
+      runId,
+      read: () => request(client).get(endpoint).set("Authorization", `Bearer ${token}`),
+      write: () => request(client).patch(endpoint).set("Authorization", `Bearer ${token}`).send({ status: "done" }),
+    };
+  }
+
+  it.each(terminalStatuses)("rejects reads and writes for a %s run finished beyond the grace", async status => {
+    const f = fixture({ status, finishedAt: pastGrace() });
+    for (const res of [await f.read(), await f.write()]) {
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ code: "agent_run_finished", error: "This run has finished; its credentials no longer authenticate" });
+    }
+  });
+
+  it.each(terminalStatuses)("fails closed for a %s run without finishedAt", async status => {
+    const f = fixture({ status, finishedAt: null });
+    for (const res of [await f.read(), await f.write()]) {
+      expect(res.status).toBe(401);
+      expect(res.body.code).toBe("agent_run_finished");
+    }
+  });
+
+  it("rejects reads and writes when the run row is missing", async () => {
+    const f = fixture(null);
+    for (const res of [await f.read(), await f.write()]) {
+      expect(res.status).toBe(401);
+      expect(res.body.code).toBe("agent_run_not_found");
+    }
+  });
+
+  it("rejects a JWT whose run id is not a UUID without querying it", async () => {
+    const agentId = randomUUID();
+    const companyId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId }, run: { id: "not-a-uuid", companyId, agentId } });
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", "not-a-uuid", "user-1");
+    const res = await request(createApp(db)).get("/actor").set("Authorization", `Bearer ${token}`);
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe("agent_run_not_found");
+  });
+
+  it.each(["queued", "scheduled_retry", "running"])("keeps reads and writes for a %s run", async status => {
+    const f = fixture({ status });
+    const read = await f.read();
+    expect(read.status).toBe(200);
+    expect(read.body.readable).toBe(true);
+    const write = await f.write();
+    expect(write.status).toBe(200);
+    expect(write.body.writable).toBe(true);
+  });
+
+  it.each(["succeeded", "failed", "timed_out", "interrupted"])("keeps a %s run's authority inside the grace", async status => {
+    const f = fixture({ status, finishedAt: insideGrace() });
+    expect((await f.read()).status).toBe(200);
+    expect((await f.write()).status).toBe(200);
+  });
+
+  it.each([false, true])("keeps the cancelled-write 403 and reads inside the grace (conversation %s)", async conversationMode => {
+    const f = fixture({ status: "cancelled", finishedAt: insideGrace(), conversationMode });
+    const write = await f.write();
+    expect(write.status).toBe(403);
+    expect(write.body.code).toBe(conversationMode ? "conversation_turn_cancelled" : "agent_run_cancelled");
+    const read = await f.read();
+    expect(read.status).toBe(200);
+    expect(read.body.readable).toBe(true);
+  });
+
+  it("applies the same rule to a JWT carrying a gateway adapter type", async () => {
+    const live = fixture({ status: "running" }, "hermes_gateway");
+    expect((await live.write()).status).toBe(200);
+    const settling = fixture({ status: "succeeded", finishedAt: insideGrace() }, "hermes_gateway");
+    expect((await settling.write()).status).toBe(200);
+    const finished = fixture({ status: "succeeded", finishedAt: pastGrace() }, "hermes_gateway");
+    expect((await finished.read()).status).toBe(401);
+    expect((await finished.write()).status).toBe(401);
+  });
+
+  it("rejects a native tool JWT for a finished run before native authority is consulted", async () => {
+    const agentId = randomUUID();
+    const companyId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId }, run: {
+      id: runId, companyId, agentId, status: "succeeded", finishedAt: pastGrace(),
+    } });
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId, "user-1", { kind: "standard" }, "user-authorizing");
+    const res = await request(createApp(db)).get("/actor").set("Authorization", `Bearer ${token}`);
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe("agent_run_finished");
+  });
+
+  it("keeps the native tool authority check for a native JWT inside the grace", async () => {
+    const agentId = randomUUID();
+    const companyId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId }, run: {
+      id: runId, companyId, agentId, status: "succeeded", finishedAt: insideGrace(),
+    } });
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId, "user-1", { kind: "standard" }, "user-authorizing");
+    const res = await request(createApp(db)).get("/actor").set("Authorization", `Bearer ${token}`);
+    // The existing native check still requires a running native run.
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Muse native tool authority is unavailable");
+  });
+
+  it("does not affect long-lived agent API keys", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const token = "pcp_long_lived_agent_key";
+    const { db } = createDbState({
+      agent: { id: agentId, companyId },
+      agentKey: { id: randomUUID(), agentId, companyId, keyHash: hashToken(token), responsibleUserId: "user-key" },
+      run: { id: randomUUID(), companyId, agentId, status: "succeeded", finishedAt: pastGrace() },
+    });
+    const client = createApp(db);
+    const res = await request(client).get("/actor").set("Authorization", `Bearer ${token}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ type: "agent", agentId, source: "agent_key", onBehalfOfUserId: "user-key" });
+    const write = await request(client).post("/actor-write").set("Authorization", `Bearer ${token}`).send({});
+    expect(write.status).toBe(200);
+    expect(write.body).toMatchObject({ type: "agent", source: "agent_key" });
   });
 });
