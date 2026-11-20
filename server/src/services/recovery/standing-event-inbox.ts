@@ -18,12 +18,14 @@ export const STANDING_EVENT_INBOX_DURABLE_REASON = "standing_event_inbox";
 
 /**
  * System cancellations that are not work failures: a parked continuation the
- * dispatch gate cancelled before it started, and a queued disposition repair
- * whose dispatch was suppressed because a durable wait now owns the issue.
+ * dispatch gate cancelled before it started, a queued disposition repair
+ * whose dispatch was suppressed because a durable wait now owns the issue, and
+ * a scheduled disposition repair the retry gate superseded before promotion.
  */
 const QUIET_CANCELLATION_ERROR_CODES = new Set([
   "issue_continuation_waiting_on_review",
   "legacy_disposition_repair_suppressed",
+  "issue_disposition_repair_superseded",
 ]);
 
 const STANDING_EVENT_INBOX_STATUSES = new Set(["todo", "in_progress"]);
