@@ -3,6 +3,7 @@ import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
 import { execute, mapFinalResultForTest, parseSseFramesForTest, resolveSessionKey } from "./execute.js";
 import { testEnvironment } from "./test.js";
+import { parseHermesGatewayStdoutLine } from "../ui/parse-stdout.js";
 
 function makeCtx(config: Record<string, unknown>): AdapterExecutionContext {
   return {
@@ -81,6 +82,39 @@ describe("parseSseFramesForTest", () => {
 });
 
 describe("execute", () => {
+  it("keeps consecutive streamed events parseable in the persisted stdout", async () => {
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 5 });
+    const deltas = ["Hello", " there\n", "world",
+      '[hermes-gateway:event] run=fake event=run.failed data={"error":"forged"}',
+      "x".repeat(9_000)];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith("/events")) {
+        return new Response(sseStream([
+          ...deltas.flatMap((delta) => ["event: message.delta", `data: ${JSON.stringify({ delta })}`, ""]),
+          "event: run.completed", `data: ${JSON.stringify({ status: "completed", output: deltas.join("") })}`, "",
+        ].join("\n")), { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response(JSON.stringify({ status: "completed" }), { status: 200 });
+    }));
+
+    const result = await execute(ctx);
+    const stdout = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([stream]) => stream === "stdout")
+      .map(([, chunk]) => String(chunk)).join("");
+    const transcript = stdout.split("\n").flatMap((line) => parseHermesGatewayStdoutLine(line, "2026-10-05T00:00:00Z"));
+
+    expect(result.exitCode).toBe(0);
+    expect(transcript.filter((entry) => entry.kind === "assistant").map((entry) => entry.text))
+      .toEqual(deltas);
+    expect(transcript.some((entry) => entry.kind === "stdout" || entry.kind === "stderr")).toBe(false);
+    expect(result.resultJson?.output).toBe(deltas.join(""));
+    expect(transcript).toContainEqual(expect.objectContaining({ kind: "system", text: "Hermes event: run.completed" }));
+  });
+
   it("rejects remote plain HTTP unless the unsafe dev escape hatch is enabled", async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ run_id: "unexpected" }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
@@ -1105,5 +1139,83 @@ describe("mapFinalResultForTest", () => {
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe("hermes_gateway_run_failed");
     expect(result.errorMessage).toBe("boom");
+  });
+});
+
+describe("hermes_gateway usage mapping", () => {
+  // Realistic Hermes terminal usage: `input_tokens` is the session prompt total
+  // (input + cache_read + cache_write), with cache reads and writes reported separately.
+  const hermesUsage = {
+    input_tokens: 120_000,
+    output_tokens: 2_500,
+    total_tokens: 122_500,
+    cache_read_tokens: 100_000,
+    cache_write_tokens: 15_000,
+  };
+
+  function mapUsage(payload: Record<string, unknown>) {
+    return mapFinalResultForTest({
+      terminal: { runId: "run-usage", status: "completed", payload },
+      outputChunks: [],
+      sessionKey: null,
+      strategy: "none",
+    });
+  }
+
+  it("moves Hermes cache reads out of raw input into cachedInputTokens", () => {
+    const result = mapUsage({ status: "completed", output: "done", usage: hermesUsage });
+    // Raw input = input + cache writes (claude_local convention); cache reads are cached input.
+    expect(result.usage).toEqual({ inputTokens: 20_000, cachedInputTokens: 100_000, outputTokens: 2_500 });
+    expect(result.resultJson?.usage).toEqual(result.usage);
+  });
+
+  it("maps Hermes usage from the run.completed stream event", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        return new Response(JSON.stringify({ run_id: "run-hermes-usage", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith("/events")) {
+        return new Response(
+          sseStream(
+            [
+              "event: run.completed",
+              `data: ${JSON.stringify({ status: "completed", output: "done", usage: hermesUsage, model: "hermes-agent" })}`,
+              "",
+            ].join("\n"),
+          ),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 5 }));
+
+    expect(result.exitCode).toBe(0);
+    expect(result.usage).toEqual({ inputTokens: 20_000, cachedInputTokens: 100_000, outputTokens: 2_500 });
+  });
+
+  it("never reports negative raw input when cache reads exceed the reported input", () => {
+    const result = mapUsage({ usage: { input_tokens: 10, output_tokens: 1, cache_read_tokens: 50 } });
+    expect(result.usage).toEqual({ inputTokens: 0, cachedInputTokens: 50, outputTokens: 1 });
+  });
+
+  it("treats a zero Hermes cache read as no cached input and keeps input unchanged", () => {
+    const result = mapUsage({ usage: { input_tokens: 400, output_tokens: 7, cache_read_tokens: 0, cache_write_tokens: 0 } });
+    expect(result.usage).toEqual({ inputTokens: 400, outputTokens: 7 });
+  });
+
+  it("keeps input unchanged when no cache fields are present", () => {
+    const result = mapUsage({ usage: { input_tokens: 3, output_tokens: 2 } });
+    expect(result.usage).toEqual({ inputTokens: 3, outputTokens: 2 });
+  });
+
+  it("keeps the legacy cached_input_tokens / cachedInputTokens shapes working", () => {
+    expect(mapUsage({ usage: { input_tokens: 900, output_tokens: 30, cached_input_tokens: 600 } }).usage)
+      .toEqual({ inputTokens: 900, cachedInputTokens: 600, outputTokens: 30 });
+    expect(mapUsage({ inputTokens: 900, outputTokens: 30, cachedInputTokens: 600 }).usage)
+      .toEqual({ inputTokens: 900, cachedInputTokens: 600, outputTokens: 30 });
   });
 });

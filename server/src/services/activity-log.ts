@@ -1,3 +1,6 @@
+import { notifyActiveRunSilence } from "./live-run-recovery-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { beginRunPhase } from "./execution-preparation-timing.js";
 import type { ActivityPublication } from "../types/activity-publication.js";
 export type { ActivityPublication } from "../types/activity-publication.js";
 import { randomUUID } from "node:crypto";
@@ -27,9 +30,36 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
   budget_soft_threshold_crossed: "budget.incident.opened",
   budget_hard_threshold_crossed: "budget.incident.opened",
   budget_incident_resolved: "budget.incident.resolved",
+  // Recovery escalations that move an issue into `blocked` keep their own
+  // audit action name, but they are issue status changes and must reach
+  // plugins as `issue.updated` like any other status transition.
+  issue_disposition_repair_escalated: "issue.updated",
+  issue_successful_run_handoff_escalated: "issue.updated",
+  issue_review_path_recovery_exhausted: "issue.updated",
 };
 
 let _pluginEventBus: PluginEventBus | null = null;
+
+/**
+ * Observer called for every published activity row and plugin domain event
+ * (`eventType` is null for an activity row without a plugin event). Used by
+ * plugin-decision-events to re-evaluate computed blocker attention.
+ */
+export type PluginDomainActivityObserver = (companyId: string, eventType: string | null) => void;
+let _domainActivityObserver: PluginDomainActivityObserver | null = null;
+
+export function setPluginDomainActivityObserver(fn: PluginDomainActivityObserver | null): void {
+  _domainActivityObserver = typeof fn === "function" ? fn : null;
+}
+
+function notifyDomainActivityObserver(companyId: string, eventType: string | null): void {
+  if (!_domainActivityObserver) return;
+  try {
+    _domainActivityObserver(companyId, eventType);
+  } catch (err) {
+    logger.warn({ err }, "plugin domain activity observer failed");
+  }
+}
 
 /** Wire the plugin event bus so domain events are forwarded to plugins. */
 export function setPluginEventBus(bus: PluginEventBus): void {
@@ -40,12 +70,16 @@ export function setPluginEventBus(bus: PluginEventBus): void {
 }
 
 function eventTypeForActivityAction(action: string): PluginEventType | null {
+  // The interaction service publishes this plugin event itself, once per
+  // created row and with the addressee fields; the activity row stays as it is.
+  if (action === "issue.thread_interaction_created") return null;
   if (PLUGIN_EVENT_SET.has(action)) return action as PluginEventType;
   return ACTIVITY_ACTION_TO_PLUGIN_EVENT[action.replaceAll(".", "_")] ?? null;
 }
 
 export function publishPluginDomainEvent(event: PluginEvent): void {
   if (!_pluginEventBus) return;
+  notifyDomainActivityObserver(event.companyId, event.eventType);
   void _pluginEventBus.emit(event).then(({ errors }) => {
     for (const { pluginId, error } of errors) {
       logger.warn({ pluginId, eventType: event.eventType, err: error }, "plugin event handler failed");
@@ -66,6 +100,7 @@ export interface LogActivityInput {
   issueId?: string | null;
   details?: Record<string, unknown> | null;
   responsibleUserIdOverride?: string | null;
+  authorization?: { action: string; operation: string; reason: string };
 }
 
 
@@ -146,18 +181,26 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
 }
 
 export function publishActivity(publication: ActivityPublication) {
+  const finish = beginRunPhase("execution.realtime");
+  try {
   publishLiveEvent({
     companyId: publication.companyId,
     type: "activity.logged",
     payload: publication.payload,
   });
   if (publication.pluginEvent) publishPluginDomainEvent(publication.pluginEvent);
+  else notifyDomainActivityObserver(publication.companyId, null);
+  } catch (error) {
+    finish(true);
+    throw error;
+  } finally { finish(); }
 }
 
-export async function persistActivity(db: Db, input: LogActivityInput) {
-  const redactedDetails = await redactActivityDetails(db, input.details ?? null);
+export async function persistActivity(db: Db, input: LogActivityInput, receipt?: { id: string }) {
+  const redactedDetails = await redactActivityDetails(db, input.authorization ? { ...input.details, permissionDecision: input.authorization, ...(input.agentApiKeyId ? { agentApiKeyId: input.agentApiKeyId } : {}) } : input.details ?? null);
   const responsibleUserId = await resolveResponsibleUserIdForActivity(db, input);
-  const [activity] = await db.insert(activityLog).values({
+  const insert = (runner: Db) => runner.insert(activityLog).values({
+    ...(receipt ? { id: receipt.id } : {}),
     companyId: input.companyId,
     actorType: input.actorType,
     actorId: input.actorId,
@@ -169,6 +212,14 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
     responsibleUserId,
     details: redactedDetails,
   }).returning({ id: activityLog.id });
+  const [activity] = input.entityType === "issue"
+    ? await db.transaction(async tx => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, `task:${input.entityId}`);
+      if (input.runId && input.action === "issue.updated" && ["done", "cancelled"].includes(String(input.details?.status)))
+        await notifyActiveRunSilence(tx, { companyId: input.companyId, runId: input.runId });
+      return insert(tx as unknown as Db);
+    })
+    : await insert(db);
 
   const payload = {
     issueId: input.issueId ?? (input.entityType === "issue" ? input.entityId : null),

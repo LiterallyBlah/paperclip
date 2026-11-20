@@ -63,3 +63,20 @@ Useful focused surfaces include `packages/adapters/muse-local`, `packages/adapte
 Do not commit database dumps, encryption/signing keys, provider credentials, SSH identities, user profiles, execution logs or private deployment configuration. Back up those separately with restrictive permissions. Preserve the application database, encryption/signing configuration, connection state and external Hermes profile/managed-role files; a source backup alone cannot restore the service. Conversely, a database backup cannot restore a missing adapter implementation.
 
 The host-specific activation, backup and health-check details belong in the operator's private `paperclip-native-ops` skill, not in this public source fork.
+
+## v2026.1117.0 base move (BLA-1924)
+
+`bla1918/merge-v2026.1117.0` merges upstream `v2026.1117.0` (`c0f132898d2a2677312d8c72096187b27a3d9a38`) into `blahsec-integration` (`16cf4f45c1d4`). It carries every local fix as a `cherry-pick -x` or an explicit adaptation commit:
+
+- the `blahsec-integration-1106` ledger (`820d9888`);
+- the live `bla-1227/port-on-249694b7` line;
+- the dist-only live overlays, now as source: privacy-a660b752, the rest of f1-5bd2c109, cov-70ebed05, d21-4b9effdb plus #21355, mcx-35fed489 (fork PR #28), and bla433-r3 RR1;
+- #21070 together with its reviewed security follow-up.
+
+Dropped only where the tag demonstrably covers it: `6e1e6646` (#18838), `0cfc13868` (ubuntu-26.04 runner tests) and `8f715d3d2` (#19457 and #20180). Not adopted: #21102, because its required CI is red.
+
+The muse migration was renumbered `0334` → `0452`.
+
+The row-per-patch ledger, with upstream-inclusion evidence and the location in the candidate, is the `patch-table` document on BLA-1924. Re-check each open upstream PR named there at the next base move.
+
+RR1 host artefacts (launcher, git shim, sudoers, systemd drop-in, `/etc/paperclip/agent-launch.json`) are host-side and are not in this repository.

@@ -3,8 +3,18 @@ import { Eye, EyeOff, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { PopoverTitle, PopoverDescription } from "@/components/ui/popover";
+import { REDACTED_COMMAND_TEXT_VALUE } from "@paperclipai/adapter-utils";
 
 const SECRET_NAME_RE = /^[a-z][a-z0-9_]*$/;
+
+/**
+ * Reads redact every plain env value to this display placeholder. It is never a
+ * real value, so it must never become a secret's stored value (the server also
+ * rejects it). Compared after trimming, matching the server check.
+ */
+function isRedactedPlaceholder(value: string): boolean {
+  return value.trim() === REDACTED_COMMAND_TEXT_VALUE;
+}
 
 const fieldClass =
   "w-full rounded-md border border-border px-2.5 py-1.5 bg-transparent outline-none text-sm font-mono placeholder:text-muted-foreground/40 focus-visible:ring-2 focus-visible:ring-ring/40";
@@ -35,8 +45,12 @@ export function SecretPopoverForm({
   onCancel,
   onSubmit,
 }: SecretPopoverFormProps) {
+  // A "store" from a row whose value came back masked cannot carry the value
+  // forward: the real value never reached the browser. Ask for it instead.
+  const [maskedSource] = useState(() => mode === "store" && isRedactedPlaceholder(initialValue));
+  const valueEditable = mode === "create" || maskedSource;
   const [name, setName] = useState(initialName);
-  const [value, setValue] = useState(initialValue);
+  const [value, setValue] = useState(maskedSource ? "" : initialValue);
   const [reveal, setReveal] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -51,8 +65,12 @@ export function SecretPopoverForm({
     }
     return null;
   })();
-  const valueError = value.length === 0 ? (touched ? "Value is required" : null) : null;
-  const canSubmit = !submitting && trimmedName.length > 0 && value.length > 0 && !nameError;
+  const valueIsPlaceholder = isRedactedPlaceholder(value);
+  const valueError = valueIsPlaceholder
+    ? "Enter the real value, not the hidden placeholder"
+    : value.length === 0 ? (touched ? "Value is required" : null) : null;
+  const canSubmit =
+    !submitting && trimmedName.length > 0 && value.length > 0 && !valueIsPlaceholder && !nameError;
 
   async function handleSubmit() {
     setTouched(true);
@@ -76,8 +94,17 @@ export function SecretPopoverForm({
         <PopoverTitle className="text-sm font-medium">{heading}</PopoverTitle>
         {mode === "store" ? (
           <PopoverDescription className="text-(length:--text-micro) text-muted-foreground">
-            Moves the typed value into an encrypted organization secret and binds{" "}
-            <span className="font-mono">{initialName || "this variable"}</span> to it.
+            {maskedSource ? (
+              <>
+                The current value is hidden. Enter the value to store as an encrypted organization secret and bind{" "}
+                <span className="font-mono">{initialName || "this variable"}</span> to it.
+              </>
+            ) : (
+              <>
+                Moves the typed value into an encrypted organization secret and binds{" "}
+                <span className="font-mono">{initialName || "this variable"}</span> to it.
+              </>
+            )}
           </PopoverDescription>
         ) : null}
       </div>
@@ -111,12 +138,12 @@ export function SecretPopoverForm({
             className={cn(fieldClass, "pr-8", valueError && "border-destructive focus-visible:ring-destructive/40")}
             type={reveal ? "text" : "password"}
             value={value}
-            readOnly={mode === "store"}
+            readOnly={!valueEditable}
             spellCheck={false}
-            placeholder={mode === "create" ? "value" : undefined}
+            placeholder={valueEditable ? "value" : undefined}
             aria-label="Secret value"
             aria-invalid={valueError ? true : undefined}
-            onChange={mode === "create" ? (event) => setValue(event.target.value) : undefined}
+            onChange={valueEditable ? (event) => setValue(event.target.value) : undefined}
           />
           <button
             type="button"

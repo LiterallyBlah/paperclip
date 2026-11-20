@@ -7,6 +7,7 @@ import {
   type IssueCommentPresentation,
   type RunLivenessState,
 } from "@paperclipai/shared";
+import { isStandingEventInboxQuietWait } from "./standing-event-inbox.js";
 import { withRecoveryContext } from "./status-only-context.js";
 import {
   agentLinkRow,
@@ -34,6 +35,12 @@ export const SUCCESSFUL_RUN_HANDOFF_OPTIONS = [
   "mark_blocked",
   "delegate_or_continue_from_checkpoint",
 ] as const;
+
+// Routine execution issues stay `in_progress` between cron fires by design — one
+// open issue is coalesced across dispatches (see issues_open_routine_execution_uq).
+// Their disposition is owned by the routine lifecycle, not by the missing-disposition
+// handoff, so a successful routine run must not be treated as a missing next step.
+const ROUTINE_EXECUTION_ORIGIN_KIND = "routine_execution";
 
 const PRODUCTIVE_SUCCESS_LIVENESS_STATES = new Set<RunLivenessState>([
   "advanced",
@@ -84,7 +91,7 @@ type IssueRow = Pick<
   | "assigneeUserId"
   | "executionState"
   | "originKind"
->;
+> & Partial<Pick<typeof issues.$inferSelect, "executionPolicy">>;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 type NoticeIssue = Pick<typeof issues.$inferSelect, "id" | "identifier" | "title" | "status">;
 type NoticeRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "status" | "agentId">;
@@ -493,6 +500,9 @@ export function decideSuccessfulRunHandoff(input: {
     return { kind: "skip", reason: "missing issue comment retry owns the next action" };
   }
   if (!issue) return { kind: "skip", reason: "issue not found" };
+  if (issue.originKind === ROUTINE_EXECUTION_ORIGIN_KIND) {
+    return { kind: "skip", reason: "routine execution owns its own disposition" };
+  }
   if (!agent) return { kind: "skip", reason: "agent not found" };
   if (issue.companyId !== run.companyId || agent.companyId !== run.companyId) {
     return { kind: "skip", reason: "company scope mismatch" };
@@ -506,6 +516,9 @@ export function decideSuccessfulRunHandoff(input: {
   if (issue.executionState) return { kind: "skip", reason: "issue has execution policy state" };
   if (isPluginManagedIssueLifecycle(issue)) {
     return { kind: "skip", reason: "issue lifecycle is owned by a plugin" };
+  }
+  if (isStandingEventInboxQuietWait(issue, run)) {
+    return { kind: "skip", reason: "standing event inbox waits for delivered events" };
   }
   if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };

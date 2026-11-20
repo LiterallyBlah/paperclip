@@ -50,6 +50,11 @@ import {
 import { AttentionInteractionResolver } from "./AttentionInteractionResolver";
 import { DecisionResolver } from "./DecisionResolver";
 import { StalledReviewActions } from "./StalledReviewActions";
+import {
+  isReviewStageParticipant,
+  ReviewStageDecisionActions,
+  type ReviewStageParticipant,
+} from "./ReviewStageDecisionActions";
 import { readIssueReviewPolicyMetadata } from "../lib/review-policy";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -165,6 +170,10 @@ export const AttentionQueueRow = memo(function AttentionQueueRow({
   // feed built before the metadata existed (PAP-17287).
   const audience = describeAttentionResolverAudience(item);
   const showOpen = !inline && !!href;
+  const reviewStage = readReviewStageMetadata(item);
+  const viewerHoldsReviewStage =
+    inline && item.subject.metadata?.reviewAttentionState !== "stalled"
+    && isReviewStageParticipant(reviewStage?.participant, currentUserId);
   const showRestore = isHidden && !!onRestore;
   // An expanded inline row hands its footer to the resolver, which owns the
   // decision verbs — so the toggle rides alongside them on one row rather than
@@ -197,7 +206,10 @@ export const AttentionQueueRow = memo(function AttentionQueueRow({
    */
   const renderFooter = ({ compact }: { compact: boolean }) => {
     const showCompact = compactActions.length > 0 && (compact || !expanded);
-    if (!toggle && !showCompact && !showOpen && !showRestore) return null;
+    // A collapsed native-stage row names the decision it opens instead of a
+    // bare "See more" (BLA-180).
+    const showStageDecision = compact && !expanded && viewerHoldsReviewStage;
+    if (!toggle && !showCompact && !showOpen && !showRestore && !showStageDecision) return null;
     return (
       <div className="flex flex-wrap items-center justify-between gap-2" data-attention-actions="true">
         {toggle ?? <span />}
@@ -210,6 +222,19 @@ export const AttentionQueueRow = memo(function AttentionQueueRow({
               audience={audience}
               onOpen={() => onToggleExpand(item)}
             />
+          )}
+
+          {showStageDecision && (
+            <Button
+              type="button"
+              variant="default"
+              size="xs"
+              className={ACTION_BTN}
+              onClick={() => onToggleExpand(item)}
+              data-testid="review-stage-open-decision"
+            >
+              Approve or request changes
+            </Button>
           )}
 
           {showOpen && (
@@ -803,7 +828,24 @@ function InlineResolver({
   }
 
   if (item.sourceKind === "review") {
-    // Inline only for stalled reviews (server sets inlineResolvable then); the
+    // A pending native stage held by a user resolves through the participant's
+    // own decision path (BLA-180); the subject IS the issue.
+    const reviewStage = readReviewStageMetadata(item);
+    if (reviewStage && item.subject.metadata?.reviewAttentionState !== "stalled") {
+      return (
+        <ReviewStageDecisionActions
+          issueId={item.subject.id}
+          companyId={companyId}
+          stageType={reviewStage.stageType}
+          participant={reviewStage.participant}
+          participantLabel={reviewStageParticipantLabel(reviewStage.participant, agentMap, userLabelMap)}
+          currentUserId={currentUserId}
+          issueHref={item.subject.href}
+          footerSlot={toggle}
+        />
+      );
+    }
+    // Inline for stalled reviews (server sets inlineResolvable then); the
     // subject IS the issue, so its id is the decision target.
     return (
       <StalledReviewActions
@@ -816,6 +858,41 @@ function InlineResolver({
   }
 
   return null;
+}
+
+interface ReviewStageMetadata {
+  stageType: "review" | "approval";
+  participant: ReviewStageParticipant;
+}
+
+/** `subject.metadata.reviewStage` from the feed; null when absent or malformed. */
+export function readReviewStageMetadata(item: AttentionItem): ReviewStageMetadata | null {
+  if (item.sourceKind !== "review") return null;
+  const raw = item.subject.metadata?.reviewStage;
+  if (!raw || typeof raw !== "object") return null;
+  const { stageType, participant } = raw as { stageType?: unknown; participant?: unknown };
+  if (!participant || typeof participant !== "object") return null;
+  const { type, agentId, userId } = participant as { type?: unknown; agentId?: unknown; userId?: unknown };
+  if (type !== "agent" && type !== "user") return null;
+  return {
+    stageType: stageType === "approval" ? "approval" : "review",
+    participant: {
+      type,
+      agentId: typeof agentId === "string" ? agentId : null,
+      userId: typeof userId === "string" ? userId : null,
+    },
+  };
+}
+
+function reviewStageParticipantLabel(
+  participant: ReviewStageParticipant,
+  agentMap?: Map<string, Agent>,
+  userLabelMap?: ReadonlyMap<string, string> | null,
+): string | null {
+  if (participant.type === "agent") {
+    return participant.agentId ? agentMap?.get(participant.agentId)?.name ?? null : null;
+  }
+  return participant.userId ? userLabelMap?.get(participant.userId) ?? null : null;
 }
 
 /** Footer shared by the resolvers that own their verbs: toggle left, verbs right. */

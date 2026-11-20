@@ -36,6 +36,7 @@ import type {
   SecretVersionSelector,
 } from "@paperclipai/shared";
 import {
+  agentHarnessType,
   CLASS3_STATIC_LEASE_ALLOWLIST,
   createSecretProviderConfigSchema,
   deriveProjectUrlKey,
@@ -47,6 +48,7 @@ import {
   updateSecretProviderConfigSchema,
 } from "@paperclipai/shared";
 import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { isRedactedPlaceholderValue } from "../redaction.js";
 import { logger } from "../middleware/logger.js";
 import {
   checkSecretProviders,
@@ -98,7 +100,23 @@ export const SANDBOX_CLEANUP_CONSUMER_ID = "environment-sandbox-cleanup";
 export const DEVICE_LOGIN_SECRET_CHECK_CONSUMER_ID = "device-login-secret-check";
 const SENSITIVE_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
-const REDACTED_SENTINEL = "***REDACTED***";
+/** Stable error code for a secret write whose value is the read-side display mask. */
+export const SECRET_VALUE_REDACTED_PLACEHOLDER_CODE = "secret_value_redacted_placeholder";
+
+/**
+ * Reads redact plain values to `REDACTED_EVENT_VALUE`. That placeholder is
+ * never a real secret value, so every secret value create/rotate rejects it
+ * before any row, version or binding is written. The message never echoes the
+ * submitted value.
+ */
+export function assertNotRedactedPlaceholderSecretValue(value: unknown): void {
+  if (isRedactedPlaceholderValue(value)) {
+    throw unprocessable(
+      "Secret value is the redacted display placeholder; enter the real value",
+      { code: SECRET_VALUE_REDACTED_PLACEHOLDER_CODE },
+    );
+  }
+}
 const COMING_SOON_SECRET_PROVIDERS: ReadonlySet<SecretProvider> = new Set([
   "gcp_secret_manager",
   "vault",
@@ -279,7 +297,7 @@ export interface ClaudeOAuthBindingInvariantDecision {
 export function assertClaudeOAuthBindingInvariant(
   input: ClaudeOAuthBindingInvariantInput,
 ): ClaudeOAuthBindingInvariantDecision {
-  const isClaudeLocal = input.adapterType === CLAUDE_LOCAL_ADAPTER_TYPE;
+  const isClaudeLocal = agentHarnessType(input.adapterType ?? "", asRecord(input.nextConfig) ?? {}) === CLAUDE_LOCAL_ADAPTER_TYPE;
   const nextIsFixed = hasFixedClaudeOAuthBinding(input.nextConfig);
   const priorIsFixed = hasFixedClaudeOAuthBinding(input.priorConfig);
 
@@ -338,7 +356,6 @@ function remoteProviderHttpError(error: unknown, context: {
   if (isSecretProviderClientError(error)) {
     logger.warn(
       {
-        err: error,
         companyId: context.companyId,
         provider: context.provider,
         providerConfigId: context.providerConfigId,
@@ -352,7 +369,6 @@ function remoteProviderHttpError(error: unknown, context: {
   if (error instanceof HttpError) return error;
   logger.warn(
     {
-      err: error,
       companyId: context.companyId,
       provider: context.provider,
       providerConfigId: context.providerConfigId,
@@ -506,7 +522,7 @@ function safeRemoteProviderErrorDetails(
       if (context.operation === "secret.create") {
         details.requiredCapability = "secretsmanager:CreateSecret";
         details.actionableMessage =
-          "AWS managed secret creation needs secretsmanager:CreateSecret in the selected region for this provider vault. If the vault config uses a KMS key, the runtime credentials also need KMS write permissions for that key.";
+          "Ensure the Paperclip server runtime can resolve valid AWS credentials, then grant them secretsmanager:CreateSecret in the selected region for this provider vault. If the vault config uses a KMS key, those credentials also need KMS write permissions for that key.";
         details.safeAlternative =
           "If the secret already exists in AWS, link it as an external reference instead of creating a Paperclip-managed value.";
       } else if (context.operation === "secret.rotate") {
@@ -645,10 +661,14 @@ type SecretBindingContext = Omit<SecretConsumerContext, "consumerType"> & {
   consumerType: SecretBindingTargetType;
 };
 
+type InstanceSecretOwner = { pluginId: string } & ({ agentId: string; projectId?: never } | { projectId: string; agentId?: never });
+type InstanceSecretScope = InstanceSecretOwner & { companyId: string };
+
 type SecretResolutionOptions = {
   bindingContext?: SecretBindingContext;
   accessContext?: SecretConsumerContext;
   allowUserSecretScope?: boolean;
+  instanceOwner?: InstanceSecretOwner;
 };
 
 export type AgentSecretReadContext = {
@@ -1355,13 +1375,18 @@ export function secretService(db: Db | DbTransaction) {
     secretId: string,
     version: number | "latest",
     options?: SecretResolutionOptions,
+    readOnlyEnvironmentInspection = false,
+    preloaded?: { secret: typeof companySecrets.$inferSelect; version: typeof companySecretVersions.$inferSelect | null },
   ): Promise<RuntimeSecretResolution> {
     const bindingContext = options?.bindingContext;
     const accessContext = options?.accessContext ?? bindingContext;
-    const secret = await getById(secretId);
+    const secret = preloaded && preloaded.secret.id === secretId ? preloaded.secret : await getById(secretId);
     if (!secret) throw notFound("Secret not found");
     if (secret.companyId !== companyId) throw unprocessable("Secret must belong to same company");
-    if (secret.scope !== "company" && !options?.allowUserSecretScope) {
+    const instanceOwned = secret.scope === "instance" && options?.instanceOwner &&
+      secret.ownerAgentId === (options.instanceOwner.agentId ?? null) &&
+      secret.ownerProjectId === (options.instanceOwner.projectId ?? null) && secret.ownerPluginId === options.instanceOwner.pluginId;
+    if (secret.scope !== "company" && !(secret.scope === "user" && options?.allowUserSecretScope) && !instanceOwned) {
       throw unprocessable("User-scoped secrets must be resolved through user secret declarations", {
         code: "secret_scope_invalid",
       });
@@ -1377,7 +1402,8 @@ export function secretService(db: Db | DbTransaction) {
         throw unprocessable("Secret is not active", { code: "secret_inactive" });
       }
       const binding = await assertBindingContext(companyId, secret.id, bindingContext);
-      const versionRow = await getSecretVersion(secret.id, resolvedVersion);
+      const versionRow = preloaded?.secret === secret && preloaded.version?.version === resolvedVersion
+        ? preloaded.version : await getSecretVersion(secret.id, resolvedVersion);
       if (!versionRow) throw new HttpError(404, "Secret version not found", { code: "version_missing" });
       if (versionRow.status === "disabled" || versionRow.status === "destroyed" || versionRow.revokedAt) {
         throw unprocessable("Secret version is not active", { code: "version_inactive" });
@@ -1400,7 +1426,7 @@ export function secretService(db: Db | DbTransaction) {
           version: resolvedVersion,
         },
       });
-      await Promise.all([
+      if (!readOnlyEnvironmentInspection) await Promise.all([
         db
           .update(companySecrets)
           .set({ lastResolvedAt: new Date(), updatedAt: new Date() })
@@ -1436,7 +1462,7 @@ export function secretService(db: Db | DbTransaction) {
       };
     } catch (err) {
       const errorCode = secretResolutionErrorCode(err);
-      await recordAccessEvent({
+      if (!readOnlyEnvironmentInspection) await recordAccessEvent({
         companyId,
         secretId: secret.id,
         userSecretDefinitionId: secret.userSecretDefinitionId ?? null,
@@ -1470,6 +1496,23 @@ export function secretService(db: Db | DbTransaction) {
       ? contextOrOptions
       : { bindingContext: contextOrOptions, accessContext: contextOrOptions };
     return (await resolveSecretValueInternal(companyId, secretId, version, options)).value;
+  }
+
+  // Cloud consumes and audits the signed inspection permit before the tenant
+  // opens its read-only transaction. Keep the ordinary environment binding and
+  // version checks, without attempting tenant audit writes inside that transaction.
+  async function resolveSecretValueForReadOnlyEnvironmentInspection(
+    companyId: string,
+    secretId: string,
+    version: number | "latest",
+    context: { environmentId: string; configPath: string; issueId?: string | null; heartbeatRunId?: string | null },
+  ): Promise<string> {
+    if (!context.environmentId || !context.configPath) throw unprocessable("Environment secret binding required");
+    return (await resolveSecretValueInternal(companyId, secretId, version, {
+      bindingContext: { consumerType: "environment", consumerId: context.environmentId,
+        actorType: "system", actorId: null, configPath: context.configPath,
+        issueId: context.issueId ?? null, heartbeatRunId: context.heartbeatRunId ?? null },
+    }, true)).value;
   }
 
   async function resolveSecretValueForEphemeralAccess(
@@ -1908,7 +1951,7 @@ export function secretService(db: Db | DbTransaction) {
             `Strict secret mode requires secret references for sensitive key: ${key}`,
           );
         }
-        if (binding.value === REDACTED_SENTINEL) {
+        if (isRedactedPlaceholderValue(binding.value)) {
           throw unprocessable(`Refusing to persist redacted placeholder for key: ${key}`);
         }
         normalized[key] = binding;
@@ -2007,8 +2050,10 @@ export function secretService(db: Db | DbTransaction) {
     }
     const value = binding.value.trim();
     if (!value) return undefined;
-    if (value === REDACTED_SENTINEL) {
-      throw unprocessable(`Refusing to persist redacted placeholder for key: ${input.key}`);
+    if (isRedactedPlaceholderValue(value)) {
+      throw unprocessable(`Refusing to persist redacted placeholder for key: ${input.key}`, {
+        code: SECRET_VALUE_REDACTED_PLACEHOLDER_CODE,
+      });
     }
     const id = randomUUID();
     const adapterPart = normalizeSecretKey(input.adapterType ?? "adapter");
@@ -2059,6 +2104,7 @@ export function secretService(db: Db | DbTransaction) {
     },
     actor?: { userId?: string | null; agentId?: string | null },
   ) {
+    assertNotRedactedPlaceholderSecretValue(input.value);
     const existing = await getByName(companyId, input.name);
     if (existing) throw conflict(`Secret already exists: ${input.name}`);
     const key = normalizeSecretKey(input.key);
@@ -2186,12 +2232,14 @@ export function secretService(db: Db | DbTransaction) {
       providerMetadata?: Record<string, unknown> | null;
     },
     actor?: { userId?: string | null; agentId?: string | null },
+    instanceOwner?: InstanceSecretOwner,
   ) {
-    const existing = await getByName(companyId, input.name);
+    assertNotRedactedPlaceholderSecretValue(input.value);
+    const existing = instanceOwner ? null : await getByName(companyId, input.name);
     if (existing) throw conflict(`Secret already exists: ${input.name}`);
     const key = normalizeSecretKey(input.key ?? input.name);
     if (!key) throw unprocessable("Secret key is required");
-    const duplicateKey = await db
+    const duplicateKey = instanceOwner ? null : await db
       .select()
       .from(companySecrets)
       .where(and(
@@ -2229,6 +2277,10 @@ export function secretService(db: Db | DbTransaction) {
       .insert(companySecrets)
       .values({
         companyId,
+        scope: instanceOwner ? "instance" : "company",
+        ownerAgentId: instanceOwner?.agentId ?? null,
+        ownerProjectId: instanceOwner?.projectId ?? null,
+        ownerPluginId: instanceOwner?.pluginId ?? null,
         key,
         name: input.name,
         provider: input.provider,
@@ -2404,6 +2456,7 @@ export function secretService(db: Db | DbTransaction) {
     },
     actor?: { userId?: string | null; agentId?: string | null },
   ) {
+    assertNotRedactedPlaceholderSecretValue(input.value);
     const secret = await getById(secretId);
     if (!secret) throw notFound("Secret not found");
     if (secret.status !== "active") throw unprocessable("Cannot rotate a non-active secret");
@@ -2890,7 +2943,7 @@ export function secretService(db: Db | DbTransaction) {
         status: companySecrets.status,
       })
       .from(companySecrets)
-      .where(and(eq(companySecrets.companyId, companyId), ne(companySecrets.status, "deleted")));
+      .where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.scope, "company"), ne(companySecrets.status, "deleted")));
     return {
       byProviderConfigExternalRef: new Map(
         activeSecrets
@@ -2989,6 +3042,7 @@ export function secretService(db: Db | DbTransaction) {
     },
     actor?: { userId?: string | null; agentId?: string | null },
   ) {
+    assertNotRedactedPlaceholderSecretValue(input.value);
     const definition = await resolveUserSecretDefinition(companyId, input);
     if (definition.status !== "active") {
       throw unprocessable("User secret definition is not active");
@@ -3426,7 +3480,24 @@ export function secretService(db: Db | DbTransaction) {
         }
       }
     }
-    await db.delete(companySecrets).where(eq(companySecrets.id, secretId));
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await db.transaction(async tx => {
+          if (secret.scope !== "instance") {
+            await tx.select({ id: agents.id }).from(agents)
+              .where(eq(agents.companyId, secret.companyId)).orderBy(agents.id).for("no key update");
+          }
+          await tx.select({ id: companySecrets.id }).from(companySecrets)
+            .where(eq(companySecrets.id, secretId)).for("update", { noWait: true });
+          await tx.delete(companySecrets).where(eq(companySecrets.id, secretId));
+        });
+        break;
+      } catch (error) {
+        const failure = error as { code?: string; cause?: { code?: string } };
+        if ((failure?.cause?.code ?? failure?.code) !== "55P03") throw error;
+        if (attempt >= 2) throw conflict("Secret changed during removal. Retry removal.", { retryable: true });
+      }
+    }
     return secret;
   }
 
@@ -3465,8 +3536,63 @@ export function secretService(db: Db | DbTransaction) {
       .then((rows) => rows[0] ?? null);
   }
 
+  const instanceSecrets = {
+    async read(scope: InstanceSecretScope): Promise<Record<string, string>> {
+      const rows = await db.select({ secret: companySecrets, version: companySecretVersions }).from(companySecrets)
+        .leftJoin(companySecretVersions, and(eq(companySecretVersions.secretId, companySecrets.id), eq(companySecretVersions.version, companySecrets.latestVersion)))
+        .where(and(eq(companySecrets.companyId, scope.companyId),
+          eq(companySecrets.scope, "instance"), scope.agentId !== undefined ? eq(companySecrets.ownerAgentId, scope.agentId) : eq(companySecrets.ownerProjectId, scope.projectId),
+          eq(companySecrets.ownerPluginId, scope.pluginId), ne(companySecrets.status, "deleted")));
+      const values: Record<string, string> = Object.create(null);
+      for (const row of rows) {
+        const resolved = await resolveSecretValueInternal(scope.companyId, row.secret.id, "latest", {
+          instanceOwner: scope, accessContext: { consumerType: "plugin_worker", consumerId: scope.pluginId,
+            actorType: "plugin", actorId: scope.pluginId, pluginId: scope.pluginId },
+        }, false, row);
+        values[row.secret.name] = resolved.value;
+      }
+      return values;
+    },
+    async set(scope: InstanceSecretScope, key: string, value: string | null) {
+      return withAccountHomeSecretMutationLock(undefined, scope.companyId, async () => {
+        if (value) await assertAccountHomeCacheDirStillValid(undefined, scope.companyId, value);
+        const normalizedKey = normalizeSecretKey(key);
+        const [existing] = await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, scope.companyId),
+          eq(companySecrets.scope, "instance"), scope.agentId !== undefined ? eq(companySecrets.ownerAgentId, scope.agentId) : eq(companySecrets.ownerProjectId, scope.projectId),
+          eq(companySecrets.ownerPluginId, scope.pluginId), eq(companySecrets.key, normalizedKey), ne(companySecrets.status, "deleted")));
+        if (value === null) {
+          if (existing) await removeSecretUnlocked(existing.id);
+        } else if (existing) {
+          await rotateUnlocked(existing.id, { value, expectedLatestVersion: existing.latestVersion });
+        } else {
+          await createSecretUnlocked(scope.companyId, { name: key, key, provider: "local_encrypted", value }, undefined, scope);
+        }
+      });
+    },
+  };
+
   return {
     listProviders: () => listSecretProviders(),
+
+    async hasInstanceAccountHomeClaim(companyId: string, accountHomeDir: string): Promise<boolean> {
+      try {
+        const rows = await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, companyId),
+          eq(companySecrets.scope, "instance"), ne(companySecrets.status, "deleted")));
+        for (const row of rows) {
+          if ((!row.ownerAgentId && !row.ownerProjectId) || !row.ownerPluginId) return true;
+          const resolved = await resolveSecretValueInternal(companyId, row.id, "latest", {
+            instanceOwner: row.ownerAgentId ? { agentId: row.ownerAgentId, pluginId: row.ownerPluginId } : { projectId: row.ownerProjectId!, pluginId: row.ownerPluginId },
+            accessContext: { consumerType: "system", consumerId: DEVICE_LOGIN_SECRET_CHECK_CONSUMER_ID,
+              actorType: "system", actorId: null },
+          });
+          if (resolved.value === accountHomeDir) return true;
+        }
+        return false;
+      } catch { return true; }
+    },
+
+    agentInstance: instanceSecrets,
+    projectInstance: instanceSecrets,
 
     checkProviders: () => checkSecretProviders(),
 
@@ -4537,6 +4663,7 @@ export function secretService(db: Db | DbTransaction) {
     resolveSecretValueForAgentAccess,
     listAgentSecretAccess,
     resolveSecretValueForEphemeralAccess,
+    resolveSecretValueForReadOnlyEnvironmentInspection,
     resolveSecretValueForSandboxCleanup,
     resolveSecretValueForDeviceLoginCheck,
 

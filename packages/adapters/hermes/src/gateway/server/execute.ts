@@ -565,16 +565,19 @@ async function handleEvent(
   const record = asRecord(parsed);
   const eventName = eventNameFromData(parsed, frame.event);
   state.lastEventName = eventName;
+  const delta = asString(record?.delta, "") || asString(record?.text_delta, "");
+  const sanitizedDelta = eventName === "message.delta" && delta ? redactText(delta) : null;
+  const redacted = redactForLog(parsed, [], 0, redactText);
+  const eventData = sanitizedDelta !== null
+    ? JSON.stringify({ delta: sanitizedDelta })
+    : stringifyForLog(redacted, 8_000);
   await ctx.onLog(
     "stdout",
-    `[hermes-gateway:event] run=${state.runId} event=${eventName ?? "message"} data=${stringifyForLog(redactForLog(parsed, [], 0, redactText), 8_000)}\n`,
+    `[hermes-gateway:event] run=${state.runId} event=${eventName ?? "message"} data=${eventData}\n`,
   );
 
-  const delta = nonEmpty(record?.delta) ?? nonEmpty(record?.text_delta);
-  if (eventName === "message.delta" && delta) {
-    const sanitizedDelta = redactText(delta);
+  if (sanitizedDelta !== null) {
     state.outputChunks.push(sanitizedDelta);
-    await ctx.onLog("stdout", sanitizedDelta);
   }
 
   const status = extractStatus(parsed) ?? (eventName?.startsWith("run.") ? eventName.slice(4) : null);
@@ -696,13 +699,27 @@ async function consumeEvents(input: {
   }
 }
 
+// Usage mapping (same convention as claude_local: `inputTokens` is uncached input including
+// cache writes, `cachedInputTokens` is cache reads).
+// - Hermes gateway terminal payloads send `input_tokens` as the session prompt total
+//   (input + cache_read + cache_write) plus separate `cache_read_tokens` / `cache_write_tokens`.
+//   The presence of a numeric `cache_read_tokens` field marks that shape: cache reads are moved
+//   out of `input_tokens` into `cachedInputTokens` (clamped so input never goes negative), and
+//   cache writes stay in raw input.
+// - Other gateways that send `cached_input_tokens` / `cachedInputTokens` keep the legacy
+//   behaviour: input is taken as-is and the cached count is reported alongside it.
 function parseUsage(value: unknown): UsageSummary | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
   const source = asRecord(record.usage) ?? record;
-  const inputTokens = asNumber(source.input_tokens ?? source.inputTokens ?? source.input, 0);
+  const promptTokens = asNumber(source.input_tokens ?? source.inputTokens ?? source.input, 0);
   const outputTokens = asNumber(source.output_tokens ?? source.outputTokens ?? source.output, 0);
-  const cachedInputTokens = asNumber(source.cached_input_tokens ?? source.cachedInputTokens, 0);
+  const hermesCacheRead = source.cache_read_tokens;
+  const hasHermesCacheRead = typeof hermesCacheRead === "number" && Number.isFinite(hermesCacheRead);
+  const cachedInputTokens = hasHermesCacheRead
+    ? Math.max(0, hermesCacheRead)
+    : asNumber(source.cached_input_tokens ?? source.cachedInputTokens, 0);
+  const inputTokens = hasHermesCacheRead ? Math.max(0, promptTokens - cachedInputTokens) : promptTokens;
   if (inputTokens <= 0 && outputTokens <= 0 && cachedInputTokens <= 0) return undefined;
   return {
     inputTokens,

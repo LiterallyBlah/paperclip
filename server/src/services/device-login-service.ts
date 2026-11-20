@@ -1,3 +1,6 @@
+import { writeLoginCleanup } from "./login-cleanup-notifications.js";
+import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
+import type { ConnectionManagementContext } from "./connection-management.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -151,6 +154,7 @@ export interface LoginSessionRuntime {
  *  session, the company, the owner, and the adapter, so the promotion resolves
  *  the company slot and the sole-active-owner check for this exact session. */
 export interface CredentialPromotionContext {
+  managementContext?: ConnectionManagementContext;
   sessionId: string;
   companyId: string;
   startedByUserId: string;
@@ -213,6 +217,7 @@ export interface LoginSessionActivityEvent {
 export type LoginSessionActivityRecorder = (event: LoginSessionActivityEvent) => void;
 
 export interface StartDeviceLoginInput {
+  managementContext?: ConnectionManagementContext;
   aiConnection?: import("@paperclipai/shared").AiConnectionLoginIntent;
   companyId: string;
   environmentId: string;
@@ -537,7 +542,7 @@ export function createDbAdapterAuthSessionStore(
   return {
     async insert(input) {
       try {
-        await db.insert(adapterAuthSessions).values({
+        await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx.insert(adapterAuthSessions).values({
           id: input.id,
           companyId: input.companyId,
           environmentId: input.environmentId,
@@ -553,7 +558,7 @@ export function createDbAdapterAuthSessionStore(
           expiresAt: input.expiresAt,
           createdAt: input.at,
           updatedAt: input.at,
-        });
+        }));
       } catch (error) {
         if (isUniqueViolation(error)) {
           throw new AdapterAuthSessionConflictError();
@@ -562,23 +567,23 @@ export function createDbAdapterAuthSessionStore(
       }
     },
     async recordLeaseAcquired(input) {
-      await db
+      await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx
         .update(adapterAuthSessions)
         .set({ providerLeaseId: input.providerLeaseId, updatedAt: input.at })
-        .where(eq(adapterAuthSessions.id, input.sessionId));
+        .where(eq(adapterAuthSessions.id, input.sessionId)));
     },
     async setStatus(input) {
-      await db
+      await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx
         .update(adapterAuthSessions)
         .set(buildStatusPatch(input))
-        .where(eq(adapterAuthSessions.id, input.sessionId));
+        .where(eq(adapterAuthSessions.id, input.sessionId)));
     },
     async compareAndSetStatus(input) {
       // The conditional write. It changes the row only when the current status is
       // one of `expectedStatuses`. The `returning` clause reports the changed
       // rows, so a lost race returns an empty array. The active-slot partial
       // unique index still serializes the company slot on the write.
-      const changed = await db
+      const changed = await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx
         .update(adapterAuthSessions)
         .set(buildStatusPatch(input))
         .where(
@@ -587,7 +592,7 @@ export function createDbAdapterAuthSessionStore(
             inArray(adapterAuthSessions.status, [...input.expectedStatuses]),
           ),
         )
-        .returning({ id: adapterAuthSessions.id });
+        .returning({ id: adapterAuthSessions.id }));
       return changed.length > 0;
     },
     async get(sessionId) {
@@ -654,6 +659,7 @@ export function createDbAdapterAuthSessionStore(
             // The shared table also holds the setup-token rows, so every reaper
             // scan filters by the closed set of displayed-code adapter types.
             inArray(adapterAuthSessions.adapterType, DISPLAYED_CODE_ADAPTER_TYPES),
+            sql`${adapterAuthSessions.connectionMethod} is distinct from 'local_subscription'`,
             inArray(adapterAuthSessions.status, [...ADAPTER_AUTH_ACTIVE_STATUSES]),
             isNotNull(adapterAuthSessions.expiresAt),
             lte(adapterAuthSessions.expiresAt, nowAt),
@@ -673,6 +679,7 @@ export function createDbAdapterAuthSessionStore(
         .where(
           and(
             inArray(adapterAuthSessions.adapterType, DISPLAYED_CODE_ADAPTER_TYPES),
+            sql`${adapterAuthSessions.connectionMethod} is distinct from 'local_subscription'`,
             eq(adapterAuthSessions.status, "cleanup_pending"),
           ),
         );
@@ -923,6 +930,7 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
   async function start(
     input: StartDeviceLoginInput,
   ): Promise<StartDeviceLoginResult> {
+    await input.managementContext?.reauthorize();
     const sessionId = randomUUID();
     // The public session identifier the API returns and looks up. It is an
     // independent CSPRNG value, so it never equals the internal `sessionId` and a
@@ -1132,7 +1140,9 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
         if (!credential || credential.length === 0) {
           throw new Error("missing_credential");
         }
+        await input.managementContext?.reauthorize();
         await profile.promotion.promote(credential, {
+          managementContext: input.managementContext,
           sessionId,
           companyId: input.companyId,
           startedByUserId: input.startedByUserId,
@@ -1167,12 +1177,14 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
           resultClaim: resultClaim ?? null,
         });
       const promotionContext: CredentialPromotionContext = {
+        managementContext: input.managementContext,
         sessionId,
         companyId: input.companyId,
         startedByUserId: input.startedByUserId,
         adapterType: input.adapterType,
       };
       try {
+        await input.managementContext?.reauthorize();
         return profile.promotion.runTerminalCommit
           ? await profile.promotion.runTerminalCommit(commitAuthenticated, promotionContext)
           : await commitAuthenticated();
@@ -1663,10 +1675,10 @@ export function createProductionLoginSessionRuntime(
       );
       // Tag the lease with the session identifier, so the reaper resolves an
       // orphan lease that no live session references. The tag carries no secret.
-      await environmentsSvc.updateLeaseMetadata(record.lease.id, {
+      await writeLoginCleanup(deps.db, DELIVERY_QUEUES.adapterLoginCleanup, tx => environmentService(tx).updateLeaseMetadata(record.lease.id, {
         ...(record.lease.metadata ?? {}),
         [LOGIN_LEASE_SESSION_TAG_KEY]: input.sessionId,
-      });
+      }));
       const sessionHome = sessionLoginHomePath(input.sessionId);
       const authPath = sessionCredentialPath(input.sessionId);
       const providerLeaseId = record.lease.providerLeaseId ?? record.lease.id;

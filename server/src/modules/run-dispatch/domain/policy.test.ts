@@ -303,6 +303,15 @@ describe("decideQueuedRunStaleness", () => {
       errorCode: "issue_not_in_progress",
     },
     {
+      name: "issue_not_in_progress (resolved-interaction continuation, unstarted answer on a non-todo task)",
+      overrides: {
+        isResolvedInteractionContinuation: true,
+        isUnstartedTaskQuestionAnswer: true,
+        issueStatus: "backlog",
+      } satisfies Partial<QueuedRunFacts>,
+      errorCode: "issue_not_in_progress",
+    },
+    {
       name: "issue_not_in_progress (max-turn continuation)",
       overrides: {
         retryReasonKind: "max_turn_continuation",
@@ -399,6 +408,15 @@ describe("decideQueuedRunStaleness", () => {
     }, NOW)).toEqual({ stale: false });
   });
 
+  it("allows an answer to a question no run asked to start a todo task that has never started", () => {
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      isResolvedInteractionContinuation: true,
+      isUnstartedTaskQuestionAnswer: true,
+      issueStatus: "todo",
+    }, NOW)).toEqual({ stale: false });
+  });
+
   it("does not cancel a parked continuation summary when the classifier says it does not park the executor", () => {
     const facts: QueuedRunFacts = {
       ...baseStalenessFacts(),
@@ -425,6 +443,58 @@ describe("decideQueuedRunStaleness", () => {
       },
     };
     expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
+  });
+
+  describe("verified pending-interaction addressee wake", () => {
+    const addresseeFacts = (): QueuedRunFacts => ({
+      ...baseStalenessFacts(),
+      runAgentId: "addressee-1",
+      issueAssigneeAgentId: "assignee-1",
+      issueExecutionRunId: "assignee-run",
+      wakeReason: "interaction_pending",
+      isPendingInteractionAddresseeWake: true,
+    });
+
+    it("excuses only the assignee-ownership check", () => {
+      expect(decideQueuedRunStaleness(addresseeFacts(), NOW)).toEqual({ stale: false });
+    });
+
+    it("is treated as absent when the adapter did not verify it", () => {
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), isPendingInteractionAddresseeWake: undefined }, NOW))
+        .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), isPendingInteractionAddresseeWake: false }, NOW))
+        .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+    });
+
+    // Rewritten for the owner's choice: the question runs past another review stage, answer-only.
+    it("passes the review-participant gate but keeps the terminal-status and pending-response gates", () => {
+      expect(decideQueuedRunStaleness({
+        ...addresseeFacts(),
+        issueStatus: "in_review",
+        reviewParticipant: { isInReview: true, hasParticipant: true, participantIsAgent: true,
+          participantAgentId: "reviewer-1", currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: "reviewer-1" } },
+      }, NOW)).toEqual({ stale: false });
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), issueStatus: "done" }, NOW))
+        .toMatchObject({ stale: true, errorCode: "issue_terminal_status" });
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), pendingResponse: "approval" }, NOW))
+        .toMatchObject({ stale: true, errorCode: "issue_waiting_for_response" });
+    });
+  });
+
+  it("lets only an interaction wake pass another in-review participant", () => {
+    const facts: QueuedRunFacts = {
+      ...baseStalenessFacts(),
+      runAgentId: "addressee-1",
+      issueAssigneeAgentId: "assignee-1",
+      issueStatus: "in_review",
+      reviewParticipant: { isInReview: true, hasParticipant: true, participantIsAgent: true,
+        participantAgentId: "reviewer-1", currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "reviewer-1" } },
+    };
+    expect(decideQueuedRunStaleness({ ...facts, isInteractionWake: true }, NOW)).toEqual({ stale: false });
+    expect(decideQueuedRunStaleness({ ...facts, issueAssigneeAgentId: "addressee-1" }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_review_participant_changed" });
   });
 
   it("allows resume intent to bypass a terminal status", () => {

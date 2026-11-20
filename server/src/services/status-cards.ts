@@ -1,7 +1,11 @@
+import { notifyStatusCardEvaluation } from "./status-card-notifications.js";
+import { issueDisplayStatusSql } from "./issue-display-status.js";
 import { createHash } from "node:crypto";
-import { and, desc, eq, gte, inArray, isNotNull, isNull, lte, ne, or, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, gt, gte, inArray, isNotNull, isNull, lte, ne, or, sql, type SQL } from "drizzle-orm";
 import {
   agents,
+  companies,
+  companyMemberships,
   costEvents,
   documentRevisions,
   documents,
@@ -9,6 +13,7 @@ import {
   issueComments,
   statusCards,
   statusCardUpdates,
+  withDedicatedDbConnection,
   type Db,
 } from "@paperclipai/db";
 import type {
@@ -18,13 +23,16 @@ import type {
   WriteStatusCardQuery,
   WriteStatusCardSummary,
 } from "@paperclipai/shared";
-import { companySearchQuerySchema, STATUS_CARD_AGENT_MAX_CARDS } from "@paperclipai/shared";
+import { companySearchQuerySchema, ISSUE_PRIORITIES, ISSUE_STATUSES, STATUS_CARD_AGENT_MAX_CARDS } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { readBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
+import { issueReadSqlCondition } from "./authorization.js";
 import { builtInAgentService } from "./built-in-agents.js";
 import { companySearchService } from "./company-search.js";
-import { issueService } from "./issues.js";
+import { executeIssuePostCommitActions, issueService, type IssuePostCommitAction } from "./issues.js";
+import { publishActivity, type ActivityPublication } from "./activity-log.js";
+import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { SUMMARIZER_BUILT_IN_KEY } from "./summary-slots.js";
 import {
   buildStatusCardFingerprint,
@@ -34,6 +42,7 @@ import {
   extractIssueMentions,
   filterStatusCardChanges,
   nextStatusCardEvaluationAt,
+  nextStatusCardPolicyEligibility,
   STATUS_CARD_MAX_MENTIONED_ISSUES,
   statusCardChangesHash,
   statusCardFingerprintHash,
@@ -47,6 +56,39 @@ type StatusCardRow = typeof statusCards.$inferSelect;
 type StatusCardReadOptions = { issueReadCondition?: SQL<boolean> };
 
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+// Generation tasks in these statuses make no further progress on their own
+// (the same set status-card-finalization releases on a status transition).
+const STALLED_GENERATION_ISSUE_STATUSES = ["done", "cancelled", "blocked"] as const;
+// Abandoned-generation recovery: after the Nth consecutive generation that ended
+// without a summary write, the existing tick retries once after
+// max(base, min(base * 2^(N-1), 2 h)), where base is the card's normal cadence
+// (reactive: min(debounce, 60 s); interval: intervalMinutes) but at least 60 s.
+// After more than STATUS_CARD_ABANDONED_RETRY_LIMIT in a row the card is left
+// in its visible `error` state until a manual refresh, recompile or
+// refresh-policy change. Manual-mode cards are never re-armed.
+const STATUS_CARD_ABANDONED_RETRY_LIMIT = 3;
+const STATUS_CARD_ABANDONED_BACKOFF_MIN_MS = 60 * 1000;
+const STATUS_CARD_ABANDONED_BACKOFF_CAP_MS = 2 * 60 * 60 * 1000;
+
+function isReopenableGenerationStatus(status: string) {
+  return TERMINAL_ISSUE_STATUSES.has(status) || status === "blocked";
+}
+
+function abandonedGenerationRetryAt(policy: StatusCardRow["refreshPolicy"], consecutiveAbandoned: number, abandonedAt: Date) {
+  if (consecutiveAbandoned < 1 || consecutiveAbandoned > STATUS_CARD_ABANDONED_RETRY_LIMIT) return null;
+  // v2026.1117.0 schedules reactive cards by change events, so
+  // nextStatusCardEvaluationAt() is null for them. The retry base keeps the
+  // card's own cadence: interval minutes, or the reactive debounce (<= 60 s).
+  if (policy.mode === "manual") return null;
+  const cadenceMs = policy.mode === "interval"
+    ? (policy.intervalMinutes ?? 15) * 60_000
+    : Math.min(policy.debounceSeconds ?? 60, 60) * 1000;
+  const baseMs = Math.max(cadenceMs, STATUS_CARD_ABANDONED_BACKOFF_MIN_MS);
+  const delayMs = Math.max(baseMs, Math.min(baseMs * 2 ** (consecutiveAbandoned - 1), STATUS_CARD_ABANDONED_BACKOFF_CAP_MS));
+  return new Date(abandonedAt.getTime() + delayMs);
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function promptHash(prompt: string) {
   return createHash("sha256").update(prompt).digest("hex");
@@ -113,11 +155,47 @@ function updateDescription(input: {
   return `Update this Paperclip status card.\n\n${UNTRUSTED_PROMPT_RULE}\n\n${task}${promptBlock}\n\n${mechanical}\n\n## Previous summary\n\n${untrustedPromptBlock("previous-summary", input.previousSummary ?? null)}\n\n## Changed issues\n\n${untrustedPromptBlock("changed-issues", input.changes.map(({ issueId, identifier, title, from, to, changeKind }) => ({ issueId, identifier, title, from, to, changeKind })))}\n\n${input.kind === "full" ? `## Bounded snapshot\n\n${untrustedPromptBlock("bounded-snapshot", input.snapshot.map(({ id, identifier, title, status }) => ({ id, identifier, title, status })))}` : ""}\n\n\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``;
 }
 
-function compileDescription(card: StatusCardRow, generationIssueId: string | null, hash: string) {
+/**
+ * Query-compilation guidance inlined into every compile task. The compile task
+ * can be assigned to any company agent (the built-in Summarizer or a per-card
+ * override), and nothing provisions the `status-card-query` catalog skill to
+ * that agent, so the task must carry everything the run needs instead of
+ * pointing it at a skill it may not have.
+ */
+function compileQueryGuidance(card: StatusCardRow, generationIssueId: string | null) {
+  // The persisted task always carries its own issue id (the description is
+  // rewritten once the issue exists), so the example body is copy-pasteable.
+  const exampleGenerationIssueId = generationIssueId ?? "<generationIssueId from the JSON payload below>";
+  return `Everything needed for this task is in this description; no extra skill is required, so do not search for one.
+
+## Query format
+
+\`queries\` is an array of 1–10 company-search query objects with union semantics: an issue matching any query belongs to the card. Prefer one narrow query; add another only for genuinely distinct populations. Each object accepts:
+
+- \`scope\`: always \`"issues"\`.
+- \`q\`: optional short free text, only for concepts no structured filter covers. Never paste the whole prompt into it.
+- \`status\`: array of ${ISSUE_STATUSES.map((status) => `\`${status}\``).join(", ")}.
+- \`priority\`: array of ${ISSUE_PRIORITIES.map((priority) => `\`${priority}\``).join(", ")}.
+- \`assigneeAgentId\` / \`assigneeUserId\`: one resolved assignee id.
+- \`projectId\` / \`labelId\`: one resolved UUID each. Resolve names with \`GET /api/companies/${card.companyId}/projects\` and \`GET /api/companies/${card.companyId}/labels\`; never put a name in an id field. Use separate query objects for multiple projects or labels.
+- \`updatedWithin\`: a bounded window such as \`24h\`, \`7d\`, \`4w\`, or \`3m\`. Add it whenever the prompt implies recency (recent, this week, lately, current).
+- \`sort\`: \`relevance\`, \`updated\`, \`created\`, or \`priority\`.
+- \`limit\`: 1–50, normally 20. \`offset\`: 0.
+
+Preserve the prompt's intent; do not broaden it. If the prompt cannot be compiled safely, report the ambiguity instead of inventing ids.
+
+Example \`PUT /api/status-cards/${card.id}/query\` body:
+
+\`\`\`text
+{"queries":[{"scope":"issues","q":"launch","status":["in_progress","blocked","in_review"],"updatedWithin":"7d","sort":"updated","limit":20,"offset":0}],"title":"Launch work updated this week","changeSummary":"Compiled the prompt into one recent active-work query.","generationIssueId":${JSON.stringify(exampleGenerationIssueId)}}
+\`\`\``;
+}
+
+export function compileDescription(card: StatusCardRow, generationIssueId: string | null, hash: string) {
   const payload = compilePayload(card, generationIssueId, hash);
   return `Compile this status-card interest prompt into structured Paperclip company-search queries, then continue in the same run and write the first full summary.
 
-Use the bundled \`status-card-query\` skill. Resolve named projects and labels to ids. Keep queries narrow, cap limits, and preserve union semantics across the query array.
+${compileQueryGuidance(card, generationIssueId)}
 
 ${UNTRUSTED_PROMPT_RULE}
 
@@ -128,13 +206,32 @@ ${untrustedPromptBlock("interest-prompt", card.interestPrompt)}
 ## Required write-back sequence
 
 1. \`PUT /api/status-cards/${card.id}/query\` with \`queries\`, an auto-title, a non-empty \`changeSummary\`, and \`generationIssueId\`.
-2. Execute the compiled scope and write the first full Markdown summary with \`PUT /api/status-cards/${card.id}/summary\` using the same \`generationIssueId\`. Do not create or wait for a second task.
+2. Execute the compiled scope with \`GET /api/status-cards/${card.id}/dry-run\`, then write the first full Markdown summary with \`PUT /api/status-cards/${card.id}/summary\` (\`markdown\`, \`title\`, a non-empty \`changeSummary\`, the same \`generationIssueId\`, and the model id). Do not create or wait for a second task.
 
 Both writes must happen from this assigned issue run.
 
 \`\`\`json
 ${JSON.stringify(payload, null, 2)}
 \`\`\``;
+}
+
+/**
+ * Generation tasks are created with this neutral body and receive their real
+ * payload only in the same update that makes them private, so the task never
+ * holds private data while it is still open to the company.
+ */
+const GENERATION_PLACEHOLDER_DESCRIPTION = "Status-card generation task. The task body is written when the task is made private.";
+
+/**
+ * N2: when the watched-issue visibility read fails, a scoped viewer is treated
+ * as redacted. Trusted internal callers (no read condition) are unaffected.
+ */
+function isSummaryRedacted(
+  visibility: { privacyRedacted: boolean } | undefined,
+  options: StatusCardReadOptions,
+) {
+  if (!options.issueReadCondition) return false;
+  return visibility?.privacyRedacted ?? true;
 }
 
 function parseGenerationPayload(description: string | null) {
@@ -151,9 +248,15 @@ export function statusCardService(
   db: Db,
   deps: { issuesSvc?: ReturnType<typeof issueService> } = {},
 ) {
-  const builtIns = builtInAgentService(db);
-  const issuesSvc = deps.issuesSvc ?? issueService(db);
+  const issuesSvc = () => deps.issuesSvc ?? issueService(db);
   const searchSvc = companySearchService(db);
+  type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+  function mutate<T>(companyId: string, write: (tx: Transaction) => Promise<T>) {
+    return db.transaction(async tx => {
+      await notifyStatusCardEvaluation(tx, companyId);
+      return write(tx);
+    });
+  }
 
   async function readWatchedIssueVisibility(card: StatusCardRow, options: StatusCardReadOptions = {}) {
     if (card.queries.length === 0 && (card.mentionedIssueIds?.length ?? 0) === 0) {
@@ -173,10 +276,47 @@ export function statusCardService(
     }
   }
 
+  /**
+   * The subset of `issueIds` the viewer may read, or `null` when no read
+   * condition applies (trusted internal callers). Non-UUID ids never match.
+   */
+  async function readableIssueIds(
+    companyId: string,
+    issueIds: Iterable<string>,
+    options: StatusCardReadOptions,
+  ): Promise<Set<string> | null> {
+    if (!options.issueReadCondition) return null;
+    const candidates = [...new Set(issueIds)].filter((id) => UUID_PATTERN.test(id));
+    if (candidates.length === 0) return new Set();
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, candidates), options.issueReadCondition));
+    return new Set(rows.map((row) => row.id));
+  }
+
+  /** Drop stored fingerprint entries and mentions the viewer cannot read. */
+  async function scopeCardIssueRefs(card: StatusCardRow, options: StatusCardReadOptions) {
+    const fingerprint = card.fingerprint ?? null;
+    const mentioned = card.mentionedIssueIds ?? [];
+    const readable = await readableIssueIds(
+      card.companyId,
+      [...Object.keys(fingerprint ?? {}), ...mentioned],
+      options,
+    );
+    if (!readable) return { fingerprint, mentionedIssueIds: mentioned };
+    return {
+      fingerprint: fingerprint
+        ? Object.fromEntries(Object.entries(fingerprint).filter(([issueId]) => readable.has(issueId)))
+        : null,
+      mentionedIssueIds: mentioned.filter((issueId) => readable.has(issueId)),
+    };
+  }
+
   async function hydrate(card: StatusCardRow, options: StatusCardReadOptions = {}) {
     const dayStart = new Date();
     dayStart.setUTCHours(0, 0, 0, 0);
-    const [document, today, watchedIssues] = await Promise.all([
+    const [document, today, watchedIssues, issueRefs] = await Promise.all([
       card.documentId
         ? db.select({ latestBody: documents.latestBody })
           .from(documents)
@@ -191,15 +331,20 @@ export function statusCardService(
         .where(and(eq(statusCardUpdates.cardId, card.id), gte(statusCardUpdates.startedAt, dayStart)))
         .then((rows) => rows[0] ?? { tokens: 0, costCents: 0 }),
       readWatchedIssueVisibility(card, options),
+      scopeCardIssueRefs(card, options),
     ]);
 
     return {
       ...card,
-      summaryBody: watchedIssues?.privacyRedacted ? null : document?.latestBody ?? null,
-      ...(watchedIssues === undefined ? {} : {
-        watchedIssueCount: watchedIssues.count,
-        privacyRedacted: watchedIssues.privacyRedacted,
-      }),
+      fingerprint: issueRefs.fingerprint,
+      mentionedIssueIds: issueRefs.mentionedIssueIds,
+      summaryBody: isSummaryRedacted(watchedIssues, options) ? null : document?.latestBody ?? null,
+      ...(watchedIssues === undefined
+        ? (options.issueReadCondition ? { privacyRedacted: true } : {})
+        : {
+          watchedIssueCount: watchedIssues.count,
+          privacyRedacted: watchedIssues.privacyRedacted,
+        }),
       todayTokens: today.tokens,
       todayCostCents: today.costCents,
     };
@@ -240,10 +385,10 @@ export function statusCardService(
     };
     const agentId = actor.agentId;
     if (!agentId) {
-      return db.insert(statusCards).values(values).returning().then((rows) => rows[0]!);
+      return mutate(companyId, tx => tx.insert(statusCards).values(values).returning().then((rows) => rows[0]!));
     }
 
-    return db.transaction(async (tx) => {
+    return mutate(companyId, async (tx) => {
       const author = await tx
         .select({ id: agents.id })
         .from(agents)
@@ -292,11 +437,12 @@ export function statusCardService(
       ...(input.refreshPolicy !== undefined
         ? {
             refreshPolicy: input.refreshPolicy,
-            nextEvalAt: card.archivedAt ? null : nextStatusCardEvaluationAt(input.refreshPolicy, now),
+            nextEvalReason: "refresh",
+            nextEvalAt: card.archivedAt ? null : input.refreshPolicy.mode === "reactive" && card.queries.length > 0 ? now : nextStatusCardEvaluationAt(input.refreshPolicy, now),
           }
         : {}),
       ...(archiveChanged && input.archived
-        ? { archivedAt: now, archivedByAgentId: actor.agentId, archivedByUserId: actor.userId, nextEvalAt: null }
+        ? { archivedAt: now, archivedByAgentId: actor.agentId, archivedByUserId: actor.userId, nextEvalAt: null, nextEvalReason: null }
         : {}),
       ...(archiveChanged && !input.archived
         ? {
@@ -306,33 +452,56 @@ export function statusCardService(
             lastChangeAt: now,
             lastUpdateRunKind: null,
             nextEvalAt: card.queries.length > 0 ? now : null,
+            nextEvalReason: "refresh",
           }
         : {}),
     };
-    const next = await db.update(statusCards).set({
+    const next = await mutate(card.companyId, tx => tx.update(statusCards).set({
       ...values,
       ...(archiveChanged && input.archived ? { generatingIssueId: null, pendingChangeHash: null } : {}),
-    }).where(eq(statusCards.id, card.id)).returning().then((rows) => rows[0]!);
+    }).where(eq(statusCards.id, card.id)).returning().then((rows) => rows[0]!));
     if (archiveChanged && input.archived && card.generatingIssueId) {
       const generationIssue = await db.select().from(issues).where(eq(issues.id, card.generatingIssueId)).then((rows) => rows[0] ?? null);
       if (generationIssue && !TERMINAL_ISSUE_STATUSES.has(generationIssue.status)) {
-        await issuesSvc.update(generationIssue.id, { status: "cancelled" });
+        await issuesSvc().update(generationIssue.id, { status: "cancelled" });
       }
     }
     return next;
   }
 
   async function remove(id: string) {
-    return db.delete(statusCards).where(eq(statusCards.id, id)).returning().then((rows) => rows[0] ?? null);
+    const card = await getById(id);
+    if (!card) return null;
+    return mutate(card.companyId, tx => tx.delete(statusCards).where(eq(statusCards.id, id)).returning().then((rows) => rows[0] ?? null));
   }
 
   async function listUpdates(cardId: string) {
     return db.select().from(statusCardUpdates).where(eq(statusCardUpdates.cardId, cardId)).orderBy(desc(statusCardUpdates.startedAt));
   }
 
-  async function listSummaryRevisions(card: Pick<StatusCardRow, "companyId" | "documentId">) {
+  /**
+   * The update ledger as one viewer may see it: change entries for issues the
+   * viewer cannot read are dropped, and the Summarizer-written change summary
+   * is withheld whenever the card's summary is redacted for that viewer.
+   */
+  async function listVisibleUpdates(card: StatusCardRow, options: StatusCardReadOptions = {}) {
+    const rows = await listUpdates(card.id);
+    if (!options.issueReadCondition) return rows;
+    const [visibility, readable] = await Promise.all([
+      readWatchedIssueVisibility(card, options),
+      readableIssueIds(card.companyId, rows.flatMap((row) => (row.changes ?? []).map((change) => change.issueId)), options),
+    ]);
+    const redacted = isSummaryRedacted(visibility, options);
+    return rows.map((row) => ({
+      ...row,
+      changes: (row.changes ?? []).filter((change) => readable?.has(change.issueId) ?? false),
+      changeSummary: redacted ? null : row.changeSummary,
+    }));
+  }
+
+  async function listSummaryRevisions(card: StatusCardRow, options: StatusCardReadOptions = {}) {
     if (!card.documentId) return [];
-    return db
+    const revisions = await db
       .select({
         id: documentRevisions.id,
         revisionNumber: documentRevisions.revisionNumber,
@@ -344,6 +513,81 @@ export function statusCardService(
       .from(documentRevisions)
       .where(and(eq(documentRevisions.documentId, card.documentId), eq(documentRevisions.companyId, card.companyId)))
       .orderBy(desc(documentRevisions.revisionNumber));
+    if (!options.issueReadCondition) return revisions;
+    // Same rule as the hydrated summaryBody: a viewer who cannot read every
+    // watched issue sees neither revision bodies nor their change summaries
+    // (the Summarizer writes the same text into the update ledger).
+    const visibility = await readWatchedIssueVisibility(card, options);
+    if (!isSummaryRedacted(visibility, options)) return revisions;
+    return revisions.map((revision) => ({ ...revision, body: null, changeSummary: null }));
+  }
+
+  /**
+   * The read scope of the agent that runs a card's generation tasks. Every
+   * issue placed in a generation task, or joined through summary mentions,
+   * must pass this condition so the Summarizer never receives an issue it
+   * could not read itself.
+   */
+  async function summarizerReadOptions(
+    companyId: string, agentId: string, onBehalfOfUserId: string, queryDb: Db = db,
+  ): Promise<StatusCardReadOptions> {
+    // The run that works a generation task carries an on-behalf user (agent_jwt
+    // `onBehalfOfUserId`), and the authorization layer intersects the agent's
+    // read with that user's. The payload must be built in the same scope.
+    return {
+      issueReadCondition: await issueReadSqlCondition(queryDb, { type: "agent", agentId, companyId, onBehalfOfUserId }),
+    };
+  }
+
+  async function isActiveCompanyUser(companyId: string, userId: string) {
+    return db
+      .select({ id: companyMemberships.id })
+      .from(companyMemberships)
+      .where(and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, userId),
+        eq(companyMemberships.status, "active"),
+      ))
+      .limit(1)
+      .then((rows) => rows.length > 0);
+  }
+
+  /**
+   * B1 (BLA-1487): the one user a card's generation runs act for. It becomes
+   * the generation task's `responsibleUserId`, so the Summarizer's run resolves
+   * to it (heartbeat run preparation reads the task's responsible user), and
+   * that user is the task's only implicit private reader. The payload is built
+   * in the Summarizer-on-behalf-of-this-user scope, so the user sees only issues
+   * they can already read. Order: the card's creator, then the company default
+   * responsible user, then the oldest active owner, each only while it is an
+   * active member (an inactive user would make the intersected read false).
+   */
+  async function resolveGenerationUserId(card: StatusCardRow): Promise<string> {
+    const company = await db
+      .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
+      .from(companies)
+      .where(eq(companies.id, card.companyId))
+      .then((rows) => rows[0] ?? null);
+    const owner = await db
+      .select({ userId: companyMemberships.principalId })
+      .from(companyMemberships)
+      .where(and(
+        eq(companyMemberships.companyId, card.companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.status, "active"),
+        eq(companyMemberships.membershipRole, "owner"),
+      ))
+      .orderBy(companyMemberships.createdAt, companyMemberships.id)
+      .limit(1)
+      .then((rows) => rows[0]?.userId ?? null);
+    const candidates = [card.createdByUserId, company?.defaultResponsibleUserId?.trim() || null, owner];
+    for (const userId of candidates) {
+      if (userId && await isActiveCompanyUser(card.companyId, userId)) return userId;
+    }
+    throw unprocessable("Status card has no active responsible user for generation", {
+      code: "status_card_responsible_user_unresolved",
+    });
   }
 
   /**
@@ -360,7 +604,7 @@ export function statusCardService(
         .then((rows) => rows[0] ?? null);
       if (override) return override.id;
     }
-    const builtIn = await builtIns.get(card.companyId, SUMMARIZER_BUILT_IN_KEY);
+    const builtIn = await builtInAgentService(db).get(card.companyId, SUMMARIZER_BUILT_IN_KEY);
     if (builtIn.status !== "ready" || !builtIn.agentId) {
       throw unprocessable("Summarizer built-in agent is not configured", {
         code: "summarizer_not_configured",
@@ -370,11 +614,69 @@ export function statusCardService(
     return builtIn.agentId;
   }
 
+  /**
+   * R1: a generation task holds Summarizer-scoped issue titles, the previous
+   * summary and the Summarizer's own run output, so only its assignee may read
+   * it. `issuesSvc.create` files a new private task without a project under a
+   * responsible user's personal private project, which would make that user a
+   * reader (and fails outright on the scheduler path, which has no user). So
+   * the task is created with a neutral placeholder body and no creating user
+   * (a creating user is an implicit private reader), then `finalize` makes it
+   * private in the same update that writes the real payload. The private-task
+   * predicate then admits only the assignee (and its assignment grant).
+   */
+  async function createGenerationIssue(
+    card: StatusCardRow,
+    input: {
+      title: string;
+      assigneeAgentId: string;
+      responsibleUserId: string;
+      createdByAgentId: string | null;
+      hiddenAt: Date;
+      idempotencyKey: string;
+      reopenStatuses: (status: string) => boolean;
+    },
+  ) {
+    let deduplicated = false;
+    const created = await issuesSvc().create(card.companyId, {
+      title: input.title,
+      description: GENERATION_PLACEHOLDER_DESCRIPTION,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: input.assigneeAgentId,
+      createdByAgentId: input.createdByAgentId,
+      createdByUserId: null,
+      responsibleUserId: input.responsibleUserId,
+      trustExplicitResponsibleUserId: true,
+      hiddenAt: input.hiddenAt,
+      idempotencyKey: input.idempotencyKey,
+      onDeduplicated: (reason) => {
+        deduplicated = reason === "idempotency_key";
+      },
+    });
+    const reopen = deduplicated && input.reopenStatuses(created.status);
+    return {
+      created,
+      deduplicated,
+      finalize: async (description: string) => {
+        const updated = await issuesSvc().update(created.id, {
+          ...(reopen ? { status: "todo", assigneeAgentId: input.assigneeAgentId } : {}),
+          responsibleUserId: input.responsibleUserId,
+          visibility: "private",
+          description,
+        });
+        if (!updated) throw notFound("Status-card generation task not found");
+        return updated;
+      },
+    };
+  }
+
   async function requestCompile(cardId: string, actor: StatusCardActor) {
     const card = await getById(cardId);
     if (!card) throw notFound("Status card not found");
     if (card.archivedAt) throw unprocessable("Archived status cards cannot be compiled");
     const summarizerAgentId = await resolveSummarizerAgentId(card);
+    const responsibleUserId = await resolveGenerationUserId(card);
 
     const hash = promptHash(card.interestPrompt);
     if (card.generatingIssueId) {
@@ -389,36 +691,27 @@ export function statusCardService(
       }
     }
 
-    let deduplicated = false;
     const createdAt = new Date();
-    const created = await issuesSvc.create(card.companyId, {
-      title: `Compile status card: ${card.title ?? card.interestPrompt.slice(0, 80)}`,
-      description: compileDescription(card, null, hash),
-      status: "todo",
-      priority: "medium",
-      assigneeAgentId: summarizerAgentId,
-      createdByAgentId: actor.agentId,
-      createdByUserId: actor.userId,
-      hiddenAt: createdAt,
-      idempotencyKey: `status-card-compile:${card.id}:${hash}`,
-      onDeduplicated: (reason) => {
-        deduplicated = reason === "idempotency_key";
-      },
-    });
     // Re-open a superseded setup task so the Summarizer picks it back up. This
     // covers idempotency-key hits that resolve to a terminal task (done/cancelled)
     // as well as a `blocked` one that a manual re-kick is reviving.
-    const reopened = deduplicated && (TERMINAL_ISSUE_STATUSES.has(created.status) || created.status === "blocked")
-      ? await issuesSvc.update(created.id, { status: "todo", assigneeAgentId: summarizerAgentId })
-      : created;
-    const generationIssue = await issuesSvc.update(reopened!.id, {
-      description: compileDescription(card, reopened!.id, hash),
+    // The `private` key segment keeps new tasks from deduplicating onto
+    // historical open generation tasks, whose creating user could read them.
+    const { created, deduplicated, finalize } = await createGenerationIssue(card, {
+      title: `Compile status card: ${card.title ?? card.interestPrompt.slice(0, 80)}`,
+      assigneeAgentId: summarizerAgentId,
+      responsibleUserId,
+      createdByAgentId: actor.agentId,
+      hiddenAt: createdAt,
+      idempotencyKey: `status-card-compile:private:${card.id}:${hash}`,
+      reopenStatuses: (status) => TERMINAL_ISSUE_STATUSES.has(status) || status === "blocked",
     });
-    const [nextCard] = await db
+    const generationIssue = await finalize(compileDescription(card, created.id, hash));
+    const [nextCard] = await mutate(card.companyId, tx => tx
       .update(statusCards)
       .set({ generatingIssueId: generationIssue!.id, state: "compiling", failureReason: null, updatedAt: createdAt })
       .where(eq(statusCards.id, card.id))
-      .returning();
+      .returning());
     return {
       card: nextCard!,
       generatingIssue: generationIssue!,
@@ -464,7 +757,7 @@ export function statusCardService(
     if (card.archivedAt) throw unprocessable("Archived status cards cannot accept generation writes");
     await assertSummarizerWriter(card, input.generationIssueId, actor);
     const now = new Date();
-    return db.transaction(async (tx) => {
+    return mutate(card.companyId, async (tx) => {
       const current = await tx.select().from(statusCards).where(eq(statusCards.id, card.id)).then((rows) => rows[0] ?? null);
       if (!current || current.archivedAt || current.generatingIssueId !== input.generationIssueId) {
         throw conflict("Status-card compilation was superseded by a newer task");
@@ -528,14 +821,16 @@ export function statusCardService(
     companyId: string,
     issueIds: string[],
     options: StatusCardReadOptions = {},
+    queryDb: Db = db,
   ): Promise<CompanySearchIssueSummary[]> {
     if (issueIds.length === 0) return [];
-    const rows = await db
+    const rows = await queryDb
       .select({
         id: issues.id,
         identifier: issues.identifier,
         title: issues.title,
         status: issues.status,
+        displayStatus: issueDisplayStatusSql(),
         priority: issues.priority,
         assigneeAgentId: issues.assigneeAgentId,
         assigneeUserId: issues.assigneeUserId,
@@ -561,7 +856,7 @@ export function statusCardService(
    * Unknown identifiers and foreign-company links drop out here, so a summary
    * cannot join arbitrary ids to the watched set.
    */
-  async function resolveMentionedIssueIds(companyId: string, markdown: string) {
+  async function resolveMentionedIssueIds(companyId: string, markdown: string, options: StatusCardReadOptions = {}) {
     const mentions = extractIssueMentions(markdown);
     const conditions = [
       ...(mentions.identifiers.length > 0 ? [inArray(issues.identifier, mentions.identifiers)] : []),
@@ -571,7 +866,7 @@ export function statusCardService(
     const rows = await db
       .select({ id: issues.id })
       .from(issues)
-      .where(and(eq(issues.companyId, companyId), or(...conditions)))
+      .where(and(eq(issues.companyId, companyId), or(...conditions), options.issueReadCondition ?? sql<boolean>`true`))
       .limit(STATUS_CARD_MAX_MENTIONED_ISSUES);
     return rows.map((row) => row.id).sort();
   }
@@ -580,12 +875,12 @@ export function statusCardService(
     return loadIssueSummaries(card.companyId, card.mentionedIssueIds ?? [], options);
   }
 
-  async function executeQueries(card: StatusCardRow, options: StatusCardReadOptions = {}) {
+  async function executeQueries(card: StatusCardRow, options: StatusCardReadOptions = {}, onNextMembershipChange?: (at: Date | null) => void, queryDb: Db = db) {
     const issueMap = new Map<string, CompanySearchIssueSummary>();
     for (const storedQuery of card.queries) {
       const query = companySearchQuerySchema.parse(storedQuery);
-      const response = await searchSvc.search(card.companyId, query, {
-        issueReadCondition: options.issueReadCondition,
+      const response = await companySearchService(queryDb).search(card.companyId, query, {
+        issueReadCondition: options.issueReadCondition, onNextMembershipChange, issueResultsOnly: true,
       });
       for (const result of response.results) {
         if (result.type === "issue" && result.issue) issueMap.set(result.issue.id, result.issue);
@@ -596,12 +891,12 @@ export function statusCardService(
     const mentioned = await loadIssueSummaries(
       card.companyId,
       (card.mentionedIssueIds ?? []).filter((issueId) => !issueMap.has(issueId)),
-      options,
+      options, queryDb,
     );
     for (const issue of mentioned) issueMap.set(issue.id, issue);
     const snapshot = [...issueMap.values()];
     if (snapshot.length === 0) return snapshot;
-    const latestHumanComments = await db
+    const latestHumanComments = await queryDb
       .select({
         issueId: issueComments.issueId,
         // The postgres-js driver returns the `max()` aggregate over a timestamp
@@ -622,14 +917,50 @@ export function statusCardService(
     return snapshot.map((issue) => ({ ...issue, latestHumanCommentAt: commentByIssueId.get(issue.id) ?? null }));
   }
 
-  async function requestRefresh(cardId: string, input: {
+  function nextEvaluationAt(card: StatusCardRow, membershipAt: Date | null, now: Date) {
+    const interval = nextStatusCardEvaluationAt(card.refreshPolicy, now);
+    return card.refreshPolicy.mode === "reactive" && (card.refreshPolicy.triggers.membershipChanges || card.refreshPolicy.triggers.anyUpdate)
+      ? membershipAt : interval;
+  }
+
+  async function cancelUnclaimedRefreshTask(card: StatusCardRow, issueId: string) {
+    const postCommitActions: IssuePostCommitAction[] = [];
+    const publications: ActivityPublication[] = [];
+    const admitted = await db.transaction(async tx => {
+      // Match the canonical mutation's issue-first lock order. A terminal
+      // transition cannot race this recheck and have its receipt rewritten.
+      const [current] = await tx.select({ status: issues.status }).from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, card.companyId))).for("update");
+      if (!current) return false;
+      const [generation] = await tx.select({ id: statusCardUpdates.id }).from(statusCardUpdates)
+        .where(and(eq(statusCardUpdates.cardId, card.id), eq(statusCardUpdates.generationIssueId, issueId))).limit(1);
+      // A failed revision CAS excludes any later claim of this revision's task.
+      // A summary clears the claim and records its ledger atomically, so even
+      // an active task whose winner already finished remains admitted work.
+      if (generation) return true;
+      if (TERMINAL_ISSUE_STATUSES.has(current.status)) return false;
+      // Bind preflight readers to this transaction too: a root-pool reader
+      // would wait forever when this transaction owns its only connection.
+      await issueService(tx as unknown as Db).update(issueId,
+        { status: "cancelled", companyGuard: card.companyId }, tx, publications, postCommitActions);
+      return false;
+    });
+    for (const publication of publications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, postCommitActions);
+    return admitted;
+  }
+
+  async function refreshCurrentCard(cardId: string, input: {
     full?: boolean;
     trigger?: "manual" | "interval" | "reactive" | "restore";
     actor?: StatusCardActor;
     now?: Date;
-  } = {}) {
-    const card = await getById(cardId);
-    if (!card) throw notFound("Status card not found");
+  } = {}, superseded = false) {
+    const [source] = await db.select({ card: statusCards, revision: sql<string>`${statusCards}.xmin::text` })
+      .from(statusCards).where(eq(statusCards.id, cardId));
+    if (!source) throw notFound("Status card not found");
+    const { card, revision } = source;
+    const currentRevision = sql`${statusCards}.xmin::text = ${revision}`;
     if (card.archivedAt) throw unprocessable("Archived status cards cannot be refreshed");
     if (card.queries.length === 0) throw conflict("Compile the status-card query before refreshing it");
     if (card.generatingIssueId) {
@@ -642,22 +973,61 @@ export function statusCardService(
     }
 
     const now = input.now ?? new Date();
-    const snapshot = await executeQueries(card);
+    if (superseded && input.trigger !== undefined && input.trigger !== "manual" && input.trigger !== "restore"
+      && (card.refreshPolicy.mode === "manual" || (card.refreshPolicy.mode === "interval" && card.nextEvalAt && card.nextEvalAt > now))) {
+      return { card, generatingIssue: null, alreadyGenerating: false, enqueued: false };
+    }
+    // The snapshot feeds the generation task, so it is built in the summarizer's
+    // read scope. Without a resolvable summarizer no task can be created; the
+    // snapshot then only drives the no-run counters below (as before) and the
+    // resolution error is rethrown before any generation task is built.
+    const summarizer = await resolveSummarizerAgentId(card).then(
+      (agentId) => ({ agentId, error: null }),
+      (error: unknown) => ({ agentId: null, error }),
+    );
+    // Without a resolvable generation user the Summarizer's run could read
+    // nothing; that error is likewise rethrown before any task is built.
+    const generationUser = await resolveGenerationUserId(card).then(
+      (userId) => ({ userId, error: null }),
+      (error: unknown) => ({ userId: null, error }),
+    );
+    const summarizerScope = summarizer.agentId && generationUser.userId
+      ? await summarizerReadOptions(card.companyId, summarizer.agentId, generationUser.userId)
+      : {};
+    let membershipAt: Date | null = null;
+    const snapshot = await executeQueries(
+      card,
+      summarizerScope,
+      at => { if (at && (!membershipAt || at < membershipAt)) membershipAt = at; },
+    );
     const fingerprint = buildStatusCardFingerprint(snapshot);
-    const allChanges = diffStatusCardFingerprint(card.fingerprint as StatusCardFingerprint | null, fingerprint);
+    // The stored fingerprint may predate summarizer scoping (or the summarizer
+    // may since have lost access). Diff only against entries the summarizer can
+    // read, so a "removed" change never carries an unreadable issue's
+    // identifier or title into the generation task, the ledger or the response.
+    const storedRefs = await scopeCardIssueRefs(card, summarizerScope);
+    const storedFingerprint = storedRefs.fingerprint;
+    // If the stored state names an issue the summarizer cannot read, the previous
+    // summary was written from unscoped data and may name it too: withhold it.
+    const storedRefsRedacted =
+      Object.keys(storedFingerprint ?? {}).length !== Object.keys(card.fingerprint ?? {}).length
+      || storedRefs.mentionedIssueIds.length !== (card.mentionedIssueIds ?? []).length;
+    const allChanges = diffStatusCardFingerprint(storedFingerprint as StatusCardFingerprint | null, fingerprint);
     const changes = filterStatusCardChanges(allChanges, card.refreshPolicy);
     const trigger = input.trigger ?? "manual";
     const forceRun = trigger === "manual" || trigger === "restore";
-    const nextEvalAt = nextStatusCardEvaluationAt(card.refreshPolicy, now);
+    const nextEvalAt = nextEvaluationAt(card, membershipAt, now);
     if (!forceRun && changes.length === 0) {
-      const [next] = await db.update(statusCards).set({
+      const [next] = await mutate(card.companyId, tx => tx.update(statusCards).set({
         pendingChangeCount: 0,
         pendingChangeHash: null,
         lastChangeAt: null,
         state: "active",
         nextEvalAt,
-      }).where(eq(statusCards.id, card.id)).returning();
-      return { card: next!, generatingIssue: null, alreadyGenerating: false, enqueued: false };
+        nextEvalReason: nextEvalAt ? card.refreshPolicy.mode === "reactive" ? "membership" : "refresh" : null,
+      }).where(and(eq(statusCards.id, card.id), currentRevision)).returning());
+      if (!next) return undefined;
+      return { card: next, generatingIssue: null, alreadyGenerating: false, enqueued: false };
     }
 
     const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
@@ -678,14 +1048,20 @@ export function statusCardService(
       manual: forceRun,
     });
     if (decision.action !== "run") {
-      const [next] = await db.update(statusCards).set({
+      const [next] = await mutate(card.companyId, tx => tx.update(statusCards).set({
         pendingChangeCount: changes.length,
         pendingChangeHash,
         lastChangeAt,
         state: decision.action === "pause_budget" ? "paused_budget" : decision.action === "pause_hours" ? "paused_hours" : "active",
-        nextEvalAt: decision.action === "wait" && "dueAt" in decision ? decision.dueAt : nextEvalAt,
-      }).where(eq(statusCards.id, card.id)).returning();
-      return { card: next!, generatingIssue: null, alreadyGenerating: false, enqueued: false };
+        nextEvalReason: "policy",
+        nextEvalAt: nextStatusCardPolicyEligibility({
+          policy: card.refreshPolicy, now, lastChangeAt,
+          completedUpdateTimes: recent.filter(row => row.kind !== "compile" && row.finishedAt).map(row => row.startedAt),
+          tokensToday: Number(daily[0]?.tokens ?? 0),
+        }),
+      }).where(and(eq(statusCards.id, card.id), currentRevision)).returning());
+      if (!next) return undefined;
+      return { card: next, generatingIssue: null, alreadyGenerating: false, enqueued: false };
     }
 
     const history = await listUpdates(card.id);
@@ -701,57 +1077,76 @@ export function statusCardService(
       configurationChanged: card.lastUpdateRunKind === null && Boolean(card.lastGeneratedAt),
       restoreRefresh: trigger === "restore",
     });
-    const summarizerAgentId = await resolveSummarizerAgentId(card);
-    const previousSummary = card.documentId
+    if (!summarizer.agentId) throw summarizer.error;
+    if (!generationUser.userId) throw generationUser.error;
+    const summarizerAgentId = summarizer.agentId;
+    const responsibleUserId = generationUser.userId;
+    // The previous summary is free text, so the stored-refs check above cannot
+    // bound it alone: pass it on only when the last summary was written by a
+    // generation run acting for this same user. Otherwise (including every
+    // summary written before generation tasks carried a responsible user) it
+    // could describe issues this task's responsible user cannot read.
+    const lastSummaryWrite = history.find((row) => row.kind !== "compile" && row.status === "ok" && row.generationIssueId);
+    const lastSummaryUserId = lastSummaryWrite?.generationIssueId
+      ? await db.select({ responsibleUserId: issues.responsibleUserId }).from(issues)
+        .where(and(eq(issues.id, lastSummaryWrite.generationIssueId), eq(issues.companyId, card.companyId)))
+        .then((rows) => rows[0]?.responsibleUserId ?? null)
+      : null;
+    const previousSummary = card.documentId && !storedRefsRedacted && lastSummaryUserId === responsibleUserId
       ? await db.select().from(documents).where(eq(documents.id, card.documentId)).then((rows) => rows[0]?.latestBody ?? null)
       : null;
     const fingerprintHash = statusCardFingerprintHash(fingerprint);
-    let deduplicated = false;
-    const created = await issuesSvc.create(card.companyId, {
+    const { created, deduplicated, finalize } = await createGenerationIssue(card, {
       title: `${kind === "full" ? "Rebuild" : "Update"} status card: ${card.title ?? card.interestPrompt.slice(0, 80)}`,
-      description: updateDescription({ card, generationIssueId: null, fingerprint, changes, kind, trigger, previousSummary, snapshot }),
-      status: "todo",
-      priority: "medium",
       assigneeAgentId: summarizerAgentId,
+      responsibleUserId,
       createdByAgentId: input.actor?.agentId ?? null,
-      createdByUserId: input.actor?.userId ?? null,
       hiddenAt: now,
-      idempotencyKey: `status-card-update:${card.id}:${fingerprintHash}`,
-      onDeduplicated: (reason) => { deduplicated = reason === "idempotency_key"; },
+      // Claim ownership is revision-scoped too. A superseded refresh may cancel
+      // its unclaimed task; it must not share that task with a newer revision
+      // which has the same watched fingerprint but has not claimed the card yet.
+      // Concurrent refreshes of this revision still deduplicate normally.
+      // The `private` key segment keeps new tasks from deduplicating onto
+      // historical open generation tasks, whose creating user could read them.
+      idempotencyKey: `status-card-update:private:${card.id}:${revision}:${fingerprintHash}`,
+      // A retry for an unchanged fingerprint deduplicates onto the earlier
+      // task. A `blocked` one is stuck (see the guard above), so it is reopened
+      // like a terminal one and gets a fresh ledger row below.
+      reopenStatuses: isReopenableGenerationStatus,
     });
-    const reopened = deduplicated && TERMINAL_ISSUE_STATUSES.has(created.status)
-      ? await issuesSvc.update(created.id, { status: "todo", assigneeAgentId: summarizerAgentId })
-      : created;
-    const generationIssue = await issuesSvc.update(reopened!.id, {
-      description: updateDescription({ card, generationIssueId: reopened!.id, fingerprint, changes, kind, trigger, previousSummary, snapshot }),
-    });
+    const generationIssue = await finalize(
+      updateDescription({ card, generationIssueId: created.id, fingerprint, changes, kind, trigger, previousSummary, snapshot }),
+    );
     const priorGenerationPredicate = card.generatingIssueId
       ? eq(statusCards.generatingIssueId, card.generatingIssueId)
       : isNull(statusCards.generatingIssueId);
-    const [next] = await db.update(statusCards).set({
+    const [next] = await mutate(card.companyId, tx => tx.update(statusCards).set({
       generatingIssueId: generationIssue!.id,
       pendingChangeCount: changes.length,
       pendingChangeHash,
       lastChangeAt,
       state: "active",
       nextEvalAt,
+      nextEvalReason: nextEvalAt ? card.refreshPolicy.mode === "reactive" ? "membership" : "refresh" : null,
       failureReason: null,
-    }).where(and(eq(statusCards.id, card.id), isNull(statusCards.archivedAt), or(isNull(statusCards.generatingIssueId), priorGenerationPredicate))).returning();
+    }).where(and(eq(statusCards.id, card.id), isNull(statusCards.archivedAt), currentRevision, or(isNull(statusCards.generatingIssueId), priorGenerationPredicate))).returning());
     if (!next) {
       const winner = await getById(card.id);
       if (!winner?.generatingIssueId) {
-        if (!TERMINAL_ISSUE_STATUSES.has(generationIssue!.status)) {
-          await issuesSvc.update(generationIssue!.id, { status: "cancelled" });
+        const admitted = await cancelUnclaimedRefreshTask(card, generationIssue!.id);
+        if (winner && !winner.archivedAt) {
+          if (admitted) return { card: winner, generatingIssue: null, alreadyGenerating: false, enqueued: false, kind, changes };
+          return undefined;
         }
         throw conflict("Status-card refresh claim was lost");
       }
-      if (generationIssue!.id !== winner.generatingIssueId && !TERMINAL_ISSUE_STATUSES.has(generationIssue!.status)) {
-        await issuesSvc.update(generationIssue!.id, { status: "cancelled" });
+      if (generationIssue!.id !== winner.generatingIssueId) {
+        await cancelUnclaimedRefreshTask(card, generationIssue!.id);
       }
       const winnerIssue = await db.select().from(issues).where(eq(issues.id, winner.generatingIssueId)).then((rows) => rows[0] ?? null);
       return { card: winner, generatingIssue: winnerIssue, alreadyGenerating: true, enqueued: false, kind, changes };
     }
-    if (!deduplicated || TERMINAL_ISSUE_STATUSES.has(created.status)) {
+    if (!deduplicated || isReopenableGenerationStatus(created.status)) {
       await db.insert(statusCardUpdates).values({
         cardId: card.id,
         kind,
@@ -765,28 +1160,136 @@ export function statusCardService(
     return { card: next, generatingIssue: generationIssue!, alreadyGenerating: deduplicated, enqueued: true, kind, changes };
   }
 
-  async function tickDueStatusCards(now = new Date()) {
-    const due = await db.select().from(statusCards).where(and(isNull(statusCards.archivedAt), isNull(statusCards.generatingIssueId), isNotNull(statusCards.nextEvalAt), lte(statusCards.nextEvalAt, now)));
+  async function requestRefresh(cardId: string, input: Parameters<typeof refreshCurrentCard>[1] = {}) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const result = await refreshCurrentCard(cardId, input, attempt > 0);
+      if (result) return result;
+    }
+    throw conflict("Status-card refresh was superseded by concurrent edits");
+  }
+
+  /**
+   * Abandoned-generation recovery, run at the start of the existing tick.
+   * A generation task that reached done/cancelled/blocked without a summary
+   * write must not leave the card unchecked for ever:
+   *  1. a card still claimed by such a task (its status changed without the
+   *     issue-service transition hook) is released through the same
+   *     finalization the hook uses (state `error`, ledger row `failed`);
+   *  2. an `error` card released that way gets `nextEvalAt` re-armed with a
+   *     bounded backoff counted from the card's own update ledger, so repeated
+   *     abandonment does not regenerate on every tick and stops after a cap.
+   * No model run starts here; the normal due-card evaluation below decides
+   * whether anything changed.
+   */
+  async function recoverAbandonedGenerations(now: Date) {
+    const stalled = await db
+      .selectDistinct({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+      })
+      .from(statusCards)
+      .innerJoin(issues, and(eq(issues.id, statusCards.generatingIssueId), eq(issues.companyId, statusCards.companyId)))
+      .where(and(isNull(statusCards.archivedAt), inArray(issues.status, [...STALLED_GENERATION_ISSUE_STATUSES])));
+    for (const issue of stalled) {
+      // v2026.1117.0 registers the evaluation work signal inside a transaction.
+      await db.transaction(tx => finalizeStatusCardsForStalledGeneration(tx, issue as Parameters<typeof finalizeStatusCardsForStalledGeneration>[1]));
+    }
+
+    const parked = await db.select().from(statusCards).where(and(
+      isNull(statusCards.archivedAt),
+      isNull(statusCards.generatingIssueId),
+      isNull(statusCards.nextEvalAt),
+      eq(statusCards.state, "error"),
+      sql`jsonb_array_length(${statusCards.queries}) > 0`,
+    ));
+    let rearmed = 0;
+    for (const card of parked) {
+      if (card.refreshPolicy.mode === "manual") continue;
+      const recent = await db.select({ status: statusCardUpdates.status, finishedAt: statusCardUpdates.finishedAt })
+        .from(statusCardUpdates)
+        .where(eq(statusCardUpdates.cardId, card.id))
+        .orderBy(desc(statusCardUpdates.startedAt))
+        .limit(STATUS_CARD_ABANDONED_RETRY_LIMIT + 1);
+      let consecutiveAbandoned = 0;
+      while (consecutiveAbandoned < recent.length && recent[consecutiveAbandoned]!.status === "failed") consecutiveAbandoned += 1;
+      if (consecutiveAbandoned === 0) continue;
+      const retryAt = abandonedGenerationRetryAt(card.refreshPolicy, consecutiveAbandoned, recent[0]!.finishedAt ?? now);
+      if (!retryAt) continue;
+      const [updated] = await mutate(card.companyId, tx => tx.update(statusCards).set({ nextEvalAt: retryAt })
+        .where(and(
+          eq(statusCards.id, card.id),
+          isNull(statusCards.archivedAt),
+          isNull(statusCards.generatingIssueId),
+          isNull(statusCards.nextEvalAt),
+          eq(statusCards.state, "error"),
+        ))
+        .returning({ id: statusCards.id }));
+      if (updated) rearmed += 1;
+    }
+    return { released: stalled.length, rearmed };
+  }
+
+  async function tickDueStatusCards(now = new Date(), reactiveCompanies?: ReadonlySet<string> | "changed", reconstruct = false) {
+    try {
+      await recoverAbandonedGenerations(now);
+    } catch (err) {
+      logger.warn({ err }, "status card abandoned-generation recovery failed");
+    }
+    const changedScope = reactiveCompanies === "changed" ? sql`true` : reactiveCompanies?.size
+      ? inArray(statusCards.companyId, [...reactiveCompanies]) : sql`false`;
+    // Startup recovers lost source hints for membership deadlines as well as
+    // disarmed cards. Saved policy gates and retry leases keep their owner.
+    // Legacy untagged leases are at most five minutes from their claim time:
+    // preserve that bounded ambiguity, never a days-away membership deadline.
+    const startupScope = reconstruct ? or(
+      isNull(statusCards.nextEvalAt), eq(statusCards.nextEvalReason, "membership"),
+      and(isNull(statusCards.nextEvalReason), isNull(statusCards.pendingChangeHash),
+        eq(statusCards.state, "active"), gt(statusCards.nextEvalAt, new Date(now.getTime() + 5 * 60_000))),
+    ) : undefined;
+    const reactiveScope = or(startupScope, changedScope);
+    const due = await db.select({ card: statusCards }).from(statusCards)
+      .innerJoin(companies, eq(companies.id, statusCards.companyId))
+      .where(and(eq(companies.status, "active"), isNull(statusCards.archivedAt), isNull(statusCards.generatingIssueId),
+        or(and(isNotNull(statusCards.nextEvalAt), lte(statusCards.nextEvalAt, now)),
+          and(reactiveScope,
+            or(isNull(statusCards.nextEvalReason), ne(statusCards.nextEvalReason, "retry"), isNull(statusCards.nextEvalAt), lte(statusCards.nextEvalAt, now)),
+            ne(statusCards.state, "error"), ne(statusCards.state, "compiling"), sql`${statusCards.refreshPolicy}->>'mode' = 'reactive'`, sql`jsonb_array_length(${statusCards.queries}) > 0`))))
+      .then(rows => rows.map(row => row.card));
     const enqueued: Array<{ cardId: string; generatingIssue: typeof issues.$inferSelect }> = [];
     let evaluated = 0;
+    const deferredCompanyIds = new Set<string>();
     for (const candidate of due) {
-      const claimUntil = new Date(now.getTime() + 5 * 60 * 1000);
-      const [claimed] = await db.update(statusCards).set({ nextEvalAt: claimUntil })
-        .where(and(eq(statusCards.id, candidate.id), isNull(statusCards.generatingIssueId), lte(statusCards.nextEvalAt, now)))
-        .returning();
-      if (!claimed) continue;
-      evaluated += 1;
-      try {
-        const result = await requestRefresh(claimed.id, { trigger: claimed.refreshPolicy.mode === "reactive" ? "reactive" : "interval", now });
-        if (result.enqueued && result.generatingIssue) enqueued.push({ cardId: claimed.id, generatingIssue: result.generatingIssue });
-      } catch (err) {
-        logger.warn(
-          { err, cardId: claimed.id, companyId: claimed.companyId },
-          "status card scheduled refresh failed",
+      // nextEvalAt is both a retry lease and an evaluation deadline. A source
+      // event may preempt a genuine future deadline, so serialize scheduler
+      // evaluation across connections without holding a row lock while the
+      // existing issue/card services commit through their own transactions.
+      await withDedicatedDbConnection(db, connection => connection.transaction(async lockTx => {
+        const [lock] = await lockTx.execute<{ acquired: boolean }>(
+          sql`select pg_try_advisory_xact_lock(hashtextextended(${candidate.id}, 0)) as acquired`,
         );
-      }
+        if (!lock?.acquired) { deferredCompanyIds.add(candidate.companyId); return; }
+        const claimUntil = new Date(now.getTime() + 5 * 60 * 1000);
+        const [claimed] = await mutate(candidate.companyId, tx => tx.update(statusCards).set({ nextEvalAt: claimUntil, nextEvalReason: "retry" })
+          .where(and(eq(statusCards.id, candidate.id), isNull(statusCards.archivedAt), isNull(statusCards.generatingIssueId),
+            candidate.nextEvalAt ? eq(statusCards.nextEvalAt, candidate.nextEvalAt) : isNull(statusCards.nextEvalAt)))
+          .returning());
+        if (!claimed) return;
+        evaluated += 1;
+        try {
+          const result = await requestRefresh(claimed.id, { trigger: claimed.refreshPolicy.mode === "reactive" ? "reactive" : "interval", now });
+          if (result.enqueued && result.generatingIssue) enqueued.push({ cardId: claimed.id, generatingIssue: result.generatingIssue });
+        } catch (err) {
+          logger.warn(
+            { err, cardId: claimed.id, companyId: claimed.companyId },
+            "status card scheduled refresh failed",
+          );
+        }
+      }));
     }
-    return { evaluated, enqueued };
+    return { evaluated, enqueued, deferredCompanyIds };
   }
 
   async function writeSummary(cardId: string, input: WriteStatusCardSummary, actor: StatusCardWriter) {
@@ -796,7 +1299,7 @@ export function statusCardService(
     await assertSummarizerWriter(card, input.generationIssueId, actor);
     if (card.queries.length === 0) throw conflict("Compile the status-card query before writing its summary");
     const now = new Date();
-    return db.transaction(async (tx) => {
+    return mutate(card.companyId, async (tx) => {
       const current = await tx.select().from(statusCards).where(eq(statusCards.id, card.id)).then((rows) => rows[0] ?? null);
       if (!current || current.archivedAt || current.generatingIssueId !== input.generationIssueId) {
         throw conflict("Status-card generation was superseded by a newer task");
@@ -813,12 +1316,21 @@ export function statusCardService(
       const payloadFingerprint = payload?.operation === "update" && payload.fingerprint && typeof payload.fingerprint === "object"
         ? payload.fingerprint as StatusCardFingerprint
         : null;
-      const mentionedIssueIds = await resolveMentionedIssueIds(current.companyId, input.markdown);
+      // assertSummarizerWriter pinned the writer to the card's summarizer, so
+      // its read scope bounds both the mentions and the watched membership.
+      // The run acts for the generation task's responsible user, so the
+      // writer's scope is the same Summarizer-on-behalf-of-that-user read.
+      const writerScope = generationIssue.responsibleUserId
+        ? await summarizerReadOptions(current.companyId, actor.agentId!, generationIssue.responsibleUserId, tx as unknown as Db)
+        : { issueReadCondition: sql<boolean>`false` };
+      const mentionedIssueIds = await resolveMentionedIssueIds(current.companyId, input.markdown, writerScope);
       // Current watched membership: compiled-query matches plus the issues this
       // summary mentions.
-      const watchedNow = buildStatusCardFingerprint(
-        await executeQueries({ ...current, mentionedIssueIds }),
-      );
+      let membershipAt: Date | null = null;
+      // All watched-source reads use this transaction. Borrowing the root
+      // pool here would deadlock a one-connection installation.
+      const watchedSnapshot = await executeQueries({ ...current, mentionedIssueIds }, writerScope, at => { if (at && (!membershipAt || at < membershipAt)) membershipAt = at; }, tx as unknown as Db);
+      const watchedNow = buildStatusCardFingerprint(watchedSnapshot);
       let snapshot: StatusCardFingerprint;
       if (payloadFingerprint) {
         // Keep the generation-time fingerprint as the change baseline: issues
@@ -889,7 +1401,8 @@ export function statusCardService(
         pendingChangeCount: 0,
         pendingChangeHash: null,
         lastChangeAt: null,
-        nextEvalAt: nextStatusCardEvaluationAt(current.refreshPolicy, now),
+        nextEvalReason: current.refreshPolicy.mode === "reactive" || current.refreshPolicy.mode === "interval" ? "refresh" : membershipAt ? "membership" : null,
+        nextEvalAt: current.refreshPolicy.mode === "reactive" ? now : nextEvaluationAt(current, membershipAt, now),
         updatedAt: now,
       }).where(and(eq(statusCards.id, current.id), eq(statusCards.generatingIssueId, input.generationIssueId))).returning();
       if (!next) throw conflict("Status-card generation was superseded by a newer task");
@@ -902,7 +1415,11 @@ export function statusCardService(
         : [];
       const existingUpdate = await tx.select().from(statusCardUpdates)
         .where(eq(statusCardUpdates.generationIssueId, input.generationIssueId))
-        .then((rows) => rows.find((row) => row.kind !== "compile") ?? null);
+        // A retried generation reopens the same task, so it can own several
+        // rows: close the one still running, not an earlier failed attempt.
+        .then((rows) => rows.find((row) => row.kind !== "compile" && !row.finishedAt)
+          ?? rows.find((row) => row.kind !== "compile")
+          ?? null);
       const updateValues = {
         runId: actor.runId,
         finishedAt: now,
@@ -935,11 +1452,11 @@ export function statusCardService(
       return {
         query,
         result: await searchSvc.search(card.companyId, query, {
-          issueReadCondition: options.issueReadCondition,
+          issueReadCondition: options.issueReadCondition, issueResultsOnly: true,
         }),
       };
     }));
   }
 
-  return { list, getById, hydrate, create, update, remove, listUpdates, listSummaryRevisions, listMentionedIssues, requestCompile, requestRefresh, tickDueStatusCards, writeQuery, writeSummary, dryRun };
+  return { list, getById, hydrate, create, update, remove, listUpdates, listVisibleUpdates, listSummaryRevisions, readableIssueIds, listMentionedIssues, requestCompile, requestRefresh, tickDueStatusCards, writeQuery, writeSummary, dryRun };
 }

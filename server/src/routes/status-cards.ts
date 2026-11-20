@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import { Router, type Request } from "express";
-import type { Db } from "@paperclipai/db";
+import { companies, type Db } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
 import {
   createStatusCardSchema,
   listStatusCardsQuerySchema,
@@ -16,6 +18,35 @@ import { accessService, heartbeatService, instanceSettingsService, issueService,
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 
+// Deadline provenance belongs to scheduling, not the public card contract.
+function publicCard<T extends { nextEvalReason?: unknown }>(card: T) {
+  const { nextEvalReason: _reason, ...result } = card;
+  return result;
+}
+
+/**
+ * R2: `status_card` activity rows are readable company-wide, so Summarizer
+ * text (change summaries, compiled queries) is logged only as length + hash.
+ */
+function textDigest(value: string) {
+  return { length: value.length, sha256: createHash("sha256").update(value).digest("hex") };
+}
+
+/**
+ * R1: the generation task is private to the Summarizer. Mutation responses
+ * carry only a reference to it, never its description or other payload.
+ */
+function generationIssueRef(issue: { id: string; identifier: string | null; title: string; status: string; assigneeAgentId: string | null } | null) {
+  if (!issue) return null;
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    status: issue.status,
+    assigneeAgentId: issue.assigneeAgentId,
+  };
+}
+
 export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWakeupDeps } = {}) {
   const router = Router();
   const access = accessService(db);
@@ -23,6 +54,16 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
   const service = statusCardService(db);
   const issueSvc = issueService(db);
   const heartbeat = opts.heartbeat ?? heartbeatService(db);
+
+  // People view, restore and refresh a card on the company's Status page. Single-card responses carry that
+  // route so an agent can give the person a usable link instead of an API instruction.
+  async function companyIssuePrefix(companyId: string) {
+    const [company] = await db.select({ issuePrefix: companies.issuePrefix }).from(companies).where(eq(companies.id, companyId)).limit(1);
+    return company?.issuePrefix ?? null;
+  }
+  function withHref<T extends { id: string }>(card: T, issuePrefix: string | null) {
+    return issuePrefix ? { ...card, href: `/${issuePrefix}/status/${card.id}` } : card;
+  }
 
   async function assertStatusCardsEnabled() {
     const experimental = await settings.getExperimental();
@@ -64,6 +105,35 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
         `Agent-authored status card prompts cannot exceed ${STATUS_CARD_AGENT_MAX_INTEREST_PROMPT_LENGTH} characters`,
       );
     }
+  }
+
+  async function viewerScope(req: Request) {
+    return { issueReadCondition: await issueReadSqlCondition(db, req.actor) };
+  }
+
+  /**
+   * Mutation responses carry the card row and, for refresh, the computed
+   * change list. Both pass through the caller's read scope like GET does.
+   */
+  async function scopeMutationResult<T extends {
+    card: Parameters<typeof service.hydrate>[0];
+    generatingIssue: Parameters<typeof generationIssueRef>[0];
+    changes?: Array<{ issueId: string }>;
+  }>(
+    req: Request,
+    result: T,
+  ) {
+    const scope = await viewerScope(req);
+    const card = await service.hydrate(result.card, scope);
+    const generatingIssue = generationIssueRef(result.generatingIssue);
+    if (!result.changes) return { ...result, card, generatingIssue };
+    const readable = await service.readableIssueIds(result.card.companyId, result.changes.map((change) => change.issueId), scope);
+    return {
+      ...result,
+      card,
+      generatingIssue,
+      changes: result.changes.filter((change) => readable?.has(change.issueId) ?? false),
+    };
   }
 
   async function logMutation(req: Request, companyId: string, action: string, cardId: string, details?: Record<string, unknown>) {
@@ -144,9 +214,9 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
     assertCompanyAccess(req, companyId);
     await assertStatusCardsEnabled();
     const query = listStatusCardsQuerySchema.parse(req.query);
-    res.json(await service.list(companyId, query.archived, {
+    res.json((await service.list(companyId, query.archived, {
       issueReadCondition: await issueReadSqlCondition(db, req.actor),
-    }));
+    })).map(publicCard));
   });
 
   router.post("/companies/:companyId/status-cards", validate(createStatusCardSchema), async (req, res) => {
@@ -155,27 +225,32 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
     await assertCanMutate(req, companyId);
     assertAgentPromptLimit(req, req.body.interestPrompt);
     const actor = getActorInfo(req);
+    // Resolve the link before creating the card, so a failed lookup leaves nothing behind.
+    const issuePrefix = await companyIssuePrefix(companyId);
     const card = await service.create(companyId, req.body, {
       agentId: actor.actorType === "agent" ? actor.actorId : null,
       userId: actor.actorType === "user" ? actor.actorId : null,
     });
+    // Only a failure to queue the compile removes the new card. Once the compile is queued, the card
+    // and its generation task exist together, so later failures must not delete the card alone.
+    let compile: Awaited<ReturnType<typeof enqueueCompile>>;
     try {
-      const compile = await enqueueCompile(req, card.id);
-      await logMutation(req, companyId, "status_card.created", card.id, { state: card.state });
-      res.status(201).json(compile.card);
+      compile = await enqueueCompile(req, card.id);
     } catch (error) {
       await service.remove(card.id);
       throw error;
     }
+    await logMutation(req, companyId, "status_card.created", card.id, { state: card.state });
+    res.status(201).json(withHref(publicCard(compile.card), issuePrefix));
   });
 
   router.get("/status-cards/:id", async (req, res) => {
     await assertStatusCardsEnabled();
     const card = await getAccessibleResource(req, res, service.getById(req.params.id as string), "Status card not found");
     if (!card) return;
-    res.json(await service.hydrate(card, {
+    res.json(withHref(publicCard(await service.hydrate(card, {
       issueReadCondition: await issueReadSqlCondition(db, req.actor),
-    }));
+    })), await companyIssuePrefix(card.companyId)));
   });
 
   router.patch("/status-cards/:id", validate(patchStatusCardSchema), async (req, res) => {
@@ -197,7 +272,8 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
       fields: Object.keys(req.body),
       archived: Boolean(updated.archivedAt),
     });
-    res.json(compile?.card ?? restore?.card ?? updated);
+    res.json(withHref(publicCard(await service.hydrate(compile?.card ?? restore?.card ?? updated, await viewerScope(req))),
+      await companyIssuePrefix(card.companyId)));
   });
 
   router.delete("/status-cards/:id", async (req, res) => {
@@ -214,14 +290,14 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
     await assertStatusCardsEnabled();
     const card = await getAccessibleResource(req, res, service.getById(req.params.id as string), "Status card not found");
     if (!card) return;
-    res.json(await service.listUpdates(card.id));
+    res.json(await service.listVisibleUpdates(card, await viewerScope(req)));
   });
 
   router.get("/status-cards/:id/summary-revisions", async (req, res) => {
     await assertStatusCardsEnabled();
     const card = await getAccessibleResource(req, res, service.getById(req.params.id as string), "Status card not found");
     if (!card) return;
-    res.json(await service.listSummaryRevisions(card));
+    res.json(await service.listSummaryRevisions(card, await viewerScope(req)));
   });
 
   router.post("/status-cards/:id/recompile", async (req, res) => {
@@ -234,7 +310,8 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
       generatingIssueId: result.generatingIssue.id,
       alreadyGenerating: result.alreadyGenerating,
     });
-    res.status(result.alreadyGenerating ? 200 : 202).json(result);
+    const scoped = await scopeMutationResult(req, result);
+    res.status(result.alreadyGenerating ? 200 : 202).json({ ...scoped, card: publicCard(scoped.card) });
   });
 
   router.post("/status-cards/:id/refresh", validate(refreshStatusCardSchema), async (req, res) => {
@@ -249,7 +326,8 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
       alreadyGenerating: result.alreadyGenerating,
       enqueued: result.enqueued,
     });
-    res.status(result.enqueued && !result.alreadyGenerating ? 202 : 200).json(result);
+    const scoped = await scopeMutationResult(req, result);
+    res.status(result.enqueued && !result.alreadyGenerating ? 202 : 200).json({ ...scoped, card: publicCard(scoped.card) });
   });
 
   router.get("/status-cards/:id/dry-run", async (req, res) => {
@@ -287,9 +365,11 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
     await logMutation(req, card.companyId, "status_card.query_written", card.id, {
       queryVersion: updated.queryVersion,
       generationIssueId: req.body.generationIssueId,
-      changeSummary: req.body.changeSummary,
+      queryCount: req.body.queries.length,
+      queries: textDigest(JSON.stringify(req.body.queries)),
+      changeSummary: textDigest(req.body.changeSummary),
     });
-    res.json(updated);
+    res.json(publicCard(updated));
   });
 
   router.put("/status-cards/:id/summary", validate(writeStatusCardSummarySchema), async (req, res) => {
@@ -307,9 +387,9 @@ export function statusCardRoutes(db: Db, opts: { heartbeat?: IssueAssignmentWake
       queryVersion: result.card.queryVersion,
       generationIssueId: req.body.generationIssueId,
       documentId: result.document.id,
-      changeSummary: req.body.changeSummary,
+      changeSummary: textDigest(req.body.changeSummary),
     });
-    res.json(result);
+    res.json({ ...result, card: publicCard(result.card) });
   });
 
   return router;

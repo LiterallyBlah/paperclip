@@ -23,7 +23,8 @@ Cloud secret or Cloud registry record is needed.
 
 Decryption and public/private key validation happen before launch. A wrong
 master key, corrupt ciphertext, or mismatched public key fails the run; none
-causes automatic key replacement. Renames, model changes, pauses, resumes, and
+causes automatic key replacement. Only the explicit rotation control below
+replaces an existing key. Renames, model changes, pauses, resumes, and
 restarts preserve the keypair.
 
 ## Managed runs
@@ -67,7 +68,8 @@ const signature = sign(null, challengeBytes, process.env.PAPERCLIP_AGENT_PRIVATE
 
 This identity does not change Paperclip bearer-token authentication. There is no
 signing API, private-key download endpoint, Git integration, rotation UI, or
-external-key import. Agents possess their private keys. External consumers must
+external-key import. Rotation is available through the board API only (see
+[Rotation](#rotation)). Agents possess their private keys. External consumers must
 define their own authorization, expiry, and revocation rules.
 
 ## Public identity
@@ -83,6 +85,38 @@ The agent's Identity section shows a shortened fingerprint and copies the full
 public PEM. Before provisioning it shows “Not created yet” and explains that
 creation happens on the next managed run.
 
+## Rotation
+
+`POST /api/agents/:id/identity/rotate` (no body) replaces an agent's existing
+identity with a fresh Ed25519 pair. It requires a board actor with the
+agent-management permission for the agent's company; agent bearer tokens,
+including the agent's own, are refused. It never provisions a missing identity
+(`404`). It returns the new public identity in the same shape as
+`GET /api/agents/:id/identity`, never private material.
+
+Rotation takes the same agent-row lock as run preparation, so a concurrent run
+receives either the complete previous pair or the complete new pair. The row is
+updated in place (`keyId`, `publicKeyPem`, encrypted private material, and
+`createdAt` as the current key's creation time); the schema does not change. An
+`agent.identity.rotated` activity records the actor, `algorithm`,
+`previousKeyId` and `keyId`.
+
+Effect on runs:
+
+- A process that is already running keeps the previous key in its environment
+  until it ends, and its output redactor continues to mask that previous key.
+- Runs prepared after rotation receive the new key and mask the new key.
+- Session compatibility includes the key ID, so a warm or native session is
+  replaced before its next turn.
+- Run authority for customer-success inspection reports the agent's current
+  key ID, including for a run that started before rotation.
+
+Rotation does not revoke anything outside Paperclip. Copies of the previous
+private key held by a runtime host, a log, or any other party remain usable, and
+signatures made with it remain mathematically valid against the previous public
+key. Paperclip itself does not verify agent signatures. External consumers must
+trust only the current public identity from `GET /api/agents/:id/identity`.
+
 ## Copies and recovery
 
 Company/template imports and duplication use normal agent creation and get new
@@ -97,7 +131,23 @@ have distinct identities.
 
 Native failure records and reports redact the assigned key before truncating diagnostics. Streaming output buffers settle at item or turn completion: short structural prefixes (such as a trailing dash) are preserved, longer interrupted key fragments become redaction markers, and pending buffers are cleared. Terminal events carry these settled `outputTails`; transcript projection displays them as deltas without changing the source event receipt.
 
-Codex shell delivery preserves its default `KEY`/`SECRET`/`TOKEN` name exclusions for other configured credentials. The exceptions are the three identity variables and `PAPERCLIP_API_KEY`: the latter is the short-lived, scoped run/bridge credential required by the Paperclip agent skill’s Bash/curl API calls. Disabling Codex’s automatic exclusions is paired with this explicit filtered allowlist; it does not admit arbitrary host environment variables. Provider authentication secrets can still reach the provider process without being newly exposed to shell commands by this feature.
+Legacy Codex shell delivery includes explicitly configured task variables, including
+resolved secret references such as `SLACK_BOT_TOKEN`. Both ACP and CLI execution
+use the same name-only allowlist, including runs without an agent identity.
+Codex login keys (`OPENAI_API_KEY`, `CODEX_API_KEY`), managed provider keys,
+observability credentials, and private runtime transport credentials remain
+outside that service-secret opt-in. Unassigned host secrets are not added.
+The three identity variables and the short-lived, scoped `PAPERCLIP_API_KEY`
+retain their runtime delivery. Secret values remain in the child environment;
+the shell policy contains only variable names. Removing a configured variable
+removes its shell access at the next launch.
+
+Assigning a service credential through the adapter's environment grants the
+run's shell commands access to that credential. It is not a brokered credential
+that is hidden from the agent: a model-directed command can read it. Assign only
+credentials the run is authorized to use, with the service permissions it needs.
+The shell allowlist protects unassigned host and provider credentials; it does
+not isolate an assigned service credential from the run's own commands.
 
 Cloud customer-success inspection can consume this existing identity together
 with strict active-run authority. See [inspection support](CUSTOMER-SUCCESS-INSPECTION.md).

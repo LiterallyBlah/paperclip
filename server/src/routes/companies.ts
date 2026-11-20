@@ -35,6 +35,7 @@ import {
   type CompanyImportTransferStatus,
 } from "@paperclipai/shared/company-import-transfer";
 import { badRequest, conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { authorizationDeniedDetails } from "../services/authorization.js";
 import { PORTABLE_ZIP_UPLOAD_LIMIT_BYTES } from "../http/body-limits.js";
 import { logger } from "../middleware/logger.js";
 import { validate } from "../middleware/validate.js";
@@ -65,8 +66,21 @@ import {
   logActivity,
   workTimelineService,
 } from "../services/index.js";
+import { issueReadSqlCondition } from "../services/authorization.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
+import {
+  preserveReviewEscalationDelegate,
+  readReviewEscalationDelegateAgentId,
+  setReviewEscalationDelegate,
+  withoutReviewEscalationDelegate,
+} from "../services/review-escalation-delegate.js";
+import {
+  preserveDecisionTriageDelegate,
+  readDecisionTriageDelegateAgentId,
+  setDecisionTriageDelegate,
+  withoutDecisionTriageDelegate,
+} from "../services/decision-triage-delegate.js";
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "./company-import-paths.js";
@@ -275,6 +289,15 @@ export interface CompanyRoutesOptions {
   importTransferSpoolRoot?: string;
 }
 
+
+const reviewEscalationDelegateBodySchema = z.object({
+  agentId: z.string().uuid().nullable(),
+}).strict();
+
+const decisionTriageDelegateBodySchema = z.object({
+  agentId: z.string().uuid().nullable(),
+}).strict();
+
 export function companyRoutes(db: Db, storage?: StorageService, options?: CompanyRoutesOptions) {
   const router = Router();
   const importTransferSpoolRoot =
@@ -426,6 +449,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     const query = companyArtifactsQuerySchema.parse(req.query);
     res.json(await artifacts.list(companyId, query, {
       userId: query.starred && req.actor.type === "board" ? req.actor.userId : undefined,
+      issueReadCondition: await issueReadSqlCondition(db, req.actor),
     }));
   });
 
@@ -886,6 +910,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       if (digest !== declared.sha256) {
         throw unprocessable(`Part ${partIndex} content does not match its declared sha256`);
       }
+      await companyTransferRunService.notePartUploadActivity(db, run.id);
       await writeImportTransferPart(importTransferSpoolRoot, run.id, partIndex, bytes);
       const recorded = await companyTransferRunService.completePart(db, run.id, partName);
       if (!recorded) {
@@ -1171,6 +1196,12 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       mode: "agent_safe",
       sourceCompanyId: companyId,
       pauseAutomations: body.pauseAutomations === true,
+      // An agent importing new agents is hiring, so it needs agents:create
+      // like the hire routes: the CEO role does not override a denial.
+      ...(req.actor.type === "agent" ? { assertCanCreateAgents: async () => {
+        const decision = await access.decide({ actor: req.actor, action: "agents:create", resource: { type: "company", companyId } });
+        if (!decision.allowed) throw forbidden(`${decision.explanation} Importing new agents is hiring; a board user can import them instead.`, authorizationDeniedDetails(decision));
+      } } : {}),
     });
     await logActivity(db, {
       companyId: result.company.id,
@@ -1252,13 +1283,38 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     if (req.actor.type === "agent") {
       body = updateCompanyBrandingSchema.parse(req.body);
     } else {
-      body = updateCompanySchema.parse(req.body);
+      // The review escalation delegate shares the governance JSON but is set
+      // only through its own board route: an incoming value is ignored here
+      // and the stored value is carried over below.
+      const rawBody = req.body && typeof req.body === "object" ? req.body as Record<string, unknown> : {};
+      body = updateCompanySchema.parse(
+        rawBody.interactionResolverGovernance === undefined
+          ? req.body
+          : {
+              ...rawBody,
+              interactionResolverGovernance: withoutDecisionTriageDelegate(
+                withoutReviewEscalationDelegate(rawBody.interactionResolverGovernance),
+              ),
+            },
+      );
     }
 
     const existingCompany = await svc.getById(companyId);
     if (!existingCompany) {
       res.status(404).json({ error: "Company not found" });
       return;
+    }
+    if (body.interactionResolverGovernance && typeof body.interactionResolverGovernance === "object") {
+      body = {
+        ...body,
+        interactionResolverGovernance: preserveDecisionTriageDelegate(
+          preserveReviewEscalationDelegate(
+            body.interactionResolverGovernance as Record<string, unknown>,
+            existingCompany.interactionResolverGovernance,
+          ),
+          existingCompany.interactionResolverGovernance,
+        ),
+      };
     }
 
     if (req.actor.type !== "agent") {
@@ -1317,6 +1373,86 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       });
     }
     res.json(company);
+  });
+
+  // The review escalation delegate (BLA-501): the agent that receives review
+  // stages whose agent reviewers exhausted maxReviewRounds. Any company member
+  // can read it; only a board actor with write access to the company (not an
+  // agent, not an MCP OAuth client) can set or clear it.
+  router.get("/:companyId/review-escalation-delegate", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const company = await svc.getById(companyId);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    res.json({ agentId: readReviewEscalationDelegateAgentId(company.interactionResolverGovernance) });
+  });
+
+  router.put("/:companyId/review-escalation-delegate", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertBoard(req);
+    if (req.actor.type === "board" && req.actor.source === "mcp_oauth") {
+      throw forbidden("Board access required");
+    }
+    assertCompanyAccess(req, companyId);
+    const body = reviewEscalationDelegateBodySchema.parse(req.body);
+    const result = await setReviewEscalationDelegate(db, companyId, body.agentId);
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "company.review_escalation_delegate_updated",
+      entityType: "company",
+      entityId: companyId,
+      details: { agentId: result.agentId, _previous: { agentId: result.previousAgentId } },
+    });
+    res.json({ agentId: result.agentId });
+  });
+
+  // The decision-triage delegate (BLA-1616): the agent that may take the
+  // routing decisions of decision-triage gaps G1, G2, G3a, G4 and G7. Separate
+  // from the review escalation delegate. Any company member can read it; only
+  // a board actor with write access (not an agent, not MCP OAuth) can set it.
+  router.get("/:companyId/decision-triage-delegate", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const company = await svc.getById(companyId);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    res.json({ agentId: readDecisionTriageDelegateAgentId(company.interactionResolverGovernance) });
+  });
+
+  router.put("/:companyId/decision-triage-delegate", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertBoard(req);
+    if (req.actor.type === "board" && req.actor.source === "mcp_oauth") {
+      throw forbidden("Board access required");
+    }
+    assertCompanyAccess(req, companyId);
+    const body = decisionTriageDelegateBodySchema.parse(req.body);
+    const result = await setDecisionTriageDelegate(db, companyId, body.agentId);
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "company.decision_triage_delegate_updated",
+      entityType: "company",
+      entityId: companyId,
+      details: { agentId: result.agentId, _previous: { agentId: result.previousAgentId } },
+    });
+    res.json({ agentId: result.agentId });
   });
 
   router.patch("/:companyId/branding", async (req, res) => {

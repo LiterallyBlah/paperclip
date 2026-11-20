@@ -662,36 +662,6 @@ describe("EnvironmentVariablesEditor", () => {
     expect(secretValueField?.value).toBe("supersecretvalue");
   });
 
-  it("opens the create-secret popover from the picker's + Create item (§6.4, PAP-12476)", async () => {
-    // Regression: selecting the picker's `+ Create secret` item closes the
-    // combobox popover and (in the same tick) opens the anchored create-secret
-    // popover. The two Radix popovers must not race — the create popover has to
-    // survive the combobox's focus-return instead of being dismissed instantly.
-    render(
-      <EnvironmentVariablesEditor
-        value={{ GH: { type: "secret_ref", secretId: "s1", version: 2 } }}
-        secrets={secrets}
-        onChange={() => {}}
-        onCreateSecret={async () => secrets[0]}
-      />,
-    );
-    const combobox = container.querySelector<HTMLElement>('[role="combobox"]')!;
-    combobox.focus();
-    await flush();
-    const createItem = [...document.querySelectorAll<HTMLElement>("[cmdk-item]")].find((el) =>
-      el.textContent?.includes("Create"),
-    );
-    expect(createItem, "create item should be present in the open picker").toBeTruthy();
-    createItem!.click();
-    await flush();
-    // The create-secret popover is open (heading rendered) and stays open.
-    expect(document.body.textContent, "create-secret popover should open").toContain("Create secret");
-    expect(
-      document.querySelector('input[aria-label="Secret name"]'),
-      "create-secret name field should render",
-    ).toBeTruthy();
-  });
-
   it("keeps the create-secret popover open when focus returns to a control inside the value cell (§6.4, PAP-12492)", async () => {
     // Regression for the *fragile* part of the picker → create transition.
     // The picker's combobox and the anchored create popover share the value
@@ -723,6 +693,11 @@ describe("EnvironmentVariablesEditor", () => {
     createItem!.click();
     await flush();
     expect(document.body.textContent, "create-secret popover should open").toContain("Create secret");
+
+    expect(
+      document.querySelector('input[aria-label="Secret name"]'),
+      "create-secret name field should render",
+    ).toBeTruthy();
 
     // Simulate the picker's animation-delayed focus-return landing on a control
     // that lives inside the value cell (the source-switch trigger is a stable
@@ -947,5 +922,109 @@ describe("EnvironmentVariablesEditor", () => {
       el.textContent?.includes(cloudMigrationKey),
     );
     expect(match?.querySelector<HTMLElement>("[title]")?.getAttribute("title")).toBe(cloudMigrationKey);
+  });
+});
+
+describe("Store as secret with a masked (redacted) value", () => {
+  // Agent config reads return every plain env value as the display mask
+  // ("***REDACTED***"). Converting such a row must never submit the mask as the
+  // new secret's value; the user must enter the real value.
+  const MASK = "***REDACTED***";
+  let container: HTMLDivElement;
+  let root: Root | null = null;
+  const secrets = [makeSecret("s1", { name: "GITHUB_TOKEN", latestVersion: 3 })];
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+  });
+
+  afterEach(async () => {
+    flushSync(() => root?.unmount());
+    root = null;
+    container.remove();
+    await flush();
+    for (const child of [...document.body.children]) child.remove();
+    document.body.style.pointerEvents = "";
+    vi.restoreAllMocks();
+  });
+
+  function setInputValue(input: HTMLInputElement, value: string) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    setter.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function clickStoreAndBind() {
+    const submit = [...document.querySelectorAll<HTMLButtonElement>("button")].find((el) =>
+      el.textContent?.includes("Store & bind"),
+    );
+    expect(submit, "Store & bind button should render").toBeTruthy();
+    submit!.click();
+  }
+
+  async function openStorePopoverFor(value: string, onCreateSecret: (name: string, value: string) => Promise<CompanySecret>) {
+    root = createRoot(container);
+    flushSync(() =>
+      root!.render(
+        <EnvironmentVariablesEditor
+          value={{ STRIPE_API_KEY: { type: "plain", value } }}
+          secrets={secrets}
+          onChange={() => {}}
+          onCreateSecret={onCreateSecret}
+        />,
+      ),
+    );
+    const storeButton = container.querySelector<HTMLButtonElement>('button[title^="This value looks sensitive"]');
+    expect(storeButton, "sensitive Store-as-secret affordance should render").toBeTruthy();
+    storeButton!.click();
+    await flush();
+    expect(document.body.textContent).toContain("Store value as secret");
+    return document.querySelector<HTMLInputElement>('input[aria-label="Secret value"]')!;
+  }
+
+  it("never submits the display mask as the new secret value", async () => {
+    const onCreateSecret = vi.fn(async () => secrets[0]);
+    const valueField = await openStorePopoverFor(MASK, onCreateSecret);
+    clickStoreAndBind();
+    await flush();
+    const submittedValues = onCreateSecret.mock.calls.map((call) => (call as unknown[])[1]);
+    expect(submittedValues).not.toContain(MASK);
+    expect(valueField.value).not.toBe(MASK);
+  });
+
+  it("asks for the real value when the current value is masked and stores what the user enters", async () => {
+    const onCreateSecret = vi.fn(async () => secrets[0]);
+    const valueField = await openStorePopoverFor(MASK, onCreateSecret);
+    expect(valueField.readOnly).toBe(false);
+    expect(valueField.value).toBe("");
+    expect(document.body.textContent).toContain("current value is hidden");
+    setInputValue(valueField, "synthetic-entered-value");
+    await flush();
+    clickStoreAndBind();
+    await flush();
+    expect(onCreateSecret).toHaveBeenCalledTimes(1);
+    expect(onCreateSecret).toHaveBeenCalledWith("stripe_api_key", "synthetic-entered-value");
+  });
+
+  it("rejects re-typing the mask itself (whitespace-trimmed)", async () => {
+    const onCreateSecret = vi.fn(async () => secrets[0]);
+    const valueField = await openStorePopoverFor(MASK, onCreateSecret);
+    setInputValue(valueField, `  ${MASK}  `);
+    await flush();
+    clickStoreAndBind();
+    await flush();
+    expect(onCreateSecret).not.toHaveBeenCalled();
+  });
+
+  it("still carries a real typed value forward read-only, including values that merely contain the mask", async () => {
+    const onCreateSecret = vi.fn(async () => secrets[0]);
+    const legit = `prefix-${MASK}-suffix-✓`;
+    const valueField = await openStorePopoverFor(legit, onCreateSecret);
+    expect(valueField.readOnly).toBe(true);
+    expect(valueField.value).toBe(legit);
+    clickStoreAndBind();
+    await flush();
+    expect(onCreateSecret).toHaveBeenCalledWith("stripe_api_key", legit);
   });
 });

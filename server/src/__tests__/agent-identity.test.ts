@@ -10,20 +10,24 @@ import { eq } from "drizzle-orm";
 import { agentIdentityKeys, agents, companies, createDb, closeRegisteredClients, ensurePostgresDatabase, runDatabaseBackup, runDatabaseRestore, type Db } from "@paperclipai/db";
 import { resolveWorktreeSeedPlan } from "../../../cli/src/commands/worktree-lib.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "../services/agent-identity.js";
 import { agentService } from "../services/agents.js";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import { execute } from "../adapters/process/execute.js";
 import { createAgentIdentityRedactor } from "../services/agent-identity-redaction.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { secretService } from "../services/secrets.js";
+import { readFile } from "node:fs/promises";
 import { agentRoutes } from "../routes/agents.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
+const externalIdentityDatabase = resolveExternalTestDatabaseUrl("PAPERCLIP_AGENT_IDENTITY_TEST_DATABASE_URL");
 describe("agent cryptographic identity", () => {
   let db: Db;
-  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let database: Pick<Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>, "connectionString" | "cleanup">;
   let directory: string;
   let companyId: string;
 
@@ -32,7 +36,9 @@ describe("agent cryptographic identity", () => {
     vi.stubEnv("PAPERCLIP_HOME", directory);
     vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "");
     vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", join(directory, "master.key"));
-    database = await startEmbeddedPostgresTestDatabase("paperclip-identity-");
+    database = externalIdentityDatabase ? { connectionString: externalIdentityDatabase,
+      cleanup: () => closeRegisteredClients(externalIdentityDatabase) }
+      : await startEmbeddedPostgresTestDatabase("paperclip-identity-");
     db = createDb(database.connectionString);
     companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Identity test", issuePrefix: "KEY", defaultResponsibleUserId: "identity-test-owner" });
@@ -51,6 +57,7 @@ describe("agent cryptographic identity", () => {
   it("migration and public reads leave existing agents unprovisioned", async () => {
     const agent = await oldAgent();
     expect(await agentIdentityService(db).getPublicIdentity(companyId, agent.id)).toBeNull();
+    expect((await agentIdentityService(db).createExistingLogRedactor(companyId, agent.id)).values).toEqual([]);
     expect(await db.select().from(agentIdentityKeys).where(eq(agentIdentityKeys.agentId, agent.id))).toHaveLength(0);
     for (const type of ["http", "openclaw_gateway", "hermes_gateway"]) expect(supportsManagedAgentIdentity(type)).toBe(false);
     for (const provider of ["claude_managed", "aws_agentcore"]) expect(supportsManagedAgentIdentity("paperclip_runner", { provider })).toBe(false);
@@ -124,7 +131,7 @@ describe("agent cryptographic identity", () => {
       await execute({
         runId: randomUUID(), agent, agentIdentity: identity,
         config: { command: process.execPath, cwd: directory, args: ["-e", `const {sign}=require('node:crypto'); process.stdout.write(sign(null,Buffer.from(process.env.CHALLENGE,'base64'),process.env.PAPERCLIP_AGENT_PRIVATE_KEY).toString('base64'));`], env: { CHALLENGE: challenge, PAPERCLIP_AGENT_PRIVATE_KEY: "configured override" } },
-        context: {}, runtime: { sessionId: null, sessionParams: null, taskKey: null },
+        context: {}, runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         onLog: async (_stream, chunk) => { logs.push(chunk); }, onMeta: async meta => { metas.push(meta); },
       });
       expect(verify(null, Buffer.from(challenge, "base64"), publicPem, Buffer.from(logs.join(""), "base64"))).toBe(true);
@@ -192,6 +199,49 @@ describe("agent cryptographic identity", () => {
       expect(lines.filter(line => line.stream === "stderr").map(line => line.chunk).join("")).toContain("safeM");
     } finally {
       await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    }
+  }, 60_000);
+
+  it("masks bound secret values and the run API key that a process prints without their names", async () => {
+    vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", "synthetic-agent-jwt-signing-fixture-0001");
+    const agent = await oldAgent();
+    const bound = "synthetic-opaque-bound-value-0002";
+    const secret = await secretService(db).create(companyId, { name: `bound-${randomUUID()}`, provider: "local_encrypted", value: bound });
+    const env = { CUSTOMER_DB_URL: { type: "secret_ref", secretId: secret.id, version: "latest" }, FEATURE_FLAG: "true" };
+    const keyOut = join(directory, `run-key-${randomUUID()}`);
+    await secretService(db).syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: agent.id }, env);
+    // Print values without their names: bare, inside a URL, as JSON, and split across chunks.
+    const script = [
+      "const v=process.env.CUSTOMER_DB_URL, k=process.env.PAPERCLIP_API_KEY||'';",
+      "require('node:fs').writeFileSync(process.env.KEY_OUT,k);",
+      "console.log('HAS_KEY:'+(k.length>20)+' FLAG='+process.env.FEATURE_FLAG);",
+      "console.log('bare '+v); console.error('url https://db.example.invalid/?p='+v); console.log(JSON.stringify({v}));",
+      "process.stdout.write('split '+v.slice(0,12)); process.stderr.write('key '+k.slice(0,15));",
+      "setTimeout(()=>{process.stdout.write(v.slice(12)+'\\n'); process.stderr.write(k.slice(15)+'\\n');},40);",
+    ].join("");
+    await db.update(agents).set({ adapterType: "process", adapterConfig: { command: process.execPath, cwd: directory, args: ["-e", script], env: { ...env, KEY_OUT: keyOut } } })
+      .where(eq(agents.id, agent.id));
+    const heartbeat = heartbeatService(db);
+    try {
+      const run = await heartbeat.invoke(agent.id, "on_demand", {}, "manual");
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const finished = await heartbeat.getRun(run!.id);
+      expect(finished?.status, JSON.stringify(finished?.error)).toBe("succeeded");
+      expect(finished?.stdoutExcerpt).toContain("HAS_KEY:true FLAG=true");
+      const log = (await heartbeat.readLog(run!.id)).content;
+      const runKey = await readFile(keyOut, "utf8");
+      expect(runKey.length).toBeGreaterThan(20);
+      const stored = JSON.stringify({ log, finished, events: await heartbeat.listEvents(run!.id) });
+      for (const value of [bound, runKey]) {
+        for (const fragment of [value, value.slice(0, 12), value.slice(12)]) expect(stored).not.toContain(fragment);
+      }
+      await rm(keyOut, { force: true });
+    } finally {
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      vi.unstubAllEnvs();
+      vi.stubEnv("PAPERCLIP_HOME", directory);
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "");
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", join(directory, "master.key"));
     }
   }, 60_000);
 

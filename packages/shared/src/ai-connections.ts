@@ -32,6 +32,7 @@ export const AI_PROVIDERS = [
   "openai",
   "openrouter",
   "xai",
+  "github",
   "google",
   "muse",
 ] as const;
@@ -80,7 +81,14 @@ export const AI_CONNECTION_CAPABILITIES: Record<
     >;
   }
 > = {
-  google: { name: "Google", methods: { api_key: { adapters: ["gemini_local"], envKey: "GEMINI_API_KEY" } } },
+  github: {
+    name: "GitHub Copilot",
+    methods: { api_key: { adapters: ["copilot_runtime"], envKey: "COPILOT_GITHUB_TOKEN" } },
+  },
+  google: { name: "Google", methods: {
+    api_key: { adapters: ["gemini_local", "pi_local", "antigravity_runtime"], envKey: "GEMINI_API_KEY" },
+    subscription: { adapters: ["antigravity_runtime"], envKey: "GEMINI_HOME" },
+  } },
   anthropic: {
     name: "Claude",
     methods: {
@@ -88,20 +96,20 @@ export const AI_CONNECTION_CAPABILITIES: Record<
         adapters: ["claude_local"],
         envKey: "CLAUDE_CODE_OAUTH_TOKEN",
       },
-      api_key: { adapters: ["claude_local"], envKey: "ANTHROPIC_API_KEY" },
+      api_key: { adapters: ["claude_local", "pi_local"], envKey: "ANTHROPIC_API_KEY" },
     },
   },
   openai: {
     name: "OpenAI",
     methods: {
       subscription: { adapters: ["codex_local"], envKey: "CODEX_HOME" },
-      api_key: { adapters: ["codex_local"], envKey: "OPENAI_API_KEY" },
+      api_key: { adapters: ["codex_local", "pi_local"], envKey: "OPENAI_API_KEY" },
     },
   },
   openrouter: {
     name: "OpenRouter",
     methods: {
-      api_key: { adapters: ["opencode_local"], envKey: "OPENROUTER_API_KEY" },
+      api_key: { adapters: ["opencode_local", "pi_local"], envKey: "OPENROUTER_API_KEY" },
     },
   },
   xai: {
@@ -127,11 +135,19 @@ export function isAiConnectionCompatible(
   acpxAgent?: unknown,
 ): boolean {
   adapterType = aiRoutingHarness(adapterType, runnerProvider, acpxAgent);
+  // Antigravity uses its own Google runtime sign-in or a Gemini API key.
+  // Tool OAuth and API-compatible endpoints cannot authenticate this harness.
+  if (adapterType === "antigravity_runtime") return requirement.provider === "google"
+    && (requirement.method === "api_key" || requirement.method === "subscription")
+    && !("routing" in requirement && requirement.routing);
   if ("routing" in requirement && requirement.routing) return requirement.method === "api_key" && isAiRoutingCompatible(requirement.routing, adapterType);
   // A fixed binding contains identity only. The service checks authoritative
   // connection metadata before resolving credentials or running the harness.
+  if (adapterType === "pi_local") return (requirement.method === "api_key" || ("mode" in requirement && requirement.mode === "responsible_user"))
+    && ["openrouter", "openai", "anthropic", "google"].includes(requirement.provider)
+    && typeof model === "string" && model.startsWith(`${requirement.provider}/`);
   if ("mode" in requirement && requirement.mode !== "responsible_user" && requirement.method === "api_key")
-    return ["claude_local", "codex_local", "opencode_local", "hermes_local", "gemini_local", "grok_local", "muse_local"].includes(adapterType);
+    return ["claude_local", "codex_local", "opencode_local", "hermes_local", "gemini_local", "grok_local", "copilot_runtime", "muse_local"].includes(adapterType);
   const methods = AI_CONNECTION_CAPABILITIES[requirement.provider].methods;
   const candidates = "mode" in requirement && requirement.mode === "responsible_user"
     ? Object.values(methods)
@@ -178,9 +194,21 @@ export interface AiManagedConnectionSummary {
   ownerUserId?: string;
   ownerName?: string;
   isDefault: boolean;
+  canSetDefault?: boolean;
   status: "connected" | "needs_attention" | "expired" | "revoked";
   unavailableReason?: string;
   usageProbeSupported?: boolean;
+}
+/** Safe provider account details for one authorized saved credential. */
+export interface AiConnectionAccountIdentity {
+  connectionId: string;
+  grantId: string;
+  status: "available" | "unavailable" | "error";
+  checkedAt: string;
+  accountLabel: string | null;
+  organizationLabel: string | null;
+  errorCode?: "unsupported" | "connection_unavailable" | "authentication_required" | "permission_denied" | "rate_limited" | "provider_unavailable" | "invalid_response";
+  message?: string;
 }
 export interface AiConnectionList {
   currentUserId: string;
@@ -195,6 +223,7 @@ export const createAiConnectionSchema = z
     ownership: z.enum(["personal", "shared"]),
     routing: aiProviderRoutingSchema.optional(),
     apiKey: z.string().trim().min(1).max(32768).optional(),
+    environmentId: z.string().uuid().nullable().optional(),
     loginSessionId: z.string().max(128).optional(),
     connectionId: z.string().uuid().optional(),
     agentIds: z.array(z.string().uuid()).max(1000).default([]),
@@ -228,7 +257,7 @@ export type CreateAiConnection = z.infer<typeof createAiConnectionSchema>;
 
 export const aiConnectionLoginIntentSchema = z
   .object({
-    provider: z.enum(["anthropic", "openai", "xai", "muse"]),
+    provider: z.enum(["anthropic", "openai", "xai", "google", "muse"]),
     method: z.literal("subscription"),
     name: z.string().trim().min(1).max(160),
     ownership: z.enum(["personal", "shared"]),
@@ -250,6 +279,7 @@ export interface LocalAiLoginStatus {
   authorizationUrl?: string;
   code?: string;
   error?: string;
+  accountLabel?: string;
 }
 export interface LocalAiLoginAttempt {
   sessionId: string;
@@ -262,6 +292,6 @@ export interface LocalAiLoginAttempt {
 export function aiSubscriptionNeedsIsolatedLogin(config: Record<string, unknown> | undefined): boolean {
   const metadata = aiConnectionMetadataSchema.safeParse(config?.ai);
   return metadata.success && metadata.data.method === "subscription" &&
-    (metadata.data.provider === "openai" || metadata.data.provider === "xai" || metadata.data.provider === "muse") &&
+    (["openai", "xai", "google", "muse"].includes(metadata.data.provider)) &&
     config?.aiIsolatedSubscription !== true;
 }

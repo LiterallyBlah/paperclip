@@ -1,6 +1,38 @@
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { expect, it } from "vitest";
-import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
+import { LEGACY_DISPOSITION_SUPPRESSION_KEY, isSuppressedLegacyDispositionDispatch, legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
+
+const suppressed = {
+  id: "controller-owned-run", runtimeMode: "legacy", status: "cancelled",
+  errorCode: "legacy_disposition_repair_suppressed", controllerBootId: "controller-boot",
+  executionStage: "dispatching", processPid: null, processGroupId: null, resultJson: null,
+  contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 2 } },
+  runnerProfileJson: { [LEGACY_DISPOSITION_SUPPRESSION_KEY]: {
+    version: 1, runId: "controller-owned-run", controllerBootId: "controller-boot",
+    providerDispatchStarted: false, reason: "durable_wait",
+  } },
+};
+
+it("recognizes only server-owned fenced disposition suppression without refunding retry accounting", () => {
+  const original = structuredClone(suppressed);
+  expect(isSuppressedLegacyDispositionDispatch(suppressed)).toBe(true);
+  expect(isSuppressedLegacyDispositionDispatch({ ...suppressed, executionStage: "settled" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation(suppressed)).toBe(false);
+  expect(suppressed).toEqual(original);
+});
+
+it.each([
+  { runnerProfileJson: {} }, { controllerBootId: "foreign-controller" }, { id: "foreign-run" },
+  { processPid: 123 }, { processGroupId: 123 }, { executionStage: "executing" },
+  { errorCode: "cancelled" }, { status: "failed" },
+  { resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } },
+  { runnerProfileJson: { [LEGACY_DISPOSITION_SUPPRESSION_KEY]: { ...suppressed.runnerProfileJson[LEGACY_DISPOSITION_SUPPRESSION_KEY], providerDispatchStarted: true } } },
+  { runnerProfileJson: {}, resultJson: { [LEGACY_DISPOSITION_SUPPRESSION_KEY]: suppressed.runnerProfileJson[LEGACY_DISPOSITION_SUPPRESSION_KEY] } },
+])("retains UNKNOWN for missing, foreign, provider-provided or unsafe suppression proof: %j", patch => {
+  const run = { ...suppressed, ...patch };
+  expect(isSuppressedLegacyDispositionDispatch(run)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation(run)).toBe(true);
+});
 
 const stopped = {
   runtimeMode: "legacy", status: "cancelled", errorCode: "cancelled",
@@ -10,7 +42,7 @@ const stopped = {
   },
 };
 
-it.each(["workspace_git_scan_timeout", "workspace_git_scan_saturated"])("does not invent unknown provider actions after exhausted %s bootstrap retries", (errorCode) => {
+it.each(["workspace_git_scan_timeout", "workspace_git_scan_saturated", "remote_workspace_prepare_timeout", "reusable_sandbox_resume_failed", "remote_workspace_restore_failed", "plugin_worker_unavailable", "runner_revision_mismatch"])("does not invent unknown provider actions after exhausted %s bootstrap retries", (errorCode) => {
   const run = { runtimeMode: "legacy", status: "failed", errorCode, scheduledRetryAttempt: 2,
     resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } };
   expect(legacyExecutionNeedsReconciliation(run)).toBe(false);

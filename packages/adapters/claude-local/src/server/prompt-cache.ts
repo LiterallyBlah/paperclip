@@ -133,6 +133,8 @@ async function ensureReadableFile(targetPath: string, contents: string): Promise
 
 export async function prepareClaudePromptBundle(input: {
   companyId: string;
+  /** BLA-433 (B2): when a valid agent UUID is given, the bundle lives under a per-agent path. */
+  agentId?: string | null;
   skills: SkillEntry[];
   instructionsContents: string | null;
   onLog: AdapterExecutionContext["onLog"];
@@ -142,7 +144,13 @@ export async function prepareClaudePromptBundle(input: {
     skills,
     instructionsContents,
   });
-  const rootDir = path.join(resolveManagedClaudePromptCacheRoot(process.env, companyId), bundleKey);
+  // BLA-433 (B2): bundles are per agent, so the isolated launcher can grant an
+  // agent read access to its OWN bundles only (path pinned to the agentId).
+  const agentId = typeof input.agentId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(input.agentId)
+    ? input.agentId
+    : null;
+  const cacheRoot = resolveManagedClaudePromptCacheRoot(process.env, companyId);
+  const rootDir = agentId ? path.join(cacheRoot, "agents", agentId, bundleKey) : path.join(cacheRoot, bundleKey);
   const skillsHome = path.join(rootDir, ".claude", "skills");
   await fs.mkdir(skillsHome, { recursive: true });
 

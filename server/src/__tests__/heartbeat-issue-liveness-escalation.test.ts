@@ -1,3 +1,4 @@
+import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -8,6 +9,7 @@ import {
   agentRuntimeState,
   budgetPolicies,
   companies,
+  authUsers,
   companyMemberships,
   companySkills,
   costEvents,
@@ -71,6 +73,9 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { attentionService } from "../services/attention.ts";
 import { issueService } from "../services/issues.ts";
 import { escalateExhaustedIssueReviewPathRecovery } from "../services/recovery/review-path-recovery-escalation.ts";
+import { setPluginEventBus } from "../services/activity-log.ts";
+import type { PluginEventBus } from "../services/plugin-event-bus.ts";
+import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import { runningProcesses } from "../adapters/index.ts";
 import {
   buildIssueBlockersResolvedWakeStateKey,
@@ -93,7 +98,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-issue-liveness-");
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
     // Dependency reconciliation heals missing wakes by enqueuing an
@@ -128,6 +133,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     await db.delete(companyMemberships);
     await db.delete(companySkills);
     await db.delete(companies);
+    await db.delete(authUsers);
   });
 
   afterAll(async () => {
@@ -244,6 +250,10 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
     });
+    // The responsible-user intersection requires both the account and its
+    // active membership; a membership pointing at a nonexistent user is denied.
+    await db.insert(authUsers).values({ id: ownerUserId, name: "Fixture owner", email: `${ownerUserId}@example.test`,
+      createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companyMemberships).values({
       companyId,
       principalType: "user",
@@ -355,6 +365,8 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
     });
+    await db.insert(authUsers).values({ id: "responsible-user", name: "Fixture user", email: "responsible-user@example.test", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -431,11 +443,23 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       }),
     });
 
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    const summaries = comments.filter((comment) => comment.authorType === "agent");
+    expect(summaries).toHaveLength(2);
+    expect(summaries).toEqual(expect.arrayContaining(
+      [followUpRun!.id, recoveryWakes[0].runId].map((runId) => expect.objectContaining({
+        authorAgentId: agentId,
+        onBehalfOfUserId: "responsible-user",
+        createdByRunId: runId,
+        body: "Acknowledged liveness escalation.",
+      })),
+    ));
+    const notices = comments.filter((comment) => comment.authorType !== "agent");
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
     if (disposition === "monitor") {
       expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: agentId, monitorNextCheckAt: expect.any(Date) });
       expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
-      expect(await db.select().from(issueComments)).toHaveLength(0);
+      expect(notices).toHaveLength(0);
       const attention = await issueService(db).listReviewAttention(companyId, [issue]);
       expect(attention.get(issueId)).toMatchObject({ state: "covered", paths: expect.arrayContaining([expect.objectContaining({ kind: "monitor" })]) });
       return;
@@ -447,7 +471,6 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       ownerType: "board", ownerAgentId: null, ownerUserId: null,
       returnOwnerAgentId: agentId, cause: "issue_review_path_lost", attemptCount: 1, maxAttempts: 1,
     });
-    const notices = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(notices).toHaveLength(1);
     expect(notices[0]).toMatchObject({ authorType: "system", presentation: expect.objectContaining({ title: "No follow-up scheduled" }) });
 
@@ -455,7 +478,8 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     // Replayed finalization must not duplicate the notice, action, or wake.
     expect(await escalateExhaustedIssueReviewPathRecovery(db, { run: recoveryRun, issueId })).toBeNull();
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
-    expect(await db.select().from(issueComments)).toHaveLength(1);
+    const replayComments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(replayComments.map((comment) => comment.id).sort()).toEqual(comments.map((comment) => comment.id).sort());
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.reason, "issue_review_path_lost"))).toHaveLength(1);
 
     const feed = await attentionService(db).list(companyId, { userId: "responsible-user" });
@@ -516,6 +540,13 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       companyId, agentId, issueId, status: "failed",
       contextSnapshot: { issueId, wakeReason: "issue_review_path_lost", reviewPathRecoveryAttempt: 1 },
     }).returning();
+    const pluginEvents: PluginEvent[] = [];
+    setPluginEventBus({
+      emit: async (event: PluginEvent) => {
+        pluginEvents.push(event);
+        return { errors: [] };
+      },
+    } as unknown as PluginEventBus);
     const results = await Promise.all([
       escalateExhaustedIssueReviewPathRecovery(db, { run, issueId }),
       escalateExhaustedIssueReviewPathRecovery(db, { run, issueId }),
@@ -524,7 +555,21 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
     expect(await db.select().from(issueComments)).toHaveLength(1);
     expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
-    expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.review_path_recovery_exhausted"))).toHaveLength(1);
+    const exhausted = await db.select().from(activityLog).where(eq(activityLog.action, "issue.review_path_recovery_exhausted"));
+    expect(exhausted).toHaveLength(1);
+    expect(exhausted[0]!.details).toMatchObject({
+      status: "blocked",
+      _previous: { status: "in_review" },
+      recoveryOwnerType: "board",
+    });
+    // The board escalation reaches plugins once, as a standard status change.
+    expect(pluginEvents.filter(event => event.eventType === "issue.updated" && event.entityId === issueId)).toEqual([
+      expect.objectContaining({
+        companyId,
+        entityType: "issue",
+        payload: expect.objectContaining({ status: "blocked", _previous: { status: "in_review" } }),
+      }),
+    ]);
   });
 
   it.each(["restart", "transaction_failure", "due_monitor", "claimed_monitor", "expired_monitor", "exhausted_monitor", "disabled_monitor"] as const)("reconciles a committed review repair after %s with a one-connection pool", async (gap) => {
@@ -533,6 +578,10 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     const issueId = randomUUID();
     const wakeId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Review Co", issuePrefix: `R${companyId.slice(0, 6)}`, defaultResponsibleUserId: "responsible-user" });
+    await db.insert(authUsers).values({ id: "responsible-user", name: "Fixture user", email: "responsible-user@example.test",
+      createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user",
+      status: "active", membershipRole: "member" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Reviewer", role: "engineer", adapterType: "codex_local", runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } });
     await db.insert(issues).values({ id: issueId, companyId, title: "Repair finalized before restart", status: "in_review", assigneeAgentId: agentId, responsibleUserId: "responsible-user" });
     await db.insert(agentWakeupRequests).values({
@@ -1154,6 +1203,188 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
 
     expect(result.healed).toBe(0);
     expect(result.existingWakeSkipped).toBe(1);
+  });
+
+  it("does not re-wake an assignee agent that opened the current blocked cycle itself", async () => {
+    const { companyId, agentId, blockedIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const blockedTransitionAt = new Date("2026-08-01T12:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt, updatedAt: blockedTransitionAt })
+      .where(eq(issues.id, blockedIssueId));
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: blockedIssueId,
+      details: { status: "blocked", changes: { status: { from: "in_progress", to: "blocked" } } },
+      createdAt: blockedTransitionAt,
+    });
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.healed).toBe(0);
+    expect(result.selfBlockedSkipped).toBe(1);
+  });
+
+  it("heals a self-blocked issue after a later board edit in the same blocked cycle", async () => {
+    const { companyId, agentId, blockedIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const blockedTransitionAt = new Date("2026-08-01T12:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt, updatedAt: blockedTransitionAt })
+      .where(eq(issues.id, blockedIssueId));
+    await db.insert(activityLog).values([
+      {
+        companyId, actorType: "agent", actorId: agentId, agentId, action: "issue.updated",
+        entityType: "issue", entityId: blockedIssueId, details: { status: "blocked" }, createdAt: blockedTransitionAt,
+      },
+      {
+        companyId, actorType: "user", actorId: "board-user", action: "issue.updated",
+        entityType: "issue", entityId: blockedIssueId, details: { blockedByIssueIds: [] },
+        createdAt: new Date("2026-08-01T12:05:00.000Z"),
+      },
+    ]);
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.selfBlockedSkipped).toBe(0);
+    expect(result.healed).toBe(1);
+  });
+
+  it.each(["title", "monitorNotes"])("preserves an assignee block after an unrelated %s edit", async (field) => {
+    const { companyId, agentId, blockedIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const blockedTransitionAt = new Date("2026-08-01T12:00:00.000Z");
+    await db.update(issues).set({ blockedTransitionAt }).where(eq(issues.id, blockedIssueId));
+    await db.insert(activityLog).values([
+      { companyId, actorType: "agent", actorId: agentId, agentId, action: "issue.updated",
+        entityType: "issue", entityId: blockedIssueId, details: { status: "blocked" }, createdAt: blockedTransitionAt },
+      { companyId, actorType: "user", actorId: "board-user", action: "issue.updated",
+        entityType: "issue", entityId: blockedIssueId, details: { changes: { [field]: { from: "old", to: "new" } } },
+        createdAt: new Date("2026-08-01T12:05:00.000Z") },
+    ]);
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+    expect(result.healed).toBe(0);
+    expect(result.selfBlockedSkipped).toBe(1);
+  });
+
+  it.each([true, false])("checks the native blocked decision run owner (assignee: %s)", async (sameOwner) => {
+    const { companyId, agentId, blockedIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const blockedTransitionAt = new Date("2026-08-01T12:00:00.000Z");
+    await db.update(issues).set({ blockedTransitionAt }).where(eq(issues.id, blockedIssueId));
+    const otherAgentId = randomUUID();
+    if (!sameOwner) await db.insert(agents).values({ id: otherAgentId, companyId, name: "Other agent", role: "engineer", status: "idle", adapterType: "process" });
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: sameOwner ? agentId : otherAgentId,
+      issueId: blockedIssueId, status: "succeeded", runtimeMode: "native", contextSnapshot: { issueId: blockedIssueId } }).returning();
+    await db.insert(activityLog).values({ companyId, actorType: "system", actorId: "native-status-committer",
+      runId: run.id, action: "issue.updated", entityType: "issue", entityId: blockedIssueId,
+      details: { source: "native_status_decision", fromStatus: "in_progress", toStatus: "blocked" }, createdAt: blockedTransitionAt });
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+    expect(result.healed).toBe(sameOwner ? 0 : 1);
+    expect(result.selfBlockedSkipped).toBe(sameOwner ? 1 : 0);
+  });
+
+  it.each(["completion", "finalize"] as const)("heals a self-block after later blocker %s", async (event) => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: event === "finalize" ? "not_finalized" : "none" });
+    const blockedTransitionAt = new Date(Date.now() - 120_000);
+    const completedAt = new Date();
+    await db.update(issues).set({ blockedTransitionAt }).where(eq(issues.id, blockedIssueId));
+    await db.insert(activityLog).values({ companyId, actorType: "agent", actorId: agentId, agentId,
+      action: "issue.updated", entityType: "issue", entityId: blockedIssueId, details: { status: "blocked" }, createdAt: blockedTransitionAt });
+    if (event === "completion") await db.update(issues).set({ completedAt }).where(eq(issues.id, blockerIssueId));
+    else await db.insert(workspaceOperations).values({ companyId, executionWorkspaceId, issueId: blockerIssueId,
+      phase: "workspace_finalize", status: "succeeded", startedAt: completedAt, finishedAt: completedAt });
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+    expect(result.healed).toBe(1);
+    expect(result.selfBlockedSkipped).toBe(0);
+  });
+
+  it("wakes once when a completion refused for unresolved dependencies later becomes valid", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const blockedTransitionAt = new Date(Date.now() - 120_000);
+    await db.update(issues).set({ blockedTransitionAt }).where(eq(issues.id, blockedIssueId));
+    await db.update(issues).set({ completedAt: new Date(blockedTransitionAt.getTime() - 60_000) }).where(eq(issues.id, blockerIssueId));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: blockedIssueId, status: "succeeded",
+      runtimeMode: "native", contextSnapshot: { issueId: blockedIssueId } }).returning();
+    await db.insert(activityLog).values({ companyId, actorType: "system", actorId: "native-status-committer",
+      runId: run.id, action: "issue.updated", entityType: "issue", entityId: blockedIssueId,
+      details: { source: "native_status_decision", fromStatus: "in_progress", toStatus: "blocked",
+        reasonCode: "durable_dependency_blocker_bound" }, createdAt: blockedTransitionAt });
+
+    const first = await heartbeatService(db).reconcileResolvedDependencyWakes({ companyId, issueId: blockedIssueId });
+    expect(first.selfBlockedSkipped).toBe(0);
+    expect(first.healed).toBe(1);
+    const second = await heartbeatService(db).reconcileResolvedDependencyWakes({ companyId, issueId: blockedIssueId });
+    expect(second.healed).toBe(0);
+    const wakes = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.reason, "issue_blockers_resolved")));
+    expect(wakes).toHaveLength(1);
+  });
+
+  it("still holds a native block the agent chose while its dependencies were ready", async () => {
+    const { companyId, agentId, blockedIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const blockedTransitionAt = new Date(Date.now() - 120_000);
+    await db.update(issues).set({ blockedTransitionAt }).where(eq(issues.id, blockedIssueId));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: blockedIssueId, status: "succeeded",
+      runtimeMode: "native", contextSnapshot: { issueId: blockedIssueId } }).returning();
+    await db.insert(activityLog).values({ companyId, actorType: "system", actorId: "native-status-committer",
+      runId: run.id, action: "issue.updated", entityType: "issue", entityId: blockedIssueId,
+      details: { source: "native_status_decision", fromStatus: "in_progress", toStatus: "blocked",
+        reasonCode: "task_wide_blocker_bound" }, createdAt: blockedTransitionAt });
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes({ companyId, issueId: blockedIssueId });
+    expect(result.healed).toBe(0);
+    expect(result.selfBlockedSkipped).toBe(1);
+  });
+
+  it.each(["dependent", "blocker", "unattributed"] as const)("attributes shared-workspace export to its %s issue", async (exporter) => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "finalized" });
+    const blockedTransitionAt = new Date(Date.now() - 30_000);
+    await db.update(issues).set({ blockedTransitionAt, executionWorkspaceId }).where(eq(issues.id, blockedIssueId));
+    await db.insert(activityLog).values({ companyId, actorType: "agent", actorId: agentId, agentId,
+      action: "issue.updated", entityType: "issue", entityId: blockedIssueId, details: { status: "blocked" }, createdAt: blockedTransitionAt });
+    await db.insert(workspaceOperations).values({ companyId, executionWorkspaceId,
+      issueId: exporter === "dependent" ? blockedIssueId : exporter === "blocker" ? blockerIssueId : null, phase: "workspace_finalize",
+      status: "succeeded", startedAt: new Date(), finishedAt: new Date() });
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+    expect(result.healed).toBe(exporter === "blocker" ? 1 : 0);
+    expect(result.selfBlockedSkipped).toBe(exporter === "blocker" ? 0 : 1);
+  });
+
+  it("still heals when someone other than the assignee opened the blocked cycle", async () => {
+    const { companyId, agentId, blockedIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const blockedTransitionAt = new Date("2026-08-01T12:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ blockedTransitionAt, updatedAt: blockedTransitionAt })
+      .where(eq(issues.id, blockedIssueId));
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: blockedIssueId,
+      details: { status: "blocked" },
+      createdAt: blockedTransitionAt,
+    });
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.selfBlockedSkipped).toBe(0);
+    expect(result.healed).toBe(1);
+    void agentId;
   });
 
   it("counts null dependency wake returns as deferred instead of enqueue failures", async () => {

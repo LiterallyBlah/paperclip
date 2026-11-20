@@ -31,6 +31,8 @@ export const connectionScopeGaps = [
   { adapter: "acpx_local", status: "excluded", reason: "Generic legacy integration; native Claude/Grok ACPX profiles remain covered." },
   { adapter: "claude_managed", status: "excluded", reason: "Managed remote integration owns credentials." },
   { adapter: "aws_agentcore", status: "excluded", reason: "Remote integration owns credentials." },
+  // Fork-only (LiterallyBlah/paperclip): the Muse adapter has no managed connection flow in this suite.
+  { adapter: "muse_local", status: "unsupported", reason: "Fork-only Muse subscription adapter; no managed connection flow." },
 ] as const;
 
 export function routingForMode(mode: ConnectionMode): AiProviderRouting | undefined {

@@ -5,7 +5,7 @@ import path from "node:path";
 import { runSetupTokenLogin } from "@paperclipai/adapter-claude-local/server";
 import { runDeviceLogin } from "@paperclipai/adapter-codex-local/server";
 import { ensureCommandResolvable, resolveCommandForLogs } from "@paperclipai/adapter-utils/server-utils";
-import { resolveCodexCommand } from "../vendor/paperclip-runner/index.js";
+import { resolveCodexCommand, startAntigravityBrowserLogin } from "../vendor/paperclip-runner/index.js";
 import { readVerifiedLocalAiCredential } from "./local-ai-credentials.js";
 
 export type LocalBrowserLoginState = {
@@ -50,7 +50,8 @@ sys.exit(os.waitstatus_to_exitcode(status))
 `;
 
 /** Run the same browser-code login used by sandbox connections on the local host. */
-export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "muse", home: string): LocalBrowserLoginState {
+export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "google" | "muse", home: string): LocalBrowserLoginState {
+  if (provider === "google") return startAntigravityBrowserLogin(home);
   const controller = new AbortController();
   const state: LocalBrowserLoginState = { abort: () => controller.abort() };
   const args = provider === "anthropic" ? ["setup-token"] : provider === "muse" ? ["login"] : ["login", "--device-auth"];
@@ -59,10 +60,8 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "muse"
     async start(_command: string, onData: (chunk: string) => void): Promise<{ exitCode: number | null }> {
       let executable = "claude";
       if (provider === "openai") {
-        // Linux ARM64 retains its supported legacy CLI path; it is not a
-        // qualified native runner target. Other hosts prefer the installed
-        // dependency, then an existing CLI when the dependency is absent.
-        const legacyPlatform = process.platform === "linux" && process.arch === "arm64";
+        const legacyPlatform = !((process.platform === "linux" || process.platform === "darwin")
+          && (process.arch === "x64" || process.arch === "arm64"));
         try {
           if (legacyPlatform) {
             await ensureCommandResolvable("codex", home, process.env);

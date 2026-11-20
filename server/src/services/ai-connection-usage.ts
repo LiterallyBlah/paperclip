@@ -70,7 +70,9 @@ export async function readUsage(url: string, headers: Record<string, string>, re
   });
   if (!response.ok) {
     await response.body?.cancel();
+    const edgePage = /^\s*text\/html\b/i.test(response.headers.get("content-type") ?? "");
     throw new ProbeFailure(response.status === 401 ? "authentication_required"
+      : response.status === 403 && edgePage ? "provider_unavailable"
       : response.status === 403 ? "permission_denied"
       : response.status === 429 ? "rate_limited" : "provider_unavailable");
   }
@@ -332,7 +334,7 @@ export async function probeAiConnectionUsage(
   options: { request?: typeof fetch } = {},
 ): Promise<Omit<AiConnectionUsage, "connectionId" | "grantId">> {
   const base = { ...metadata, checkedAt: new Date().toISOString(), source: null, planType: null, limits: [], overage: null };
-  if (metadata.provider === "google" || metadata.provider === "muse" || !supportsAiConnectionUsage(metadata.provider, metadata.method)) {
+  if (metadata.provider === "google" || metadata.provider === "github" || metadata.provider === "muse" || !supportsAiConnectionUsage(metadata.provider, metadata.method)) {
     return { ...base, status: "unsupported", errorCode: "unsupported", message: messages.unsupported };
   }
   try {

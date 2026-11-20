@@ -289,6 +289,17 @@ export function createPluginEventBus(): PluginEventBus {
     emit,
     forPlugin,
     clearPlugin,
+    /** True when at least one plugin subscription matches the event type (and company, if given). */
+    hasSubscriber(eventType: string, companyId?: string): boolean {
+      for (const subs of registry.values()) {
+        for (const sub of subs) {
+          if (!matchesPattern(eventType, sub.eventPattern)) continue;
+          if (companyId !== undefined && sub.filter?.companyId !== undefined && sub.filter.companyId !== companyId) continue;
+          return true;
+        }
+      }
+      return false;
+    },
     /** Expose subscription count for a plugin (useful for tests and diagnostics). */
     subscriptionCount(pluginId?: string): number {
       if (pluginId !== undefined) {
@@ -347,6 +358,13 @@ export interface PluginEventBus {
    * specific plugin if `pluginId` is provided.
    */
   subscriptionCount(pluginId?: string): number;
+
+  /**
+   * Return true when at least one active subscription matches `eventType`
+   * and, if `companyId` is given, does not filter that company out. Used to
+   * skip building events that no plugin would receive.
+   */
+  hasSubscriber(eventType: string, companyId?: string): boolean;
 }
 
 /**

@@ -70,6 +70,12 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+/** A generated runtime home slot name: `<digest>` or `<digest>-<n>`. */
+function readCodexRuntimeHome(value: unknown): string | null {
+  const home = readNonEmptyString(value);
+  return home && /^[a-f0-9]{64}(-[1-9][0-9]?)?$/.test(home) ? home : null;
+}
+
 export const sessionCodec: AdapterSessionCodec = {
   deserialize(raw: unknown) {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
@@ -83,8 +89,10 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(record.workspaceId) ?? readNonEmptyString(record.workspace_id);
     const repoUrl = readNonEmptyString(record.repoUrl) ?? readNonEmptyString(record.repo_url);
     const repoRef = readNonEmptyString(record.repoRef) ?? readNonEmptyString(record.repo_ref);
+    const codexRuntimeHome = readCodexRuntimeHome(record.codexRuntimeHome);
     return {
       sessionId,
+      ...(codexRuntimeHome ? { codexRuntimeHome } : {}),
       ...(cwd ? { cwd } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
@@ -102,8 +110,10 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(params.workspaceId) ?? readNonEmptyString(params.workspace_id);
     const repoUrl = readNonEmptyString(params.repoUrl) ?? readNonEmptyString(params.repo_url);
     const repoRef = readNonEmptyString(params.repoRef) ?? readNonEmptyString(params.repo_ref);
+    const codexRuntimeHome = readCodexRuntimeHome(params.codexRuntimeHome);
     return {
       sessionId,
+      ...(codexRuntimeHome ? { codexRuntimeHome } : {}),
       ...(cwd ? { cwd } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),

@@ -1,3 +1,5 @@
+import { notifyChatRunMilestones } from "./chat-run-milestone-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { updateAgentConfigurationInTransaction } from "./agent-configuration-transaction.js";
 import { withAgentAppearance } from "@paperclipai/shared";
 import { and, count, desc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
@@ -18,7 +20,8 @@ import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } f
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import { agentService } from "./agents.js";
 import { logActivity } from "./activity-log.js";
-import { normalizeSecretKey, secretService } from "./secrets.js";
+import { publishInteractionCreatedPluginEvent } from "./plugin-decision-events.js";
+import { assertNotRedactedPlaceholderSecretValue, normalizeSecretKey, secretService } from "./secrets.js";
 
 const CONFIG_PATH_RE = /^(?:env\.[A-Za-z_][A-Za-z0-9_]*|access\.[A-Za-z_][A-Za-z0-9_]*)$/;
 const SECRET_NAME_RE = /^[^/\s]+(?:\/[^/\s]+)*$/;
@@ -144,6 +147,7 @@ export function createSecretProposalsService(db: Db) {
         });
         return { denial, value: null };
       }
+      await notifyDeliveryWork(txDb, DELIVERY_QUEUES.secretProposalExpiry, input.companyId);
       return { denial: null, value: await create(txDb) };
     });
     if (result.denial) throw unprocessable(result.denial.message);
@@ -250,6 +254,11 @@ export function createSecretProposalsService(db: Db) {
         serverOwnedPayload: "secretProposal",
       },
     });
+    await publishInteractionCreatedPluginEvent(
+      interaction,
+      { agentId: proposal.proposedByAgentId, runId: proposal.originRunId },
+      txDb,
+    );
     return linked;
   }
 
@@ -288,6 +297,7 @@ export function createSecretProposalsService(db: Db) {
       : outcome === "rejected"
         ? "rejected"
         : "withdrawn";
+    if (current.status !== status) await notifyChatRunMilestones(txDb, current);
     await txDb
       .update(issueThreadInteractions)
       .set({
@@ -325,6 +335,7 @@ export function createSecretProposalsService(db: Db) {
     if (!SECRET_NAME_RE.test(name)) throw unprocessable("Secret name must be a slash-separated path without empty segments");
     if (!justification) throw unprocessable("Justification is required");
     if (!input.value) throw unprocessable("Secret value is required");
+    assertNotRedactedPlaceholderSecretValue(input.value);
     if (Buffer.byteLength(input.value, "utf8") > MAX_SECRET_VALUE_BYTES) {
       throw unprocessable(`Secret value must be at most ${MAX_SECRET_VALUE_BYTES} bytes`);
     }
@@ -576,6 +587,9 @@ export function createSecretProposalsService(db: Db) {
       material: proposal.valueCiphertext,
       externalRef: null,
     });
+    // A proposal stored before submission-time rejection existed may still
+    // hold the placeholder; never materialise it into a company secret.
+    assertNotRedactedPlaceholderSecretValue(value);
     const secrets = secretService(txDb);
     const providerConfigId = input.overrides?.providerConfigId ?? null;
     const providerConfig = providerConfigId
@@ -619,6 +633,7 @@ export function createSecretProposalsService(db: Db) {
     appliedBindingConfigPath?: string | null;
   }) {
     const now = new Date();
+    await notifyDeliveryWork(txDb, DELIVERY_QUEUES.secretProposalExpiry, proposal.companyId);
     const updated = await txDb.update(companySecretProposals).set({
       status: "approved",
       resolvedByUserId: input.resolvedByUserId,
@@ -794,6 +809,7 @@ export function createSecretProposalsService(db: Db) {
     const now = new Date();
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.secretProposalExpiry, companyId);
       const updated = await tx.update(companySecretProposals).set({
         status,
         resolvedByUserId: input.resolvedByUserId ?? null,
@@ -868,10 +884,12 @@ export function createSecretProposalsService(db: Db) {
     limit = DEFAULT_EXPIRY_SWEEP_LIMIT,
     expireProposal: (companyId: string, proposalId: string) => Promise<unknown> =
       (companyId, proposalId) => transition(companyId, proposalId, "expired", { reason: "Pending proposal expired" }),
+    companyId?: string,
   ) {
     const expired = await db.select({ id: companySecretProposals.id, companyId: companySecretProposals.companyId })
       .from(companySecretProposals)
-      .where(and(eq(companySecretProposals.status, "pending"), lte(companySecretProposals.expiresAt, now)))
+      .where(and(eq(companySecretProposals.status, "pending"), lte(companySecretProposals.expiresAt, now),
+        companyId === undefined ? undefined : eq(companySecretProposals.companyId, companyId)))
       .orderBy(companySecretProposals.expiresAt)
       .limit(limit);
     let expiredCount = 0;
@@ -887,5 +905,25 @@ export function createSecretProposalsService(db: Db) {
     return expiredCount;
   }
 
-  return { getById, view: enrich, createSecret, createBinding, listForAgent, listForBoard, assertBindingSnapshotCurrent, approve, transition, sweepExpired };
+  async function sweepExpiredForCompany(companyId: string) {
+    return sweepExpired(new Date(), DEFAULT_EXPIRY_SWEEP_LIMIT, undefined, companyId);
+  }
+
+  async function expiryDeadlines(companyId?: string) {
+    const rows = await db.select({ companyId: companySecretProposals.companyId,
+      at: sql<string | Date>`min(${companySecretProposals.expiresAt})` })
+      .from(companySecretProposals)
+      .where(and(eq(companySecretProposals.status, "pending"),
+        companyId === undefined ? undefined : eq(companySecretProposals.companyId, companyId)))
+      .groupBy(companySecretProposals.companyId);
+    return rows.map(row => ({ companyId: row.companyId, dueAt: new Date(row.at).getTime() }));
+  }
+
+  async function nextExpiryAt(): Promise<number | null> {
+    const [row] = await db.select({ at: sql<string | Date | null>`min(${companySecretProposals.expiresAt})` })
+      .from(companySecretProposals).where(eq(companySecretProposals.status, "pending"));
+    return row?.at == null ? null : new Date(row.at).getTime();
+  }
+
+  return { getById, view: enrich, createSecret, createBinding, listForAgent, listForBoard, assertBindingSnapshotCurrent, approve, transition, sweepExpired, sweepExpiredForCompany, expiryDeadlines, nextExpiryAt };
 }

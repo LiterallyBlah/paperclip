@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
@@ -26,6 +26,7 @@ import {
   issueThreadInteractions,
   issues,
   principalPermissionGrants,
+  routineRevisions,
   routines,
   routineTriggers,
 } from "@paperclipai/db";
@@ -48,6 +49,8 @@ import {
 } from "../services/built-in-agents.ts";
 import { readBuiltInAgentMarker, withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.ts";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
+import { routineService } from "../services/routines.ts";
+import { heartbeatService } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -140,6 +143,8 @@ describeEmbeddedPostgres("built-in agents", () => {
     };
   }
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let runnerSelectionSpy: { mockRestore(): void } | undefined;
+  const runnerTarget = { driver: "local", platform: "linux", architecture: "x64" };
   const instructionOperator = { type: "board", userId: "local-board", source: "local_implicit" } as const;
   async function writeInstructionEntry(agent: { id: string; companyId: string }, entryFile: string, content: string) {
     const service = agentInstructionRevisionService(db);
@@ -157,7 +162,16 @@ describeEmbeddedPostgres("built-in agents", () => {
     lifecycleWorker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
   }, 20_000);
 
+  beforeEach(async () => {
+    runnerTarget.platform = "linux";
+    runnerTarget.architecture = "x64";
+    const selection = await import("../services/agent-runner-selection.js");
+    runnerSelectionSpy = vi.spyOn(selection, "resolveNewAgentRunnerForCompany").mockImplementation(async (_db, _companyId, input) =>
+      selection.resolveNewAgentRunner({ ...input, target: runnerTarget }));
+  });
+
   afterEach(async () => {
+    runnerSelectionSpy?.mockRestore();
     await lifecycleWorker.sweep();
     await db.delete(routineTriggers);
     await db.delete(routines);
@@ -200,6 +214,14 @@ describeEmbeddedPostgres("built-in agents", () => {
       issuePrefix: issuePrefix(companyId),
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: options.requireApproval ?? true,
+    });
+    // The default responsible user is a real, active company member.
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "member",
     });
     return companyId;
   }
@@ -255,7 +277,9 @@ describeEmbeddedPostgres("built-in agents", () => {
     ])).toThrow("defaultAdapterType must be allowed");
   });
 
-  it("lazily provisions one agent per company/key and updates the same row on setup", async () => {
+  it.each([{ platform: "linux", architecture: "x64" }, { platform: "linux", architecture: "arm64" }, { platform: "darwin", architecture: "arm64" }, { platform: "darwin", architecture: "x64" }])("lazily provisions one agent per company/key and updates the same row on setup ($platform/$architecture)", async ({ platform, architecture }) => {
+    runnerTarget.platform = platform;
+    runnerTarget.architecture = architecture;
     const companyId = await seedCompany();
     const svc = builtInAgentService(db);
 
@@ -280,19 +304,70 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(configured.status).toBe("ready");
     expect(configured.agentId).toBe(created.agentId);
     expect(configured.agent).toMatchObject({
-      adapterType: "codex_local",
-      adapterConfig: { model: "gpt-5.4" },
+      adapterType: "paperclip_runner",
+      adapterConfig: { provider: "codex", model: "gpt-5.4" },
     });
 
     const reconciled = await svc.ensure(companyId, "briefs");
     expect(reconciled.status).toBe("ready");
     expect(reconciled.agent).toMatchObject({
-      adapterType: "codex_local",
-      adapterConfig: { model: "gpt-5.4" },
+      adapterType: "paperclip_runner",
+      adapterConfig: { provider: "codex", model: "gpt-5.4" },
     });
 
     const rows = await db.select().from(agents).where(eq(agents.companyId, companyId));
     expect(rows).toHaveLength(1);
+  });
+
+  it("keeps existing legacy and native built-in runners through unrelated edits and startup", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    const svc = builtInAgentService(db);
+    const savedSettings = { model: "gpt-5.5", modelReasoningEffort: "high", timeoutSec: 123 };
+    const created = await svc.ensure(companyId, "briefs", { adapterType: "codex_local", adapterConfig: savedSettings, runner: "legacy" });
+    expect(created.agent?.adapterType).toBe("codex_local");
+    await svc.ensure(companyId, "briefs", { budgetMonthlyCents: 100 });
+    await reconcileBuiltInAgentsOnStartup(db);
+    const legacy = await svc.get(companyId, "briefs");
+    expect(legacy.agent?.adapterType).toBe("codex_local");
+    expect(legacy.agent?.adapterConfig).toEqual(created.agent?.adapterConfig);
+    const switched = await svc.ensure(companyId, "briefs", { runner: "paperclip" });
+    expect(switched.agent).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "codex", ...savedSettings } });
+    await svc.ensure(companyId, "briefs", { budgetMonthlyCents: 200 });
+    await reconcileBuiltInAgentsOnStartup(db);
+    expect((await svc.get(companyId, "briefs")).agent?.adapterConfig).toEqual(switched.agent?.adapterConfig);
+    const switchedBack = await svc.ensure(companyId, "briefs", { runner: "legacy" });
+    expect(switchedBack.agent).toMatchObject({ adapterType: "codex_local", adapterConfig: savedSettings });
+    const switchedAgain = await svc.ensure(companyId, "briefs", { runner: "paperclip" });
+    expect(switchedAgain.agent).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "codex", ...savedSettings } });
+    runnerTarget.platform = "win32";
+    runnerTarget.architecture = "x64";
+    const edited = await svc.ensure(companyId, "briefs", { adapterType: "codex_local", adapterConfig: { model: "gpt-5.4" } });
+    expect(edited.agent).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: "gpt-5.4" } });
+  });
+
+  it("freezes Codex built-in execution in the reviewed hire through service restart", async () => {
+    const companyId = await seedCompany({ requireApproval: true });
+    const result = await builtInAgentService(db).provision(companyId, "briefs", { adapterType: "codex_local", adapterConfig: { model: "gpt-5.4" } }, { requestedByUserId: "board-user" });
+    expect(result.approval?.payload).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: "gpt-5.4" } });
+    runnerTarget.platform = "win32";
+    runnerTarget.architecture = "x64";
+    await reconcileBuiltInAgentsOnStartup(db);
+    await approvalService(db).approve(result.approval!.id, "board-user");
+    const approved = await builtInAgentService(db).get(companyId, "briefs");
+    expect(approved.agent?.adapterType).toBe(result.approval!.payload.adapterType);
+    expect(approved.agent?.adapterConfig).toEqual(result.approval!.payload.adapterConfig);
+  });
+
+  it("records the human who enabled a built-in agent and leaves automatic creation unattributed", async () => {
+    const enabledCompanyId = await seedCompany({ requireApproval: false });
+    const automaticCompanyId = await seedCompany({ requireApproval: false });
+    const builtIns = builtInAgentService(db);
+
+    const enabled = await builtIns.provision(enabledCompanyId, "briefs", {}, { requestedByUserId: "board-user" });
+    const automatic = await builtIns.provision(automaticCompanyId, "briefs");
+
+    expect(enabled.state.agent?.createdByUserId).toBe("board-user");
+    expect(automatic.state.agent?.createdByUserId).toBeNull();
   });
 
   it("routes policy-gated built-in provisioning through a pending hire approval", async () => {
@@ -336,7 +411,7 @@ describeEmbeddedPostgres("built-in agents", () => {
 
     const rowsBeforeApproval = await db.select().from(agents).where(eq(agents.companyId, companyId));
     expect(rowsBeforeApproval).toHaveLength(1);
-    expect(rowsBeforeApproval[0]).toMatchObject({ status: "pending_approval" });
+    expect(rowsBeforeApproval[0]).toMatchObject({ status: "pending_approval", createdByUserId: "board-user" });
 
     await expect(builtIns.requireBuiltInAgent(companyId, "briefs")).rejects.toMatchObject({
       status: 412,
@@ -406,7 +481,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     await expect(builtIns.get(companyId, "briefs")).resolves.toMatchObject({
       status: "ready",
       agentId: ready.agentId,
-      agent: { adapterType: "codex_local", adapterConfig: { model: "gpt-5.4" } },
+      agent: { adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: "gpt-5.4" } },
     });
   });
 
@@ -433,8 +508,8 @@ describeEmbeddedPostgres("built-in agents", () => {
       agentId: seeded.agentId,
       agent: {
         status: "idle",
-        adapterType: "codex_local",
-        adapterConfig: { model: "gpt-5.4" },
+        adapterType: "paperclip_runner",
+        adapterConfig: { provider: "codex", model: "gpt-5.4" },
         budgetMonthlyCents: 2500,
       },
     });
@@ -600,8 +675,8 @@ describeEmbeddedPostgres("built-in agents", () => {
         role: "general",
         title: null,
         capabilities: "Prepares concise operational briefs for the board and agent company.",
-        adapterType: "codex_local",
-        adapterConfig: { model: "gpt-5.4" },
+        adapterType: "paperclip_runner",
+        adapterConfig: { provider: "codex", model: "gpt-5.4" },
       },
     });
   });
@@ -647,7 +722,7 @@ describeEmbeddedPostgres("built-in agents", () => {
         role: "general",
         title: "Reflection Coach",
         icon: "eye",
-        adapterType: "codex_local",
+        adapterType: "paperclip_runner",
         permissions: {
           canCreateAgents: false,
           canCreateSkills: false,
@@ -696,6 +771,374 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(coachGrantKeys).toEqual(expect.arrayContaining(["agents:suggest-changes", "skills:suggest-changes"]));
     expect(coachGrantKeys).not.toContain("agents:configure");
     expect(coachGrantKeys).not.toContain("skills:create");
+  });
+
+  // --- BLA-942: built-in bundle routines are owned by a real company member ---
+  // Fork backport of upstream paperclipai/paperclip#20129 (code only). The
+  // owner is the company default responsible user when that user is an active
+  // member, else the earliest active owner; never the requesting user, never
+  // the "built-in-bundles" marker, never a non-member.
+
+  const BUNDLE_MARKER = "built-in-bundles";
+  const COACH = "reflection-coach";
+  const COACH_ROUTINE = "recent-agent-reflection";
+
+  async function addMembership(
+    companyId: string,
+    principalId: string,
+    options: { role?: string; status?: string; createdAt?: Date } = {},
+  ) {
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId,
+      status: options.status ?? "active",
+      membershipRole: options.role ?? "member",
+      ...(options.createdAt ? { createdAt: options.createdAt } : {}),
+    });
+  }
+
+  async function seedOwnedCompany(options: { defaultResponsibleUserId?: string | null } = {}) {
+    const companyId = await seedCompany({ requireApproval: false });
+    if (options.defaultResponsibleUserId !== undefined) {
+      await db.update(companies)
+        .set({ defaultResponsibleUserId: options.defaultResponsibleUserId })
+        .where(eq(companies.id, companyId));
+    }
+    return companyId;
+  }
+
+  async function bundleRoutine(companyId: string) {
+    const rows = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    expect(rows).toHaveLength(1);
+    return rows[0]!;
+  }
+
+  async function markBundleRoutine(companyId: string, patch: Partial<typeof routines.$inferInsert> = {}) {
+    const installed = await bundleRoutine(companyId);
+    await db.update(routines)
+      .set({ responsibleUserId: BUNDLE_MARKER, ...patch })
+      .where(eq(routines.id, installed.id));
+    await db.update(routineRevisions)
+      .set({
+        responsibleUserId: BUNDLE_MARKER,
+        snapshot: sql`jsonb_set("snapshot", '{routine,responsibleUserId}', to_jsonb(${BUNDLE_MARKER}::text))`,
+      })
+      .where(eq(routineRevisions.routineId, installed.id));
+    return installed;
+  }
+
+  async function expectRoutineOwnedBy(routineId: string, responsibleUserId: string) {
+    const [routine] = await db.select().from(routines).where(eq(routines.id, routineId));
+    expect(routine!.responsibleUserId).toBe(responsibleUserId);
+    const revisions = await db.select().from(routineRevisions).where(eq(routineRevisions.routineId, routineId));
+    expect(revisions.length).toBeGreaterThan(0);
+    for (const revision of revisions) {
+      expect(revision.responsibleUserId).toBe(responsibleUserId);
+      expect((revision.snapshot as { routine?: { responsibleUserId?: string | null } }).routine?.responsibleUserId)
+        .toBe(responsibleUserId);
+    }
+    return routine!;
+  }
+
+  async function cleanupRoutineRuns(companyId: string) {
+    await db.delete(routineRuns).where(eq(routineRuns.companyId, companyId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+  }
+
+  // Real heartbeat runs write events, runtime state and other run-linked rows
+  // fire-and-forget. Drain them, then truncate the run tables with CASCADE so
+  // no run-linked row (whatever table it lands in) still references the agent.
+  async function drainAndTruncateRealRuns() {
+    await heartbeatService(db).drainActiveRunExecutions();
+    await db.execute(sql.raw(`
+      TRUNCATE TABLE
+        "heartbeat_run_events",
+        "heartbeat_runs",
+        "routine_runs",
+        "agent_wakeup_requests",
+        "agent_runtime_state"
+      CASCADE
+    `));
+  }
+
+  // Fire the bundle routine's schedule through the real scheduler and return
+  // the responsible user recorded on the routine run and its execution issue.
+  async function dispatchBundleSchedule(companyId: string) {
+    const routine = await bundleRoutine(companyId);
+    const [schedule] = await db.select().from(routineTriggers).where(and(
+      eq(routineTriggers.routineId, routine.id),
+      eq(routineTriggers.kind, "schedule"),
+    ));
+    expect(schedule!.enabled).toBe(true);
+    const due = new Date("2020-01-01T00:00:00.000Z");
+    await db.update(routineTriggers).set({ nextRunAt: due }).where(eq(routineTriggers.id, schedule!.id));
+    const wakeups: unknown[] = [];
+    const scheduler = routineService(db, {
+      heartbeat: {
+        wakeup: async (agentId: string, opts: unknown) => {
+          wakeups.push({ agentId, opts });
+          return null;
+        },
+      } as never,
+      runtimeEnv: {},
+    });
+    expect(await scheduler.tickScheduledTriggers(new Date())).toEqual({ triggered: 1 });
+    const [routineRun] = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+    expect(routineRun).toMatchObject({ source: "schedule", status: "issue_created" });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, routineRun!.linkedIssueId!));
+    return { routineRun: routineRun!, issue: issue! };
+  }
+
+  it("reproduction: a scheduled bundle routine dispatch carries a real company member, never the built-in-bundles marker", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH, {}, { createdByUserId: "enabling-user" });
+    await builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "board-user" });
+    try {
+      const { routineRun, issue } = await dispatchBundleSchedule(companyId);
+      expect(issue.responsibleUserId).not.toBe(BUNDLE_MARKER);
+      expect(issue.responsibleUserId).toBe("responsible-user");
+      expect(routineRun.responsibleUserId).toBe("responsible-user");
+
+      const routine = await expectRoutineOwnedBy(routineRun.routineId, "responsible-user");
+      expect(routine.createdByUserId).toBeNull();
+    } finally {
+      await cleanupRoutineRuns(companyId);
+    }
+  });
+
+  it("falls back to the earliest active owner when the company default user is not an active member", async () => {
+    const companyId = await seedOwnedCompany({ defaultResponsibleUserId: "departed-user" });
+    await addMembership(companyId, "departed-user", { status: "suspended" });
+    await addMembership(companyId, "suspended-owner", { role: "owner", status: "suspended", createdAt: new Date("2020-01-01T00:00:00Z") });
+    await addMembership(companyId, "early-member", { role: "member", createdAt: new Date("2020-01-02T00:00:00Z") });
+    await addMembership(companyId, "first-owner", { role: "owner", createdAt: new Date("2020-01-03T00:00:00Z") });
+    await addMembership(companyId, "second-owner", { role: "owner", createdAt: new Date("2020-01-04T00:00:00Z") });
+
+    await builtInAgentService(db).ensure(companyId, COACH, {}, { createdByUserId: "enabling-user" });
+
+    await expectRoutineOwnedBy((await bundleRoutine(companyId)).id, "first-owner");
+  });
+
+  it("falls back to the earliest active owner when the company has no default user", async () => {
+    const companyId = await seedOwnedCompany({ defaultResponsibleUserId: null });
+    await addMembership(companyId, "only-owner", { role: "owner" });
+
+    await builtInAgentService(db).ensure(companyId, COACH);
+
+    await expectRoutineOwnedBy((await bundleRoutine(companyId)).id, "only-owner");
+  });
+
+  it("never selects the built-in-bundles marker, even when it is configured as the company default", async () => {
+    const companyId = await seedOwnedCompany({ defaultResponsibleUserId: BUNDLE_MARKER });
+    await addMembership(companyId, BUNDLE_MARKER, { role: "owner", createdAt: new Date("2020-01-01T00:00:00Z") });
+    await addMembership(companyId, "real-owner", { role: "owner", createdAt: new Date("2020-01-02T00:00:00Z") });
+
+    await builtInAgentService(db).ensure(companyId, COACH);
+
+    await expectRoutineOwnedBy((await bundleRoutine(companyId)).id, "real-owner");
+  });
+
+  it("repairs a marked routine and all its revisions on reconcile, keeps operator edits, and the next scheduled dispatch carries a real member", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    await builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "responsible-user" });
+    const installed = await markBundleRoutine(companyId, { title: "Operator-customized title" });
+
+    await builtIns.ensure(companyId, COACH);
+
+    const repaired = await expectRoutineOwnedBy(installed.id, "responsible-user");
+    expect(repaired.title).toBe("Operator-customized title");
+    const repairs = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "built_in_agent.routine_reconciled"),
+    ));
+    for (const entry of repairs) expect(entry.actorId).toBe(BUNDLE_MARKER);
+    try {
+      const { routineRun, issue } = await dispatchBundleSchedule(companyId);
+      expect(routineRun.responsibleUserId).toBe("responsible-user");
+      expect(issue.responsibleUserId).toBe("responsible-user");
+    } finally {
+      await cleanupRoutineRuns(companyId);
+    }
+  });
+
+  it("repairs a marked routine during startup reconcile", async () => {
+    const companyId = await seedOwnedCompany();
+    await builtInAgentService(db).ensure(companyId, COACH);
+    const installed = await markBundleRoutine(companyId);
+
+    await reconcileBuiltInAgentsOnStartup(db);
+
+    await expectRoutineOwnedBy(installed.id, "responsible-user");
+  });
+
+  it("repairs a marked routine on reset instead of re-persisting the marker", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    const installed = await markBundleRoutine(companyId, { title: "Operator-customized title" });
+
+    await builtIns.reset(companyId, COACH, { resources: ["routine"] }, instructionOperator);
+
+    const reset = await expectRoutineOwnedBy(installed.id, "responsible-user");
+    expect(reset.title).toBe("Review recent agent trajectories for coaching proposals");
+    const resets = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "built_in_agent.routine_reset"),
+    ));
+    expect(resets.length).toBeGreaterThan(0);
+    for (const entry of resets) expect(entry.actorId).toBe(BUNDLE_MARKER);
+  });
+
+  it("repairs a marked routine to the company owner, not the requester, when its schedule is enabled", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    const installed = await markBundleRoutine(companyId);
+
+    await builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "board-user" });
+
+    await expectRoutineOwnedBy(installed.id, "responsible-user");
+  });
+
+  it("repairs marked revisions of a routine whose owner was already fixed, without changing that owner", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    const installed = await markBundleRoutine(companyId, { responsibleUserId: "operator-pick" });
+
+    await builtIns.ensure(companyId, COACH);
+
+    await expectRoutineOwnedBy(installed.id, "operator-pick");
+  });
+
+  // Seed-level check: the heartbeat run that executes the routine issue must
+  // carry a real active company member. The heartbeat resolves it through
+  // `getRoutineEnvForExecutionIssue`, which (while the dispatch transaction
+  // is still open) falls back to the routine row, so a marked routine leaks
+  // the marker into the run even for a manual board-user run.
+  async function heartbeatRunsFor(companyId: string) {
+    const issueIds = (await db.select({ id: issues.id }).from(issues).where(eq(issues.companyId, companyId)))
+      .map((row) => row.id);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    return runs.filter((run) => issueIds.includes(String((run.contextSnapshot as { issueId?: unknown } | null)?.issueId ?? "")));
+  }
+
+  async function expectActiveMember(companyId: string, userId: string | null) {
+    expect(userId).not.toBe(BUNDLE_MARKER);
+    const [membership] = await db.select().from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, companyId),
+      eq(companyMemberships.principalType, "user"),
+      eq(companyMemberships.principalId, userId ?? ""),
+      eq(companyMemberships.status, "active"),
+    ));
+    expect(membership, `heartbeat run responsible user ${userId} is an active member`).toBeDefined();
+  }
+
+  it("seeds both a scheduled and a manual board-user heartbeat run with a real company member after repair", async () => {
+    const companyId = await seedOwnedCompany();
+    await addMembership(companyId, "operator-user");
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    await builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "operator-user" });
+    const installed = await markBundleRoutine(companyId);
+
+    await lifecycleWorker.stop();
+    lifecycleWorker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "pending" });
+    try {
+      // Manual board-user run: the route path repairs the routine, then the
+      // heartbeat run must not inherit the marker from the routine row.
+      const manual = await builtIns.runRoutine(companyId, COACH, COACH_ROUTINE, { userId: "operator-user" });
+      expect(manual.status).toBe("issue_created");
+      const manualRuns = await heartbeatRunsFor(companyId);
+      expect(manualRuns.length).toBeGreaterThan(0);
+      for (const run of manualRuns) await expectActiveMember(companyId, run.responsibleUserId);
+      await expectRoutineOwnedBy(installed.id, "responsible-user");
+      await heartbeatService(db).drainActiveRunExecutions();
+      const manualRunIds = new Set((await heartbeatRunsFor(companyId)).map((run) => run.id));
+      await db.update(issues).set({ status: "done" }).where(eq(issues.companyId, companyId));
+
+      // Scheduled dispatch through the real scheduler and real heartbeat.
+      const [schedule] = await db.select().from(routineTriggers).where(and(
+        eq(routineTriggers.routineId, installed.id),
+        eq(routineTriggers.kind, "schedule"),
+      ));
+      await db.update(routineTriggers).set({ nextRunAt: new Date("2020-01-01T00:00:00.000Z") })
+        .where(eq(routineTriggers.id, schedule!.id));
+      expect(await routineService(db, { runtimeEnv: {} }).tickScheduledTriggers(new Date())).toEqual({ triggered: 1 });
+      const scheduledRuns = (await heartbeatRunsFor(companyId)).filter((run) => !manualRunIds.has(run.id));
+      expect(scheduledRuns.length).toBeGreaterThan(0);
+      for (const run of scheduledRuns) await expectActiveMember(companyId, run.responsibleUserId);
+    } finally {
+      await lifecycleWorker.stop();
+      await drainAndTruncateRealRuns();
+      lifecycleWorker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
+    }
+  });
+
+  it("defers a new bundle routine when the company has no user to own it, then materializes it once an owner exists", async () => {
+    const companyId = await seedOwnedCompany({ defaultResponsibleUserId: null });
+    const builtIns = builtInAgentService(db);
+
+    const deferred = await builtIns.ensure(companyId, COACH, {}, { createdByUserId: "enabling-user" });
+    expect(deferred.agentId).toBeTruthy();
+    expect(deferred.resources.find((resource) => resource.resourceKind === "skill")).toMatchObject({
+      stockStatus: "stock_current",
+    });
+    expect(deferred.resources.find((resource) => resource.resourceKind === "routine")).toMatchObject({
+      resourceId: null,
+      stockStatus: "missing",
+    });
+    expect(await db.select().from(routines).where(eq(routines.companyId, companyId))).toHaveLength(0);
+    const deferrals = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "built_in_agent.routine_deferred"),
+    ));
+    expect(deferrals).toEqual([
+      expect.objectContaining({
+        actorId: BUNDLE_MARKER,
+        entityId: deferred.agentId,
+        details: expect.objectContaining({ reason: "no_responsible_user" }),
+      }),
+    ]);
+
+    await addMembership(companyId, "new-owner", { role: "owner" });
+    const materialized = await builtIns.ensure(companyId, COACH);
+    expect(materialized.resources.find((resource) => resource.resourceKind === "routine")).toMatchObject({
+      stockStatus: "stock_current",
+    });
+    await expectRoutineOwnedBy((await bundleRoutine(companyId)).id, "new-owner");
+  });
+
+  it("defers, without a partial write, a marked routine when no user can own it, and refuses to enable it", async () => {
+    const companyId = await seedOwnedCompany();
+    const builtIns = builtInAgentService(db);
+    await builtIns.ensure(companyId, COACH);
+    await builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "responsible-user" });
+    const installed = await markBundleRoutine(companyId, { title: "Operator-customized title" });
+    await db.update(companies).set({ defaultResponsibleUserId: null }).where(eq(companies.id, companyId));
+    await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));
+
+    await builtIns.reset(companyId, COACH, { resources: ["routine"] }, instructionOperator);
+    const untouched = await expectRoutineOwnedBy(installed.id, BUNDLE_MARKER);
+    expect(untouched.title).toBe("Operator-customized title");
+    const deferrals = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "built_in_agent.routine_deferred"),
+    ));
+    expect(deferrals).toEqual([
+      expect.objectContaining({ entityId: installed.id, details: expect.objectContaining({ reason: "no_responsible_user" }) }),
+    ]);
+
+    // Enabling needs an owner: it is refused before any write.
+    await expect(
+      builtIns.enableRoutineSchedule(companyId, COACH, COACH_ROUTINE, { userId: "board-user" }),
+    ).rejects.toMatchObject({ status: 422 });
+    await expectRoutineOwnedBy(installed.id, BUNDLE_MARKER);
   });
 
   it("recreates missing managed resource bindings idempotently during concurrent reconcile", async () => {
@@ -1263,7 +1706,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       title: "Reflection Coach",
       icon: "eye",
       reportsTo: root.id,
-      adapterType: "codex_local",
+      adapterType: "paperclip_runner",
       budgetMonthlyCents: 0,
     });
     expect(state.status).toBe("paused");
@@ -1339,8 +1782,8 @@ describeEmbeddedPostgres("built-in agents", () => {
       icon: "sparkles",
       role: "general",
       reportsTo: root.id,
-      adapterType: "claude_local",
-      adapterConfig: { model: "claude-haiku-4-5" },
+      adapterType: "paperclip_runner",
+      adapterConfig: { provider: "acpx", acpxAgent: "claude", model: "claude-haiku-4-5" },
       budgetMonthlyCents: 0,
     });
     expect(state.status).toBe("paused");

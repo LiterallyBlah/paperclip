@@ -16,6 +16,10 @@ jobs:
   review:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Fork (LiterallyBlah/paperclip): the commitperclip app key belongs to
+    # upstream. Without it, run Dependency Review only and say so.
+    env:
+      COMMITPERCLIP_KEY_SET: ${{ secrets.COMMITPERCLIP_KEY != '' }}
     steps:
       - name: Checkout base branch (never PR code)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -28,13 +32,19 @@ jobs:
           base-ref: ${{ github.event.pull_request.base.sha }}
           head-ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Report skipped commitperclip quality gates
+        if: env.COMMITPERCLIP_KEY_SET != 'true'
+        run: echo "::notice title=commitperclip::COMMITPERCLIP_KEY is not set on this repository; quality gates skipped. Dependency Review ran above."
+
       - name: Set up Node
+        if: env.COMMITPERCLIP_KEY_SET == 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
 
       - name: Generate commitperclip token
         id: token
+        if: env.COMMITPERCLIP_KEY_SET == 'true'
         run: |
           TOKEN=$(node .github/scripts/get-bot-token.mjs)
           echo "::add-mask::$TOKEN"
@@ -44,7 +54,7 @@ jobs:
 
       - name: Run quality gates
         id: quality
-        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        if: env.COMMITPERCLIP_KEY_SET == 'true' && github.event.pull_request.user.login != 'dependabot[bot]'
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
         env:
@@ -56,6 +66,7 @@ jobs:
 
       - name: Fail if quality gates failed
         if: >-
+          env.COMMITPERCLIP_KEY_SET == 'true' &&
           github.event.pull_request.user.login != 'dependabot[bot]' &&
           steps.quality.outcome == 'failure'
         run: |

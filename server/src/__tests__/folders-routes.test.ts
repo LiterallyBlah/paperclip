@@ -18,6 +18,11 @@ vi.mock("../services/index.js", () => ({
   logActivity: mockLogActivity,
 }));
 
+// Slice H F-H2: routine read access is covered end to end in routines-e2e; here the routine is readable.
+vi.mock("../services/routine-reference-access.js", () => ({
+  routineHiddenForWrite: vi.fn(async () => false),
+}));
+
 async function createApp() {
   vi.resetModules();
   const [{ errorHandler }, { folderRoutes }] = await Promise.all([

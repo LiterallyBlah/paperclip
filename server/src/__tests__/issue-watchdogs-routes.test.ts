@@ -188,6 +188,9 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       // window) so attaching a watchdog evaluates immediately instead of being
       // deferred by the pending-first-run guard.
       createdAt: overrides.createdAt ?? new Date(Date.now() - 60 * 60 * 1000),
+      // Likewise default to a settled issue (last transition before the
+      // hand-off settle window) so the transition-settle guard does not defer.
+      updatedAt: overrides.updatedAt ?? new Date(Date.now() - 60 * 60 * 1000),
     });
     return id;
   }
@@ -512,6 +515,18 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       .from(issueWatchdogs)
       .where(and(eq(issueWatchdogs.companyId, companyId), eq(issueWatchdogs.issueId, watchedChildId)));
     expect(nestedWatchdogs).toHaveLength(0);
+
+    // Watchdog runs are authorized for the watched subtree, so the agent depth
+    // limit does not move their tasks above the requested parent. Remove the
+    // task afterwards so the watched subtree returns to its stopped state.
+    const allowedCreate = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Allowed watched grandchild", parentId: watchedChildId });
+    expect(allowedCreate.status, JSON.stringify(allowedCreate.body)).toBe(201);
+    expect(allowedCreate.body.parentId).toBe(watchedChildId);
+    expect(allowedCreate.body).not.toHaveProperty("parentAdjusted");
+    await db.delete(activityLog).where(eq(activityLog.entityId, allowedCreate.body.id));
+    await db.delete(issues).where(eq(issues.id, allowedCreate.body.id));
 
     const allowedChild = await request(app)
       .post(`/api/issues/${watchedChildId}/children`)

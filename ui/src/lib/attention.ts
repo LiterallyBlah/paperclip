@@ -9,6 +9,7 @@ import type {
   AttentionSourceKind,
   AttentionWorkspaceRef,
 } from "@paperclipai/shared";
+import { markdownToPlainText } from "./markdown-plain-text";
 
 export type AttentionListOptions = AttentionFeedQuery;
 
@@ -187,6 +188,12 @@ function quote(text: string | null | undefined): string | null {
   return `“${trimmed}”`;
 }
 
+// Prompt and question text is agent-authored Markdown (often truncated
+// server-side mid-syntax); the one-line preview shows its words, not its syntax.
+function quoteMarkdown(text: string | null | undefined): string | null {
+  return quote(text ? markdownToPlainText(text) : text);
+}
+
 function countNoun(count: number, singular: string): string {
   return `${count} ${count === 1 ? singular : `${singular}s`}`;
 }
@@ -207,13 +214,13 @@ export function attentionDetailLine(item: AttentionItem): string | null {
     case "approval":
       return quote(detail.summaryExcerpt);
     case "confirmation":
-      return quote(detail.promptExcerpt);
+      return quoteMarkdown(detail.promptExcerpt);
     case "checkbox_confirmation": {
-      const q = quote(detail.promptExcerpt);
+      const q = quoteMarkdown(detail.promptExcerpt);
       return q ? `${countNoun(detail.optionCount, "option")} — ${q}` : countNoun(detail.optionCount, "option");
     }
     case "questions": {
-      const q = quote(detail.firstQuestionText);
+      const q = quoteMarkdown(detail.firstQuestionText);
       const label = countNoun(detail.questionCount, "question");
       return q ? `${label} — ${q}` : label;
     }
@@ -223,7 +230,7 @@ export function attentionDetailLine(item: AttentionItem): string | null {
       return q ? `${label} — ${q}` : label;
     }
     case "item_verdicts": {
-      const q = quote(detail.promptExcerpt);
+      const q = quoteMarkdown(detail.promptExcerpt);
       const label = `${countNoun(detail.itemCount, "item")} to verdict`;
       return q ? `${label} — ${q}` : label;
     }
@@ -732,9 +739,17 @@ export function attentionItemMatchesFilters(item: AttentionItem, filters: Attent
   return true;
 }
 
-export function filterAttentionItems(items: AttentionItem[], filters: AttentionFilterState): AttentionItem[] {
-  if (countActiveAttentionFilters(filters) === 0) return items;
-  return items.filter((item) => attentionItemMatchesFilters(item, filters));
+export function filterAttentionItems(items: AttentionItem[], filters: AttentionFilterState, query = ""): AttentionItem[] {
+  const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  if (countActiveAttentionFilters(filters) === 0 && terms.length === 0) return items;
+  return items.filter((item) => {
+    if (!attentionItemMatchesFilters(item, filters)) return false;
+    if (terms.length === 0) return true;
+    const text = [item.subject.title, item.subject.identifier, item.relatedIssue?.title,
+      item.relatedIssue?.identifier, item.whyNow, attentionDetailLine(item),
+      item.originAgentName, item.project?.name, item.workspace?.name].filter(Boolean).join(" ").toLocaleLowerCase();
+    return terms.every(term => text.includes(term));
+  });
 }
 
 /** Distinct filterable dimensions present in the current feed, for the picker. */

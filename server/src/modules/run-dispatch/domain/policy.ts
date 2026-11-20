@@ -118,7 +118,8 @@ export type QueuedRunStalenessErrorCode =
   | "issue_execution_lock_changed"
   | "issue_blocked"
   | "issue_review_participant_changed"
-  | "issue_continuation_waiting_on_review";
+  | "issue_continuation_waiting_on_review"
+  | "issue_interaction_not_pending";
 
 export type StalenessDecision =
   | { stale: false }
@@ -145,9 +146,22 @@ export type QueuedRunFacts = {
   issueCheckoutRunId?: string | null;
 
   isResolvedInteractionContinuation: boolean;
+  /** Verified under the issue lock: an answer to a question no run asked, on a todo task that has never started. */
+  isUnstartedTaskQuestionAnswer?: boolean;
   /** A connection resolution or tool refresh can resume an agent waiting in review. */
   isConnectionContinuation?: boolean;
   isInteractionWake: boolean;
+  /**
+   * Verified from the current stored interaction under the queued-run lock:
+   * an addressed question this run's agent may still answer (pending, not
+   * dismissed, answerable kind, resolver-eligible, valid retry origin).
+   * Excuses the assignee-ownership and review-participant checks.
+   */
+  isPendingInteractionAddresseeWake?: boolean;
+  /** The card a non-owner is admitted to answer; written to the run by the claim. */
+  addressedQuestionInteractionId?: string | null;
+  /** This run inherited a question admission whose card can no longer be answered by it. */
+  addressedQuestionInvalidated?: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
@@ -172,6 +186,7 @@ type OwnershipFacts = {
   issueAssigneeAgentId: string | null;
   isNonAssigneeWorkspaceBusyRetry: boolean;
   isInteractionWake?: boolean;
+  isPendingInteractionAddresseeWake?: boolean;
   isCurrentReviewParticipant?: boolean;
   isAuthorizedSourceScopedRecovery?: boolean;
 };
@@ -187,6 +202,7 @@ function decideIssueOwnership(facts: OwnershipFacts): OwnershipOutcome {
   if (facts.issueAssigneeAgentId === facts.runAgentId) return "current_owner";
   if (facts.isNonAssigneeWorkspaceBusyRetry) return "current_owner";
   if (facts.isInteractionWake) return "current_owner";
+  if (facts.isPendingInteractionAddresseeWake) return "current_owner";
   if (facts.isCurrentReviewParticipant) return "current_owner";
   if (facts.isAuthorizedSourceScopedRecovery) return "current_owner";
   return "reassigned";
@@ -510,9 +526,11 @@ export function decideQueuedRunStaleness(
   }
 
   if (facts.isResolvedInteractionContinuation || facts.isConnectionContinuation) {
+    // A todo task that has never started has no parked execution to protect.
+    const startsUnstartedTask = facts.issueStatus === "todo" && facts.isUnstartedTaskQuestionAnswer === true;
     const earlyStatus = decideIssueStatus({
       status: facts.issueStatus,
-      requiresInProgress: facts.issueStatus !== "in_review",
+      requiresInProgress: facts.issueStatus !== "in_review" && !startsUnstartedTask,
       terminalBypass: true,
     });
     if (earlyStatus === "not_in_progress") {
@@ -569,11 +587,21 @@ export function decideQueuedRunStaleness(
     };
   }
 
+  if (facts.addressedQuestionInvalidated && !facts.isInteractionWake) {
+    return {
+      stale: true,
+      errorCode: "issue_interaction_not_pending",
+      reason: "Cancelled because the question this run was admitted to answer is no longer open to it",
+      details: { issueId: facts.issueId },
+    };
+  }
+
   const ownership = decideIssueOwnership({
     runAgentId: facts.runAgentId,
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
     isInteractionWake: facts.isInteractionWake,
+    isPendingInteractionAddresseeWake: facts.isPendingInteractionAddresseeWake === true,
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.participantIsAgent &&
@@ -669,7 +697,7 @@ export function decideQueuedRunStaleness(
   const participantOutcome = decideReviewParticipant({
     ...facts.reviewParticipant,
     runAgentId: facts.runAgentId,
-    bypass: facts.wakeCommentIdPresent,
+    bypass: facts.wakeCommentIdPresent || facts.isInteractionWake || facts.isPendingInteractionAddresseeWake === true,
   });
   if (participantOutcome === "participant_changed") {
     return {
