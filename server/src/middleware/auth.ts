@@ -24,7 +24,7 @@ import {
 } from "../services/issue-prefix.js";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
-import { loadAgentRunAuthentication } from "./agent-run-authentication.js";
+import { agentRunAuthenticationRevoked, loadAgentRunAuthentication } from "./agent-run-authentication.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
@@ -402,6 +402,13 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         companyId: claims.company_id,
         agentId: claims.sub,
       });
+      // A run-bound JWT carries the run's authority, so it ends when the run
+      // is gone or finished beyond the grace, on every method.
+      const runRevocation = agentRunAuthenticationRevoked(identityRun);
+      if (runRevocation) {
+        _res.status(401).json(runRevocation);
+        return;
+      }
       if (agentRunWritesRevoked(identityRun)
         && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
         const conversation = identityRun?.contextSnapshot?.conversationMode === true;
