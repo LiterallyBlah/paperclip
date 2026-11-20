@@ -12,11 +12,12 @@ import { isInterruptedNativePreparationCandidate } from "./cancelled-native-star
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, exists, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, desc, eq, exists, inArray, isNull, not, or, sql } from "drizzle-orm";
 import {
   chatActions,
   environmentLeases,
   heartbeatRuns,
+  issueExecutionDecisions,
   issueRecoveryActions,
   issues,
   nativeRunFinalizations,
@@ -28,12 +29,52 @@ import {
   EXECUTION_RECONCILIATION_CAUSES,
   type ExecutionReconciliation,
 } from "@paperclipai/shared";
-import { parseIssueExecutionState } from "./issue-execution-policy.js";
+import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { alias } from "drizzle-orm/pg-core";
+
+/**
+ * BLA-2425 "approved advance": the stopped source run belongs to the reviewer
+ * whose approval completed an earlier stage, and the policy has since moved
+ * to a pending stage whose agent participant is also the assignee and the
+ * requested continuation agent. The approving reviewer's no-replay hold then
+ * belongs to that next participant's native continuation. Every element is
+ * read from durable state: the decision row named by `lastDecisionId` must be
+ * the task's latest decision, an approval by the run's agent on a completed
+ * stage that precedes the current one.
+ */
+export async function isApprovedStageAdvanceSource(db: Db, input: {
+  companyId: string;
+  task: Pick<typeof issues.$inferSelect, "id" | "status" | "assigneeAgentId" | "executionPolicy" | "executionState">;
+  run: Pick<typeof heartbeatRuns.$inferSelect, "agentId">;
+  agentId: string | null;
+  recoveryAction: Pick<typeof issueRecoveryActions.$inferSelect, "evidence"> | null | undefined;
+}): Promise<boolean> {
+  const { task, run, agentId } = input;
+  if (!agentId || task.status !== "in_review" || agentId === run.agentId || task.assigneeAgentId !== agentId) return false;
+  if (input.recoveryAction?.evidence?.reviewParticipantAgentId !== run.agentId) return false;
+  const state = parseIssueExecutionState(task.executionState);
+  if (state?.status !== "pending" || state.lastDecisionOutcome !== "approved" || !state.lastDecisionId ||
+      !state.currentStageId || state.currentParticipant?.type !== "agent" ||
+      state.currentParticipant.agentId !== agentId || state.completedStageIds.includes(state.currentStageId)) return false;
+  const policy = normalizeIssueExecutionPolicy(task.executionPolicy ?? null);
+  const currentIndex = policy?.stages.findIndex((stage) => stage.id === state.currentStageId) ?? -1;
+  if (!policy || currentIndex < 0 || state.currentStageIndex !== currentIndex ||
+      policy.stages[currentIndex]!.type !== state.currentStageType) return false;
+  const [latest] = await db.select().from(issueExecutionDecisions).where(and(
+    eq(issueExecutionDecisions.companyId, input.companyId),
+    eq(issueExecutionDecisions.issueId, task.id),
+  )).orderBy(desc(issueExecutionDecisions.createdAt), desc(issueExecutionDecisions.id)).limit(1);
+  if (!latest || latest.id !== state.lastDecisionId || latest.outcome !== "approved" ||
+      latest.actorAgentId !== run.agentId || latest.actorUserId) return false;
+  const decidedIndex = policy.stages.findIndex((stage) => stage.id === latest.stageId);
+  return decidedIndex >= 0 && decidedIndex < currentIndex &&
+    policy.stages[decidedIndex]!.type === latest.stageType &&
+    state.completedStageIds.includes(latest.stageId);
+}
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 /**
@@ -66,6 +107,8 @@ export async function validateExecutionReconciliation(input: {
   recoveryAction?: Pick<typeof issueRecoveryActions.$inferSelect, "evidence"> | null;
   /** Out-parameter: the agent the continuation must wake, when it is not the action's return owner. */
   admission?: { continuationAgentId?: string };
+  /** Stopped-stage recovery only: also admit the verified approved-advance source (BLA-2425). */
+  admitApprovedAdvance?: boolean;
 }) {
   const { db, companyId, issueId, agentId, decision } = input;
   if (!decision || decision.runId !== input.sourceRunId || (!agentId && !input.workspaceRepairOnly)) {
@@ -109,6 +152,8 @@ export async function validateExecutionReconciliation(input: {
     agentId !== run.agentId &&
     !["done", "cancelled"].includes(task.status),
   );
+  const isApprovedAdvance = Boolean(input.admitApprovedAdvance && run && task &&
+    await isApprovedStageAdvanceSource(db, { companyId, task, run, agentId, recoveryAction: input.recoveryAction }));
   const retainedWorkspace = hasRequiredWorkspaceRecovery(run?.resultJson);
   const repairOnly = input.workspaceRepairOnly === true && retainedWorkspace;
   const terminalRepairSource = ["failed", "interrupted", "timed_out", "cancelled"].includes(run?.status ?? "") ||
@@ -117,7 +162,7 @@ export async function validateExecutionReconciliation(input: {
     (input.workspaceRepairOnly && !retainedWorkspace) ||
     !run ||
     !task ||
-    (!repairOnly && (task.assigneeAgentId !== agentId || (run.agentId !== agentId && !isCurrentReviewer && !isReviewerHandBack))) ||
+    (!repairOnly && (task.assigneeAgentId !== agentId || (run.agentId !== agentId && !isCurrentReviewer && !isReviewerHandBack && !isApprovedAdvance))) ||
     (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== issueId ||
     !terminalRepairSource
   ) {
@@ -209,6 +254,25 @@ export async function validateExecutionReconciliation(input: {
   return run;
 }
 
+/**
+ * Delivery owner of a stopped pending stage's recovery: the stage's current
+ * agent participant, woken once per issue, stage and review round.
+ */
+export type PendingStageParticipantDeliveryOwner = {
+  kind: "pending_stage_participant";
+  agentId: string;
+  stageId: string;
+  changesRequestedCount: number;
+  idempotencyKey: string;
+};
+
+export function pendingStageRecoveryWakeKey(
+  issueId: string,
+  stage: { stageId: string; changesRequestedCount: number },
+) {
+  return `stopped-stage-recovery:${issueId}:${stage.stageId}:${stage.changesRequestedCount}`;
+}
+
 /** Durable delivery marker lives on the existing source-scoped recovery action. */
 export async function markExecutionReconciliation(
   db: Db,
@@ -218,13 +282,21 @@ export async function markExecutionReconciliation(
   >,
   decision: ExecutionReconciliation,
   actorId: string,
-  deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
+  deliveryOwner?:
+    | { kind: "chat_failed_run_retry"; actionId: string }
+    | PendingStageParticipantDeliveryOwner,
   options?: { workspaceRepairOnly?: boolean; continuationAgentId?: string },
 ) {
   if (options?.workspaceRepairOnly && (deliveryOwner || !hasRequiredWorkspaceRecovery(action.evidence))) {
     throw conflict("Workspace repair must target the retained source without a continuation owner.");
   }
-  if (deliveryOwner) {
+  if (deliveryOwner?.kind === "pending_stage_participant") {
+    // The route delivers this continuation itself through the stage wake.
+    // The generic reconciled-execution worker never delivers "delegated".
+    if (deliveryOwner.idempotencyKey !== pendingStageRecoveryWakeKey(action.sourceIssueId, deliveryOwner)) {
+      throw conflict("The pending stage continuation owner is no longer valid.");
+    }
+  } else if (deliveryOwner) {
     const [retry] = await db
       .select()
       .from(chatActions)

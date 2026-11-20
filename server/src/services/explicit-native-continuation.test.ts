@@ -1428,7 +1428,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
   it.each([
     { parentHold: false, retryNow: false }, { parentHold: true, retryNow: false },
     { parentHold: false, retryNow: true }, { parentHold: true, retryNow: true },
-  ])("resumes saved input after a historical pause suppressed an unclaimed workspace retry (parent hold: $parentHold, retry now: $retryNow)", async ({ parentHold, retryNow }) => {
+  ])("delivers saved input after a historical pause suppressed an unclaimed workspace retry (parent hold: $parentHold, retry now: $retryNow)", async ({ parentHold, retryNow }) => {
     const f = await seedHistoricalPausedWorkspaceRetry(parentHold, retryNow);
     await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
     const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
@@ -1438,13 +1438,22 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
         _paperclipWakeContext: { issueId: f.issueId, wakeCommentId: f.commentId, wakeCommentIds: [f.commentId] } },
     }).returning();
     const heartbeat = heartbeatService(db);
+    // Fork PR #41 (BLA-2551 carry): the gate-cancelled retry provably never
+    // started, so its historical legacy hold is not an execution blocker and
+    // the explicit-continuation resumer leaves the saved input alone. The
+    // deferred-receipt sweep's stranded-queue pass delivers it once instead;
+    // there is no unverified session to discard, so no forced fresh session.
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
     await Promise.all([heartbeat.resumeExecutionWaitComments(), heartbeat.resumeExecutionWaitComments()]);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+    await Promise.all([heartbeat.resumeQueuedRuns(), heartbeat.resumeQueuedRuns()]);
     const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
       eq(heartbeatRuns.status, "queued")));
     expect(successors).toHaveLength(1);
-    expect(successors[0].contextSnapshot).toMatchObject({ forceFreshSession: true, wakeCommentIds: [f.commentId] });
+    expect(successors[0].contextSnapshot).toMatchObject({ issueId: f.issueId, wakeCommentIds: [f.commentId] });
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0])
-      .toMatchObject({ status: "coalesced", runId: successors[0].id });
+      .toMatchObject({ runId: successors[0].id });
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId)))[0])
       .toMatchObject({ status: "cancelled", startedAt: null, errorCode: "issue_paused", resultJson: null });
   });
