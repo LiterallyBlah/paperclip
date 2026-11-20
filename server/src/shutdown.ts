@@ -367,3 +367,20 @@ export async function finishServiceShutdown(
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) throw new AggregateError(failures, "Service shutdown failed");
 }
+
+/** How long a planned shutdown lets this process's running runs finish on
+ * their own before it interrupts them. Admission is already stopped, so the
+ * window only shortens; it never admits work. Bounded well inside a typical
+ * service-manager stop timeout; set 0 to interrupt at once. */
+export const DEFAULT_SHUTDOWN_RUN_COMPLETION_GRACE_MS = 10_000;
+const MAX_SHUTDOWN_RUN_COMPLETION_GRACE_MS = 60_000;
+
+export function resolveShutdownRunCompletionGraceMs(
+  env: Record<string, string | undefined>,
+): number {
+  const raw = env.PAPERCLIP_SHUTDOWN_RUN_GRACE_MS?.trim();
+  if (!raw) return DEFAULT_SHUTDOWN_RUN_COMPLETION_GRACE_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_SHUTDOWN_RUN_COMPLETION_GRACE_MS;
+  return Math.min(Math.floor(parsed), MAX_SHUTDOWN_RUN_COMPLETION_GRACE_MS);
+}

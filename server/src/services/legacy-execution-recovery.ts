@@ -16,7 +16,7 @@ import { RUNNER_REVISION_MISMATCH_CODE } from "./runner-revision-mismatch.js";
 import { isPreAdmissionLostRunVerified } from "./pre-admission-lost-run.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
-import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
+import { claimedAdapterType, hasConversationContinuationPolicy, historicalAdapterType } from "./conversation-continuation.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, getTableColumns, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
@@ -138,6 +138,24 @@ const GATEWAY_RETRY_REPEATABLE_ACTIONS = [
  * or a workspace that still needs restoring, keeps today's reconciliation. */
 async function isEffectFreeGatewayTransientFailure(db: Db, run: Run): Promise<boolean> {
   if (run.runtimeMode === "native" || run.status !== "failed" || !isHermesGatewayTransientBadRequest(run)) return false;
+  return hasNoRecordedGatewayRunEffects(db, run);
+}
+
+export const HERMES_GATEWAY_ADAPTER_TYPE = "hermes_gateway";
+
+/** A planned shutdown interrupted a gateway turn and the gateway confirmed the
+ * stop. A fresh attempt is safe only when Paperclip holds no record that the
+ * stopped turn changed anything, and only once per continuation chain. An
+ * unconfirmed stop or any recorded effect keeps today's reconciliation. */
+async function isEffectFreeShutdownInterruptedGatewayRun(db: Db, run: Run): Promise<boolean> {
+  if (run.runtimeMode === "native" || run.status !== "interrupted" || run.errorCode !== "server_shutdown_interrupted") return false;
+  if ((run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged") return false;
+  if (executionFailureRetryCount(run) >= 1) return false;
+  if (await historicalAdapterType(db, run) !== HERMES_GATEWAY_ADAPTER_TYPE) return false;
+  return hasNoRecordedGatewayRunEffects(db, run);
+}
+
+async function hasNoRecordedGatewayRunEffects(db: Db, run: Run): Promise<boolean> {
   if (run.resultJson?.workspaceRestoreFailure || hasRequiredWorkspaceRecovery(run.resultJson)) return false;
   const [comment] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, run.companyId),
@@ -159,7 +177,8 @@ export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run
       && !(await isPreDispatchExecutionWaitVerified(db, run))
       && !(await isEffectFreeGatewayTransientFailure(db, run))
       // An exact retained `required` admission proves the adapter was never entered.
-      && !(await isPreAdmissionLostRunVerified(db, run)));
+      && !(await isPreAdmissionLostRunVerified(db, run))
+      && !(await isEffectFreeShutdownInterruptedGatewayRun(db, run)));
 }
 
 /** Persist the failed legacy run, owned lock release and operator decision together. */
@@ -381,6 +400,41 @@ export async function terminalizeLegacyExecution(input: {
       });
     }
     return updated;
+  });
+}
+
+/** A planned shutdown writes the interrupted status before the gateway
+ * adapter returns its stop evidence, so that write holds the run for
+ * reconciliation. Once a confirmed stop with no recorded effect is on the row,
+ * retire only that run's own unreconciled hold; any effect keeps it. */
+export async function settleShutdownStoppedGatewayRun(db: Db, input: { run: Run }): Promise<boolean> {
+  const issueId = input.run.contextSnapshot?.issueId;
+  if (typeof issueId !== "string") return false;
+  return db.transaction(async tx => {
+    const [task] = await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("update");
+    const [run] = await tx.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId))).for("update");
+    if (!task || !run || run.contextSnapshot?.issueId !== task.id) return false;
+    if (!await isEffectFreeShutdownInterruptedGatewayRun(tx as unknown as Db, run)) return false;
+    const now = new Date();
+    const resolved = await tx.update(issueRecoveryActions).set({ status: "resolved", outcome: "false_positive",
+      resolutionNote: "The gateway confirmed the stop of the interrupted turn and the run recorded no effect.",
+      resolvedAt: now, updatedAt: now,
+      evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({ automaticRecovery: {
+        policy: "confirmed_gateway_stop_v1", runId: run.id, replay: "allowed", recordedAt: now.toISOString() } })}::jsonb`,
+    }).where(and(
+      eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, task.id),
+      eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE), eq(issueRecoveryActions.fingerprint, `legacy-execution:${run.id}`),
+      inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+      sql`not (${issueRecoveryActions.evidence} ? 'executionReconciliation')`,
+    )).returning({ id: issueRecoveryActions.id });
+    if (resolved.length) await logActivity(tx as unknown as Db, { companyId: run.companyId, actorType: "system", actorId: "system",
+      action: "issue.recovery_action_resolved", entityType: "issue", entityId: task.id, agentId: run.agentId, runId: run.id,
+      details: { reason: "gateway_stop_confirmed_without_effects", recoveryActionIds: resolved.map(r => r.id) },
+    });
+    return true;
   });
 }
 

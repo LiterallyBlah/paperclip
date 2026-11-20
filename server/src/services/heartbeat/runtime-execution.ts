@@ -51,7 +51,7 @@ import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { isConversation } from "../agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
 import { remoteExecutionHasStopped } from "../remote-execution-termination.js";
-import { registerAdapterExecutionControl } from "../adapter-execution-control.js";
+import { readAdapterCancellationOutcome, registerAdapterExecutionControl } from "../adapter-execution-control.js";
 import { resolveManagedOpenAiBilling } from "@paperclipai/adapter-utils";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { heartbeatRuns, nativeRunFinalizations, workspaceOperations } from "@paperclipai/db";
@@ -946,6 +946,9 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       adapterResult = await guardedDispatch.resultPromise;
     }
     adapterResult = identityRedactor.redact(adapterResult);
+    if (executionControl.controller.signal.aborted) {
+      executionControl.cancellationOutcome = readAdapterCancellationOutcome(adapterResult);
+    }
     if (run.runtimeMode === "legacy" && hasWorkspaceRestoreFailure(adapterResult.resultJson)
         && executionTarget?.kind === "remote" && executionTarget.transport === "sandbox") {
       const requiredWorkspaceRestoreEvidence = {
