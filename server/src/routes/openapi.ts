@@ -7412,6 +7412,26 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/instance/maintenance-redispatch",
+  tags: ["instance"],
+  summary:
+    "Read-only affected-run manifest for one task drain (default: the latest): each run or stage wake the window ended, the re-dispatch decision and any dispatched wake",
+  request: { query: z.object({ operationId: z.string().uuid().optional() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/instance/maintenance-redispatch",
+  tags: ["instance"],
+  summary:
+    "Apply the maintenance re-dispatch for an ended task drain: wake each eligible task or review participant at most once per operation",
+  request: { body: jsonBody(z.object({ operationId: z.string().uuid().optional() })) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/instance/lifecycle",
   tags: ["instance"],
   summary:
