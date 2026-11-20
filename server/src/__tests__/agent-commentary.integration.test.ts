@@ -128,7 +128,7 @@ describe("internal agent commentary through both transports", () => {
   it.each(["cancelled", "succeeded", "failed"])("rejects submissions and replay after the run is %s", async (status) => {
     const f = await legacy();
     expect((await post(f, { ...input, kind: "complaint" })).status).toBe(201);
-    await server.db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, f.runId));
+    await server.db.update(heartbeatRuns).set({ status, finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
     expect((await post(f, { ...input, kind: "complaint" })).status).toBe(403);
     expect(await rows(f)).toHaveLength(1);
   });

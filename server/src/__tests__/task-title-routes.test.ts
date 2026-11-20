@@ -245,7 +245,7 @@ describe("task titles", () => {
     expect([403, 404]).toContain((await request(f, `/issues/${foreign.id}/title`, "PUT", { title: "Wrong" })).status);
     expect((await request(f, `/issues/${f.issueId}/title`, "PUT", { title: "Wrong", status: "done" })).status).toBe(400);
     await expect(rename(f, { title: "  " })).rejects.toThrow();
-    await server.db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
+    await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
     await expect(rename(f)).rejects.toThrow(/authorized/);
     expect((await request(f, `/issues/${f.issueId}/title`, "PUT", { title: "Stale" })).status).toBe(403);
     expect(await issueService(server.db).getById(f.issueId)).toMatchObject({ title: "Please investigate", titleNeedsGeneration: true });
