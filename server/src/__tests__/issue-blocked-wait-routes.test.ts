@@ -257,6 +257,17 @@ describeEmbeddedPostgres("blocked status requires a real wait", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(200);
     });
 
+    it("keeps the dependency path: a blocked task may keep a link whose blocker already finished", async () => {
+      const { app, insertIssue, link } = await seed();
+      const blockedId = await insertIssue({ status: "blocked" });
+      const doneBlockerId = await insertIssue({ status: "done" });
+      await link(doneBlockerId, blockedId);
+
+      const res = await request(app).patch(`/api/issues/${blockedId}`).send({ blockedByIssueIds: [doneBlockerId] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
+
     it("accepts dropping blocker links while a descriptor still names the unblock owner", async () => {
       const { app, insertIssue, link } = await seed();
       const blockedId = await insertIssue({
