@@ -64,6 +64,7 @@ describe("standing event inbox marker", () => {
     expect(isStandingEventInboxQuietRun({ status: "succeeded" })).toBe(true);
     expect(isStandingEventInboxQuietRun({ status: "cancelled", errorCode: "issue_continuation_waiting_on_review" })).toBe(true);
     expect(isStandingEventInboxQuietRun({ status: "cancelled", errorCode: "legacy_disposition_repair_suppressed" })).toBe(true);
+    expect(isStandingEventInboxQuietRun({ status: "cancelled", errorCode: "issue_disposition_repair_superseded" })).toBe(true);
     for (const failed of [
       { status: "failed", errorCode: "adapter_failed" },
       { status: "timed_out", errorCode: "timeout" },

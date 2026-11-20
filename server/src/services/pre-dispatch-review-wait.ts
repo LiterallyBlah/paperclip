@@ -1,9 +1,9 @@
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
-import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { activityLog, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { executionStartedEventPredicate, noRetainedExecutionPredicate } from "./pre-dispatch-execution-evidence.js";
-import type { QueuedRunStalenessErrorCode } from "../modules/run-dispatch/index.js";
+import type { QueuedRunStalenessErrorCode, ScheduledRetryGateErrorCode } from "../modules/run-dispatch/index.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type DispatchFields = "startedAt" | "runtimeModeResolvedAt" | "processPid" | "processGroupId" |
@@ -26,10 +26,45 @@ const staleDispatchReconciliationExemptions = {
   // This code requires its own executionWait receipt in pre-dispatch-execution-wait.ts.
   execution_reconciliation_required: false,
 } satisfies Record<QueuedRunStalenessErrorCode, boolean>;
-const staleDispatchErrorCodes = Object.entries(staleDispatchReconciliationExemptions)
-  .filter(([, exempt]) => exempt).map(([errorCode]) => errorCode);
+/** The scheduled-retry gate cancels a `scheduled_retry` row before it is ever
+ * promoted or claimed, so none of these codes describes provider work. Every
+ * gate code is classified here; a new code must be classified explicitly. */
+const scheduledRetryGateReconciliationExemptions = {
+  agent_not_invokable: true,
+  heartbeat_wake_on_demand_disabled: true,
+  budget_blocked: true,
+  issue_not_found: true,
+  issue_reassigned: true,
+  issue_cancelled: true,
+  issue_terminal_status: true,
+  issue_not_in_progress: true,
+  issue_execution_lock_changed: true,
+  issue_blocked: true,
+  issue_review_participant_changed: true,
+  issue_paused: true,
+  issue_dependencies_blocked: true,
+  issue_disposition_repair_superseded: true,
+  issue_waiting_for_response: true,
+} satisfies Record<ScheduledRetryGateErrorCode, boolean>;
+const staleDispatchErrorCodes = [...new Set([
+  ...Object.entries(staleDispatchReconciliationExemptions),
+  ...Object.entries(scheduledRetryGateReconciliationExemptions),
+].filter(([, exempt]) => exempt).map(([errorCode]) => errorCode))];
 
-/** A dispatch cancellation is not an interrupted provider attempt. Historical
+/** A run that never started cannot have written a comment or recorded an agent
+ * action. If one exists, its outcome is unverified and the hold stays. */
+function noRecordedRunEffectsPredicate() {
+  return and(
+    sql`not exists (select 1 from ${issueComments}
+      where ${issueComments.companyId} = ${heartbeatRuns.companyId}
+        and (${issueComments.createdByRunId} = ${heartbeatRuns.id} or ${issueComments.derivedCreatedByRunId} = ${heartbeatRuns.id}))`,
+    sql`not exists (select 1 from ${activityLog}
+      where ${activityLog.companyId} = ${heartbeatRuns.companyId}
+        and ${activityLog.runId} = ${heartbeatRuns.id} and ${activityLog.actorType} = 'agent')`,
+  );
+}
+
+/** A dispatch or scheduled-retry gate cancellation is not an interrupted provider attempt. Historical
  * rows need no new receipt, but every retained execution reference must agree. */
 export function neverStartedDispatchCancellationPredicate() {
   return and(
@@ -37,6 +72,7 @@ export function neverStartedDispatchCancellationPredicate() {
     inArray(heartbeatRuns.errorCode, staleDispatchErrorCodes),
     isNotNull(heartbeatRuns.finishedAt),
     noRetainedExecutionPredicate(),
+    noRecordedRunEffectsPredicate(),
   );
 }
 
