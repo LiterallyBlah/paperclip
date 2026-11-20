@@ -14670,17 +14670,23 @@ export function issueRoutes(
       // A task that stays blocked can lose its last real wait through a later
       // edit: an emptied blocker list or a cleared unblock descriptor. That
       // leaves a narrative-only block nothing will ever wake, so it takes the
-      // same check as entering blocked.
+      // same check as entering blocked. A kept blocker link stays a wait even
+      // when its blockers are finished: the dependency-ready wake owns it.
       const droppingBlockedWait =
         existing.status === "blocked" &&
         nextStatus === "blocked" &&
-        (Array.isArray(req.body.blockedByIssueIds) ||
+        ((Array.isArray(req.body.blockedByIssueIds) &&
+          req.body.blockedByIssueIds.length === 0) ||
           (req.body.unblockDescriptor === null && existing.unblockDescriptor != null));
       if (enteringBlocked || droppingBlockedWait) {
         const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
           ? [...new Set(req.body.blockedByIssueIds as string[])]
           : null;
-        const hasUnresolvedBlocker = requestedBlockerIds
+        const hasUnresolvedBlocker = !enteringBlocked
+          ? requestedBlockerIds
+            ? requestedBlockerIds.length > 0
+            : (await svc.getDependencyReadiness(existing.id)).blockerIssueIds.length > 0
+          : requestedBlockerIds
           ? requestedBlockerIds.length > 0 &&
             (await db
               .select({ id: issueRows.id })
