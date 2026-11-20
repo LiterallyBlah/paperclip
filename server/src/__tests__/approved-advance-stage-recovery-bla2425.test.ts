@@ -317,7 +317,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   it("refuses while the source run holds a live environment lease", async () => {
     const f = await seed();
     await db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.sourceRunId,
-      agentId: f.reviewerAId, provider: "local", status: "active", leasePolicy: "ephemeral" });
+      provider: "local", status: "active", leasePolicy: "ephemeral" });
     await expectRefused(f, "stage_recovery_source_unverified");
   });
 
