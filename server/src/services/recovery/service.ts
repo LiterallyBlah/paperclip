@@ -2621,7 +2621,10 @@ export function recoveryService(
       issue: input.issue,
       latestRun: input.latestRun,
     });
-    const isProviderQuotaWait = recoveryCause === "provider_quota";
+    // Only a quota wait with a return owner is owned by the system monitor.
+    // Without one, nobody resumes it automatically: the board owns it, as its
+    // notice ("Board decision required") and recovery event both say.
+    const isProviderQuotaWait = recoveryCause === "provider_quota" && Boolean(routing.returnOwnerAgentId);
     const now = new Date();
     const actions = database === db ? recoveryActionsSvc : issueRecoveryActionService(database);
     const action = await actions.upsertSourceScoped({
@@ -2665,7 +2668,9 @@ export function recoveryService(
           : recoveryCause === "process_lost"
             ? "Board operator: inspect the retry history, then explicitly retry the original owner, reassign, or intentionally resolve the task."
             : recoveryCause === "provider_quota"
-              ? "Wait for provider quota recovery, then retry the original assignee; do not wake a takeover owner."
+              ? isProviderQuotaWait
+                ? "Wait for provider quota recovery, then retry the original assignee; do not wake a takeover owner."
+                : "Board operator: provider quota is exhausted and no original assignee can be retried. Choose an owner, then retry or reassign."
               : recoveryCause === "codex_output_inactivity_monitor"
                 ? "Board operator: inspect the inactivity evidence, then explicitly retry the original owner, reassign, or intentionally resolve the task."
                 : recoveryCause === "workspace_validation_failed"

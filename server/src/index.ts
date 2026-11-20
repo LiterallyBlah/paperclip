@@ -94,6 +94,7 @@ import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./se
 import { deliverPendingPauseResumes } from "./services/issue-tree-resume.js";
 import { deliverBudgetResumeContinuations, type BudgetResumeDelivery } from "./services/budget-resume-continuation.js";
 import { invalidateNativeReplacementDiscovery, reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
+import { reconcileTerminalSourceHolds } from "./services/terminal-hold-reconciliation.js";
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { acknowledgeNativeStartupCleanup } from "./services/native-runtime/native-startup-cleanup.js";
 import { executionControlSchedule, registerExecutionControlWork } from "./services/execution-control-work.js";
@@ -1397,7 +1398,11 @@ async function startServerWithDatabaseTeardown(
       },
     }), next: executionSchedule.finalization },
     { queue: DELIVERY_QUEUES.executionStatus, run: () => deliverExecutionStatuses(db), next: executionSchedule.status },
-    { queue: DELIVERY_QUEUES.executionDisposition, run: () => settleUnrecoverableExecutions(db), next: executionSchedule.disposition },
+    { queue: DELIVERY_QUEUES.executionDisposition, run: async () => {
+      // Settle verdict-only holds first, so an applied hand-back never waits for a manual reconcile.
+      await reconcileTerminalSourceHolds(db, heartbeat?.wakeup ?? null);
+      await settleUnrecoverableExecutions(db);
+    }, next: executionSchedule.disposition },
     ...(heartbeat ? [
       { queue: DELIVERY_QUEUES.executionReplacement, run: () => reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run) }), next: executionSchedule.replacement, onSettled: () => invalidateNativeReplacementDiscovery(db), settleEmptyWhilePaused: true },
       { queue: DELIVERY_QUEUES.executionContinuation, run: async () => {
