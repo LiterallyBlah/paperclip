@@ -5,6 +5,7 @@ import { type DeliveryQueue } from "./delivery-work-notifications.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./execution-control-deadline.js";
 import { obsoleteExecutionConversationHold, unresolvedExecutionDispositions } from "./execution-recovery-resolution.js";
 import { nativeReplacementPending } from "./native-runtime/native-safe-replacement.js";
+import { nextTerminalHoldReviewAt } from "./terminal-hold-reconciliation.js";
 
 export function registerExecutionControlWork(
   coordinator: ReturnType<typeof createDeliveryWorkCoordinator>,
@@ -86,7 +87,9 @@ export function executionControlSchedule(db: Db) {
         db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(obsoleteExecutionConversationHold()).limit(1),
         unresolvedExecutionDispositions(db, 1),
       ]);
-      return conversation.length || execution.length ? retry() : null;
+      if (conversation.length || execution.length) return retry();
+      // Verdict-only holds kept for now are checked again when due.
+      return deadline([await nextTerminalHoldReviewAt(db)]);
     },
     async localLogin() {
       const rows = await db.select({ at: adapterAuthSessions.expiresAt }).from(adapterAuthSessions).where(and(
