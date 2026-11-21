@@ -156,6 +156,21 @@ const support = await getEmbeddedPostgresTestSupport();
         revision: latest.updatedAt.toISOString(),
       });
     });
+    it("adds a recent window only for adapters that opt in, keeping full messages", async () => {
+      const full = await build();
+      expect(full.recentWindow).toBeUndefined();
+      const windowed = await buildExecutionContinuation({
+        db, companyId, issueId, agentId,
+        context: { interactionId, wakeReason: "connection_intent.resolved" },
+        summary: "Notion read completed.",
+        exposeLowTrustRaw: false,
+        historyMode: "recent_window",
+      });
+      const { recentWindow, ...rest } = windowed;
+      expect(rest).toEqual(full);
+      expect(recentWindow?.messages.map(m => m.id)).toEqual(full.messages.map(m => m.id));
+      expect(recentWindow).toMatchObject({ omittedCount: 0, truncatedCount: 0, throughCommentId: full.coverage.throughCommentId });
+    });
     it("loads authenticated human answers from stored resolver identity", async () => {
       const answerId = randomUUID();
       await db.insert(issueThreadInteractions).values({ id: answerId, companyId, issueId,

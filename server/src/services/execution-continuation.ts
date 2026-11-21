@@ -17,6 +17,11 @@ import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
 import { isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { githubRecoveryReceipts } from "./chat-channels/github/recovery-receipts.js";
+import {
+  MAX_INLINE_WAKE_COMMENTS,
+  MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
+  MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS,
+} from "./wake-inline-limits.js";
 
 export class StaleExecutionContinuationError extends Error {
   constructor(readonly code: "continuation_task_ownership_changed") {
@@ -72,8 +77,74 @@ export function deliveredContinuationCommentIds(context: unknown): {
     }
   };
   collect(wake.comments);
-  collect(continuation.messages);
+  // A recent window is what a fresh provider session received; a resumed
+  // session also received its delta. Neither proves delivery of omitted history.
+  const recentWindow = object(continuation.recentWindow);
+  if (Array.isArray(recentWindow.messages)) {
+    collect(recentWindow.messages);
+    collect(object(continuation.resumeDelta).messages);
+  } else collect(continuation.messages);
   return { known, ids };
+}
+
+export type ContinuationHistoryMode = "full" | "recent_window";
+
+/**
+ * Adapters whose fresh sessions receive a bounded recent window instead of the
+ * whole task thread. hermes_gateway runs a new remote session on every wake by
+ * default, so the full thread was re-sent on every model request (BLA-3272).
+ */
+const RECENT_WINDOW_ADAPTER_TYPES: ReadonlySet<string> = new Set(["hermes_gateway"]);
+
+export function continuationHistoryModeForAdapter(adapterType: string | null | undefined): ContinuationHistoryMode {
+  return adapterType && RECENT_WINDOW_ADAPTER_TYPES.has(adapterType) ? "recent_window" : "full";
+}
+
+type ContinuationMessage = ExecutionContinuationEnvelope["messages"][number];
+
+const isHumanDirection = (message: ContinuationMessage) =>
+  message.authorType === "user" && !message.createdByRunId && !message.deleted && message.body.trim().length > 0;
+
+/**
+ * Select the newest messages plus origin/wake comments and unanswered human
+ * direction, capped per body and in total. Priority decides who gets the body
+ * budget (origins, then unanswered human messages newest first, then the
+ * newest messages); the window itself stays in thread order.
+ */
+export function buildRecentContinuationWindow(
+  messages: ContinuationMessage[],
+  input: { originCommentIds: string[]; agentId: string },
+): NonNullable<ExecutionContinuationEnvelope["recentWindow"]> {
+  const lastAgentReply = messages.findLastIndex(
+    (message) => message.authorType === "agent" && message.authorId === input.agentId && !message.deleted,
+  );
+  const origins = new Set(input.originCommentIds);
+  const priority = [
+    ...messages.filter((message) => origins.has(message.id)),
+    ...messages.filter((message, index) => index > lastAgentReply && isHumanDirection(message)).reverse(),
+    ...messages.slice(-MAX_INLINE_WAKE_COMMENTS).reverse(),
+  ];
+  const selected = new Map<string, ContinuationMessage>();
+  let remaining = MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS;
+  for (const message of priority) {
+    if (selected.has(message.id)) continue;
+    const allowed = Math.min(MAX_INLINE_WAKE_COMMENT_BODY_CHARS, remaining);
+    if (message.body.length > 0 && allowed <= 0) continue;
+    const bodyTruncated = message.body.length > allowed;
+    const body = bodyTruncated ? message.body.slice(0, allowed) : message.body;
+    remaining -= body.length;
+    selected.set(message.id, bodyTruncated ? { ...message, body, bodyTruncated } : message);
+  }
+  const window = messages.flatMap((message) => {
+    const entry = selected.get(message.id);
+    return entry ? [entry] : [];
+  });
+  return {
+    messages: window,
+    omittedCount: messages.length - window.length,
+    truncatedCount: window.filter((message) => message.bodyTruncated).length,
+    throughCommentId: messages.at(-1)?.id ?? null,
+  };
 }
 
 /** Keep service/tool results and generated summaries out of human authority. */
@@ -153,6 +224,8 @@ export async function buildExecutionContinuation(input: {
   runId?: string;
   summary: string | null;
   exposeLowTrustRaw: boolean;
+  /** `recent_window` adds a bounded window for fresh sessions; `messages` stays complete. */
+  historyMode?: ContinuationHistoryMode;
 }): Promise<ExecutionContinuationEnvelope> {
   const { db, companyId, issueId } = input;
   const [issue] = await db
@@ -247,7 +320,7 @@ export async function buildExecutionContinuation(input: {
   // Missing source rows cannot silently become a claim of complete context.
   if (originCommentIds.some((id) => !rows.some((row) => row.id === id)))
     throw new Error("continuation_source_context_missing");
-  const messages = rows.map((row) => {
+  const messages: ContinuationMessage[] = rows.map((row) => {
     const safe = input.exposeLowTrustRaw
       ? row
       : sanitizeQuarantinedCommentForHigherTrust(row);
@@ -456,6 +529,9 @@ export async function buildExecutionContinuation(input: {
     objective: latestRequest?.body ?? issue.description ?? issue.title,
     objectiveSource,
     messages,
+    ...(input.historyMode === "recent_window"
+      ? { recentWindow: buildRecentContinuationWindow(messages, { originCommentIds, agentId: input.agentId }) }
+      : {}),
     humanResponses: interactions.flatMap(row => {
       const response = projectHumanInteractionResponse(row);
       return response ? [response] : [];

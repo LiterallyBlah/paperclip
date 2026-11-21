@@ -119,6 +119,11 @@ import {
 } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import type { TrustPresetResolution } from "../trust-preset-resolver.js";
+import {
+  MAX_INLINE_WAKE_COMMENTS,
+  MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
+  MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS,
+} from "../wake-inline-limits.js";
 
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
 
@@ -131,13 +136,7 @@ export const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 export const PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY =
   "paperclipExternalChatExecutionBound";
 
-const MAX_INLINE_WAKE_COMMENTS = 8;
-
 const MAX_INLINE_WAKE_ATTACHMENTS = 20;
-
-const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
-
-const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 
 const MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS = 12_000;
 
