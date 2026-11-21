@@ -165,9 +165,19 @@ export const updateRoutineTriggerSchema = z.object({
   timezone: z.string().trim().min(1).optional().nullable(),
   signingMode: z.enum(ROUTINE_TRIGGER_SIGNING_MODES).optional().nullable(),
   replayWindowSec: z.number().int().min(30).max(86_400).optional().nullable(),
+  // Optional optimistic-concurrency guard: when present, the update applies only
+  // if it still equals the routine's latest revision id; otherwise 409.
+  baseRevisionId: z.string().guid().optional().nullable(),
 });
 
 export type UpdateRoutineTrigger = z.infer<typeof updateRoutineTriggerSchema>;
+
+export const restoreRoutineRevisionSchema = z.object({
+  // Optional optimistic-concurrency guard, same contract as updateRoutineTriggerSchema.
+  baseRevisionId: z.string().guid().optional().nullable(),
+});
+
+export type RestoreRoutineRevision = z.infer<typeof restoreRoutineRevisionSchema>;
 
 export const runRoutineSchema = z.object({
   triggerId: z.string().guid().optional().nullable(),
