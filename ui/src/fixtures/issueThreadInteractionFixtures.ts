@@ -815,6 +815,60 @@ export const pendingSecretProposalInteraction = createSecretProposalConfirmation
   id: "interaction-secret-proposal-pending",
 });
 
+const secretBundleProposal: Partial<RequestConfirmationSecretProposalPayload> = {
+  kind: "secret_with_bindings",
+  proposalId: "eeeeeee7-7777-4777-8777-7777777777e7",
+  sourceSecretLabel: "infra/light/training-ssh-ed25519",
+  configPath: "env.TRAINING_SSH_KEY",
+  targetAgentName: "InfraEngineer",
+  justification: "The training host needs this internal deploy key to pull the lab image.",
+  bindings: [
+    {
+      proposalId: "eeeeeee8-8888-4888-8888-8888888888e8",
+      configPath: "env.TRAINING_SSH_KEY",
+      targetAgentId: "ffffffff-6666-4666-8666-6666666666f6",
+      targetAgentName: "InfraEngineer",
+    },
+    {
+      proposalId: "eeeeeee9-9999-4999-8999-9999999999e9",
+      configPath: "env.TRAINING_SSH_KEY",
+      targetAgentId: "ffffffff-7777-4777-8777-7777777777f7",
+      targetAgentName: "LabRunner",
+    },
+  ],
+};
+
+/** One card for a pending secret proposal and all of its bindings; accept is allowed. */
+export const pendingSecretBundleInteraction = createSecretProposalConfirmationInteraction({
+  id: "interaction-secret-bundle-pending",
+  summary: "Create secret infra/light/training-ssh-ed25519 and its 2 bindings",
+  payload: {
+    version: 1,
+    prompt: "Approve the proposed secret and its 2 bindings?",
+    acceptLabel: "Approve secret & bindings",
+  },
+  secretProposal: secretBundleProposal,
+  secretProposalReadiness: { canAccept: true, blockReason: null, approvesSecret: true, bindingCount: 2 },
+});
+
+/** Same card, but the viewer may not approve the secret: accept is disabled before the click. */
+export const blockedSecretBundleInteraction = createSecretProposalConfirmationInteraction({
+  id: "interaction-secret-bundle-blocked",
+  summary: "Create secret infra/light/training-ssh-ed25519 and its 2 bindings",
+  payload: {
+    version: 1,
+    prompt: "Approve the proposed secret and its 2 bindings?",
+    acceptLabel: "Approve secret & bindings",
+  },
+  secretProposal: secretBundleProposal,
+  secretProposalReadiness: {
+    canAccept: false,
+    blockReason: "Company owner or admin access is required to approve the proposed secret infra/light/training-ssh-ed25519",
+    approvesSecret: true,
+    bindingCount: 2,
+  },
+});
+
 // ---------------------------------------------------------------------------
 // Connection-authorization fixtures (PAP-17835). Same interaction kind and the
 // same server-addressed audience as any other confirmation; only the

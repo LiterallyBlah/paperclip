@@ -1407,15 +1407,43 @@ export interface RequestConfirmationToolActionPayload {
   expiresAt: string;
 }
 
+export interface RequestConfirmationSecretProposalBinding {
+  proposalId: string;
+  configPath: string;
+  targetAgentId: string;
+  targetAgentName: string;
+}
+
 export interface RequestConfirmationSecretProposalPayload {
   version: 1;
+  /**
+   * `binding` (default, legacy): the card resolves one binding proposal.
+   * `secret_with_bindings`: the card resolves one pending secret proposal
+   * (`proposalId`) together with every binding listed in `bindings`.
+   */
+  kind?: "binding" | "secret_with_bindings";
   proposalId: string;
   sourceSecretLabel: string;
+  /** First binding's config path; `bindings` lists all of them for bundle cards. */
   configPath: string;
   targetAgentId: string;
   targetAgentName: string;
   justification: string;
   expiresAt: string;
+  bindings?: RequestConfirmationSecretProposalBinding[];
+}
+
+/**
+ * Read-time, viewer-specific accept state for a pending secret-proposal card.
+ * Computed by the server when it lists interactions so the card can disable
+ * accept, with a plain reason, before the human clicks.
+ */
+export interface IssueThreadInteractionSecretProposalReadiness {
+  canAccept: boolean;
+  blockReason: string | null;
+  /** True when accepting also approves a pending secret proposal. */
+  approvesSecret: boolean;
+  bindingCount: number;
 }
 
 /**
@@ -1638,6 +1666,8 @@ export interface IssueThreadInteractionBase extends IssueThreadInteractionActorF
   continuationPolicy: IssueThreadInteractionContinuationPolicy;
   /** Read-time acceptance gate; omitted when no workspace preparation is pending. */
   acceptanceBlocker?: "workspace_sync_pending";
+  /** Read-time accept state for pending secret-proposal cards (viewer-specific). */
+  secretProposalReadiness?: IssueThreadInteractionSecretProposalReadiness;
   /** Deferred to conversation history by a human; never an approval or answer. */
   dismissedAt?: Date | string | null;
   dismissedByUserId?: string | null;

@@ -253,6 +253,166 @@ export function createSecretProposalsService(db: Db) {
     return linked;
   }
 
+  function bundleCardText(secretLabel: string, bindings: Array<{ configPath: string; targetAgentName: string }>) {
+    const list = bindings.map((binding) => `${binding.targetAgentName} as ${binding.configPath}`).join("; ");
+    const noun = bindings.length === 1 ? "binding" : `${bindings.length} bindings`;
+    const clip = (value: string, max: number) => value.length > max ? `${value.slice(0, max - 1)}…` : value;
+    return {
+      summary: clip(`Create secret ${secretLabel} and its ${noun}: ${list}`, 1000),
+      prompt: clip(`Approve the proposed secret ${secretLabel} and its ${noun} (${list})?`, 1000),
+    };
+  }
+
+  /**
+   * One card per pending secret proposal: the first binding that references a
+   * pending secret proposal raises a card anchored to that secret proposal;
+   * later bindings for the same proposal join the same card. Accepting the
+   * card approves the secret and all its bindings in one decision.
+   */
+  async function createOrExtendSecretBundleInteraction(
+    txDb: Db,
+    binding: Proposal,
+    dependency: Proposal,
+  ) {
+    if (!binding.originIssueId || !binding.targetId || !binding.configPath) return binding;
+    const target = await txDb
+      .select({ name: agents.name })
+      .from(agents)
+      .where(and(eq(agents.id, binding.targetId), eq(agents.companyId, binding.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!target) throw notFound("Target agent not found");
+    const entry = {
+      proposalId: binding.id,
+      configPath: binding.configPath,
+      targetAgentId: binding.targetId,
+      targetAgentName: target.name,
+    };
+    const secretLabel = dependency.proposedName ?? "proposed secret";
+    const now = new Date();
+
+    if (dependency.interactionId) {
+      const existing = await txDb
+        .select()
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.id, dependency.interactionId),
+          eq(issueThreadInteractions.companyId, dependency.companyId),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      const existingPayload = asRecord(existing?.payload);
+      const linked = asRecord(existingPayload.secretProposal);
+      if (!existing || existing.status !== "pending" || linked.proposalId !== dependency.id) {
+        throw unprocessable(
+          "The secret proposal's approval card is no longer pending; use secretId once the secret is approved",
+        );
+      }
+      const bindings = [
+        ...(Array.isArray(linked.bindings) ? linked.bindings as typeof entry[] : []),
+        entry,
+      ];
+      const text = bundleCardText(secretLabel, bindings);
+      await txDb
+        .update(issueThreadInteractions)
+        .set({
+          summary: text.summary,
+          payload: {
+            ...existingPayload,
+            prompt: text.prompt,
+            secretProposal: { ...linked, bindings },
+          } as typeof existing.payload,
+          updatedAt: now,
+        })
+        .where(eq(issueThreadInteractions.id, existing.id));
+      const [linkedBinding] = await txDb
+        .update(companySecretProposals)
+        .set({ interactionId: existing.id, updatedAt: now })
+        .where(eq(companySecretProposals.id, binding.id))
+        .returning();
+      await txDb.update(issues).set({ updatedAt: now }).where(eq(issues.id, existing.issueId));
+      return linkedBinding;
+    }
+
+    const text = bundleCardText(secretLabel, [entry]);
+    const expiresAt = dependency.expiresAt.getTime() < binding.expiresAt.getTime()
+      ? dependency.expiresAt
+      : binding.expiresAt;
+    const [interaction] = await txDb
+      .insert(issueThreadInteractions)
+      .values({
+        companyId: binding.companyId,
+        issueId: binding.originIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "governed_action",
+        idempotencyKey: `secret-proposal:${dependency.id}`,
+        sourceRunId: binding.originRunId,
+        title: "Confirm new secret and bindings",
+        summary: text.summary,
+        createdByAgentId: binding.proposedByAgentId,
+        addresseeAgentId: null,
+        payload: {
+          version: 1,
+          prompt: text.prompt,
+          acceptLabel: "Approve secret & bindings",
+          rejectLabel: "Reject",
+          rejectRequiresReason: true,
+          rejectReasonLabel: "Why should this secret and its bindings not be created?",
+          allowDeclineReason: true,
+          supersedeOnUserComment: false,
+          secretProposal: {
+            version: 1,
+            kind: "secret_with_bindings",
+            proposalId: dependency.id,
+            sourceSecretLabel: secretLabel,
+            configPath: entry.configPath,
+            targetAgentId: entry.targetAgentId,
+            targetAgentName: entry.targetAgentName,
+            justification: dependency.justification,
+            expiresAt: expiresAt.toISOString(),
+            bindings: [entry],
+          },
+        },
+      })
+      .returning();
+    await txDb
+      .update(companySecretProposals)
+      .set({ interactionId: interaction.id, updatedAt: now })
+      .where(eq(companySecretProposals.id, dependency.id));
+    const [linkedBinding] = await txDb
+      .update(companySecretProposals)
+      .set({ interactionId: interaction.id, updatedAt: now })
+      .where(eq(companySecretProposals.id, binding.id))
+      .returning();
+    await txDb.update(issues).set({ updatedAt: now }).where(eq(issues.id, binding.originIssueId));
+    await logActivity(txDb, {
+      companyId: binding.companyId,
+      actorType: "agent",
+      actorId: binding.proposedByAgentId,
+      action: "issue.thread_interaction_created",
+      entityType: "issue",
+      entityId: binding.originIssueId,
+      agentId: binding.proposedByAgentId,
+      runId: binding.originRunId,
+      details: {
+        interactionId: interaction.id,
+        interactionKind: "request_confirmation",
+        interactionStatus: "pending",
+        continuationPolicy: "wake_assignee",
+        addresseeAgentId: null,
+        requestedResolverPolicy: "board_only",
+        effectiveResolverPolicy: "board_only",
+        serverOwnedPayload: "secretProposal",
+        secretProposalId: dependency.id,
+      },
+    });
+    return linkedBinding;
+  }
+
   async function reflectProposalLifecycleOnInteraction(
     txDb: Db,
     proposal: Proposal,
@@ -272,7 +432,27 @@ export function createSecretProposalsService(db: Db) {
     if (!current || (current.status !== "pending" && !(outcome === "approved" && current.status === "accepted"))) return;
     const payload = asRecord(current.payload);
     const linked = asRecord(payload.secretProposal);
-    if (linked.proposalId !== proposal.id) return;
+    if (linked.kind === "secret_with_bindings") {
+      // A bundle card resolves only when its secret is rejected/withdrawn/
+      // expired, or once the secret and every bundled binding are approved
+      // (for example when each was approved on Secrets › Proposals).
+      const isAnchor = linked.proposalId === proposal.id;
+      if (!isAnchor && (outcome !== "approved" || proposal.secretProposalId !== linked.proposalId)) return;
+      if (outcome === "approved") {
+        const anchor = isAnchor ? proposal : await getById(proposal.companyId, String(linked.proposalId), txDb);
+        if (!anchor || (anchor.status !== "approved" && anchor.id !== proposal.id)) return;
+        const stillPending = await txDb
+          .select({ id: companySecretProposals.id })
+          .from(companySecretProposals)
+          .where(and(
+            eq(companySecretProposals.companyId, proposal.companyId),
+            eq(companySecretProposals.interactionId, current.id),
+            eq(companySecretProposals.kind, "binding"),
+            eq(companySecretProposals.status, "pending"),
+          ));
+        if (stillPending.length > 0) return;
+      }
+    } else if (linked.proposalId !== proposal.id) return;
 
     const now = new Date();
     const currentResult = asRecord(current.result);
@@ -442,6 +622,7 @@ export function createSecretProposalsService(db: Db) {
     return createWithinQuota(
       { companyId: context.companyId, agentId: run.agentId, runId: run.id, issueId: originIssueId },
       async (txDb) => {
+        let pendingDependency: Proposal | null = null;
         if (input.secretProposalId) {
           const dependency = await txDb.select().from(companySecretProposals).where(and(
             eq(companySecretProposals.id, input.secretProposalId),
@@ -454,6 +635,7 @@ export function createSecretProposalsService(db: Db) {
             );
           }
           sourceSecretLabel = dependency.proposedName;
+          pendingDependency = dependency;
         }
         const proposal = await txDb.insert(companySecretProposals).values({
           companyId: context.companyId,
@@ -474,6 +656,7 @@ export function createSecretProposalsService(db: Db) {
         }).returning().then((rows) => rows[0]);
         await recordCreated(proposal, txDb);
         if (!sourceSecretLabel) throw conflict("Binding proposal source secret label is unavailable");
+        if (pendingDependency) return createOrExtendSecretBundleInteraction(txDb, proposal, pendingDependency);
         return createBindingInteraction(txDb, proposal, sourceSecretLabel);
       },
     );
@@ -782,6 +965,200 @@ export function createSecretProposalsService(db: Db) {
     });
   }
 
+  type CardApprovalPlan = {
+    anchor: Proposal | null;
+    /** Pending secret proposal that accepting the card also approves. */
+    secret: Proposal | null;
+    /** Pending binding proposals that accepting the card approves. */
+    bindings: Proposal[];
+    /** Approved secret id the bindings use when no pending secret is involved. */
+    approvedSecretId: string | null;
+    targetAgentNames: Map<string, string>;
+    blockReason: string | null;
+  };
+
+  /**
+   * Works out what accepting a secret-proposal card would approve, and why it
+   * cannot, from proposal state alone. Callers add viewer permission checks.
+   */
+  async function planCardApproval(
+    companyId: string,
+    interactionId: string,
+    proposalId: string,
+    dbClient: Db = db,
+    lockForUpdate = false,
+  ): Promise<CardApprovalPlan> {
+    const plan: CardApprovalPlan = {
+      anchor: null,
+      secret: null,
+      bindings: [],
+      approvedSecretId: null,
+      targetAgentNames: new Map(),
+      blockReason: null,
+    };
+    const block = (reason: string) => ({ ...plan, blockReason: reason });
+    const statusWord = (status: string) => status === "withdrawn" ? "withdrawn by the agent" : status;
+    const proposerIsCompanyAgent = async (proposal: Proposal) => {
+      const proposer = await dbClient.select({ id: agents.id }).from(agents).where(and(
+        eq(agents.id, proposal.proposedByAgentId),
+        eq(agents.companyId, companyId),
+      )).then((rows) => rows[0] ?? null);
+      return Boolean(proposer);
+    };
+
+    // Bundle cards anchor on the secret proposal; lock its bindings before the
+    // secret so the order matches binding approval (binding -> secret).
+    const peek = await getById(companyId, proposalId, dbClient);
+    if (!peek) return block("This secret proposal does not belong to this company");
+    if (peek.interactionId !== interactionId) return block("This card is no longer linked to its secret proposal");
+    if (peek.kind === "secret") {
+      const bindingQuery = dbClient.select().from(companySecretProposals).where(and(
+        eq(companySecretProposals.companyId, companyId),
+        eq(companySecretProposals.kind, "binding"),
+        eq(companySecretProposals.secretProposalId, peek.id),
+        eq(companySecretProposals.interactionId, interactionId),
+        eq(companySecretProposals.status, "pending"),
+      )).orderBy(companySecretProposals.id);
+      plan.bindings = lockForUpdate ? await bindingQuery.for("update") : await bindingQuery;
+    }
+    const anchor = lockForUpdate ? await getById(companyId, proposalId, dbClient, true) : peek;
+    if (!anchor) return block("This secret proposal does not belong to this company");
+    plan.anchor = anchor;
+    if (!(await proposerIsCompanyAgent(anchor))) {
+      return block("This proposal was not made by an agent of this company, so it cannot be approved from this card");
+    }
+
+    if (anchor.kind === "secret") {
+      if (anchor.status === "pending") {
+        if (anchor.expiresAt.getTime() <= Date.now()) return block(`The secret proposal ${anchor.proposedName} has expired`);
+        plan.secret = anchor;
+      } else if (anchor.status === "approved" && anchor.createdSecretId) {
+        plan.approvedSecretId = anchor.createdSecretId;
+      } else {
+        return block(`The secret proposal ${anchor.proposedName} was ${statusWord(anchor.status)}; nothing can be approved`);
+      }
+      if (!plan.secret && plan.bindings.length === 0) {
+        return block("Nothing is left to approve: the secret and its bindings are already resolved");
+      }
+    } else {
+      if (anchor.status !== "pending") return block(`The binding proposal was ${statusWord(anchor.status)}`);
+      plan.bindings = [anchor];
+      plan.approvedSecretId = anchor.secretId;
+      if (anchor.secretProposalId) {
+        const dependency = await getById(companyId, anchor.secretProposalId, dbClient, lockForUpdate);
+        if (!dependency || dependency.kind !== "secret") return block("The secret proposal for this binding was not found");
+        if (dependency.status === "pending") {
+          if (dependency.expiresAt.getTime() <= Date.now()) {
+            return block(`The secret proposal ${dependency.proposedName} has expired`);
+          }
+          if (!(await proposerIsCompanyAgent(dependency))) {
+            return block("The secret for this binding was not proposed by an agent of this company");
+          }
+          plan.secret = dependency;
+        } else if (dependency.status === "approved" && dependency.createdSecretId) {
+          plan.approvedSecretId = dependency.createdSecretId;
+        } else {
+          return block(
+            `The secret proposal ${dependency.proposedName} was ${statusWord(dependency.status)}; ask the agent to propose the secret again`,
+          );
+        }
+      }
+    }
+
+    for (const binding of plan.bindings) {
+      if (binding.expiresAt.getTime() <= Date.now()) return block(`The binding proposal for ${binding.configPath} has expired`);
+      try {
+        await assertBindingSnapshotCurrent(binding, dbClient, lockForUpdate);
+      } catch (error) {
+        if (error instanceof HttpError) return block(`${binding.configPath}: ${error.message}`);
+        throw error;
+      }
+      if (binding.targetId && !plan.targetAgentNames.has(binding.targetId)) {
+        const target = await dbClient.select({ name: agents.name }).from(agents)
+          .where(and(eq(agents.id, binding.targetId), eq(agents.companyId, companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (!target) return block(`The target agent for ${binding.configPath} was not found`);
+        plan.targetAgentNames.set(binding.targetId, target.name);
+      }
+    }
+    if (!plan.secret && plan.bindings.length > 0 && !plan.approvedSecretId) {
+      return block("The binding proposal has no approved secret");
+    }
+    return plan;
+  }
+
+  /**
+   * Accept path for a secret-proposal card: approves the pending secret (when
+   * there is one) and every pending binding on the card in one transaction,
+   * and records one decision entry that names all of them. Each proposal is
+   * checked by assertCanResolve exactly as the Proposals-page approval does.
+   */
+  async function approveFromCard(companyId: string, input: {
+    interactionId: string;
+    proposalId: string;
+    resolvedByUserId: string;
+    assertCanResolve: (proposal: Proposal, txDb: Db) => Promise<void>;
+  }) {
+    return db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const plan = await planCardApproval(companyId, input.interactionId, input.proposalId, txDb, true);
+      if (plan.blockReason || !plan.anchor) {
+        throw unprocessable(plan.blockReason ?? "Secret proposal not found", { code: "secret_proposal_not_approvable" });
+      }
+      let createdSecretId: string | null = null;
+      if (plan.secret) {
+        await input.assertCanResolve(plan.secret, txDb);
+        for (const binding of plan.bindings) await input.assertCanResolve(binding, txDb);
+        const created = await applySecretApproval(txDb, plan.secret, { resolvedByUserId: input.resolvedByUserId });
+        await markApproved(txDb, plan.secret, {
+          resolvedByUserId: input.resolvedByUserId,
+          createdSecretId: created.id,
+        });
+        createdSecretId = created.id;
+      } else {
+        for (const binding of plan.bindings) await input.assertCanResolve(binding, txDb);
+      }
+      const bindingSecretId = createdSecretId ?? plan.approvedSecretId;
+      const approvedBindings: Proposal[] = [];
+      for (const binding of plan.bindings) {
+        const liveSecret = bindingSecretId ? await secretService(txDb).getById(bindingSecretId) : null;
+        if (!liveSecret || liveSecret.companyId !== companyId || liveSecret.status !== "active") {
+          throw conflict("Binding proposal secret is not active");
+        }
+        await applyBindingApproval(txDb, binding, liveSecret, input.resolvedByUserId);
+        approvedBindings.push(await markApproved(txDb, binding, {
+          resolvedByUserId: input.resolvedByUserId,
+          appliedBindingConfigPath: binding.configPath,
+        }));
+      }
+      await logActivity(txDb, {
+        companyId,
+        actorType: "user",
+        actorId: input.resolvedByUserId,
+        action: "secret.proposal.card_approved",
+        entityType: "company_secret_proposal",
+        entityId: plan.anchor.id,
+        agentId: plan.anchor.proposedByAgentId,
+        runId: plan.anchor.originRunId,
+        details: {
+          interactionId: input.interactionId,
+          issueId: plan.anchor.originIssueId,
+          cascade: Boolean(plan.secret),
+          secretProposalId: plan.secret?.id ?? null,
+          createdSecretId,
+          bindingProposalIds: approvedBindings.map((binding) => binding.id),
+          configPaths: approvedBindings.map((binding) => binding.configPath),
+        },
+      });
+      return {
+        anchor: plan.anchor,
+        secretProposal: plan.secret,
+        bindings: approvedBindings,
+        createdSecretId,
+      };
+    });
+  }
+
   async function transition(companyId: string, proposalId: string, status: Exclude<SecretProposalTerminalStatus, "approved">, input: {
     resolvedByUserId?: string | null;
     reason?: string | null;
@@ -855,7 +1232,9 @@ export function createSecretProposalsService(db: Db) {
           reason: dependent.resolutionReason,
         });
       }
-      await reflectProposalLifecycleOnInteraction(txDb, proposal, status, {
+      // Use the row returned by the guarded update: a concurrent binding
+      // proposal may have linked this secret to its card after the pre-read.
+      await reflectProposalLifecycleOnInteraction(txDb, updated, status, {
         resolvedByUserId: input.resolvedByUserId,
         reason: input.reason ?? (status === "expired" ? "Pending proposal expired" : null),
       });
@@ -887,5 +1266,18 @@ export function createSecretProposalsService(db: Db) {
     return expiredCount;
   }
 
-  return { getById, view: enrich, createSecret, createBinding, listForAgent, listForBoard, assertBindingSnapshotCurrent, approve, transition, sweepExpired };
+  return {
+    getById,
+    view: enrich,
+    createSecret,
+    createBinding,
+    listForAgent,
+    listForBoard,
+    assertBindingSnapshotCurrent,
+    approve,
+    planCardApproval,
+    approveFromCard,
+    transition,
+    sweepExpired,
+  };
 }

@@ -23,6 +23,8 @@ import {
   failedRequestConfirmationInteraction,
   failedToolActionInteraction,
   pendingSecretProposalInteraction,
+  pendingSecretBundleInteraction,
+  blockedSecretBundleInteraction,
   executedSecretProposalInteraction,
   failedSecretProposalInteraction,
   rejectedSecretProposalInteraction,
@@ -1056,6 +1058,25 @@ export const SecretProposalPending: Story = {
           interaction={pendingSecretProposalInteraction}
           interactive
         />
+      </ScenarioCard>
+    </StoryFrame>
+  ),
+};
+
+export const SecretProposalBundle: Story = {
+  render: () => (
+    <StoryFrame>
+      <ScenarioCard
+        title="New secret with bindings: cascade allowed"
+        description="One card covers the pending secret proposal and every binding. Accept approves all of them in one decision."
+      >
+        <SecretProposalCard interaction={pendingSecretBundleInteraction} interactive />
+      </ScenarioCard>
+      <ScenarioCard
+        title="New secret with bindings: cascade not allowed"
+        description="The server reports before the click why this viewer cannot approve; accept is disabled with that reason."
+      >
+        <SecretProposalCard interaction={blockedSecretBundleInteraction} interactive />
       </ScenarioCard>
     </StoryFrame>
   ),

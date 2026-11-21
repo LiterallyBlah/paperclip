@@ -1180,6 +1180,29 @@ async function resolveLinkedSecretProposal(
     )
     .returning();
   if (!proposal) throw conflict("Linked secret proposal is no longer pending");
+  // A secret-with-bindings card resolves the secret and every binding that
+  // waits on it in the same decision.
+  const bundledBindings = proposal.kind === "secret"
+    ? await db
+        .update(companySecretProposals)
+        .set({
+          status: outcome.status === "withdrawn" ? "withdrawn" : outcome.status === "expired" ? "expired" : "rejected",
+          resolvedByUserId: outcome.actor.userId ?? null,
+          resolvedAt: outcome.now,
+          resolutionReason: outcome.reason ?? `Secret proposal ${proposal.id} was ${outcome.status}`,
+          valueCiphertext: null,
+          ciphertextScrubbedAt: outcome.now,
+          updatedAt: outcome.now,
+        })
+        .where(
+          and(
+            eq(companySecretProposals.companyId, interaction.companyId),
+            eq(companySecretProposals.secretProposalId, proposal.id),
+            eq(companySecretProposals.status, "pending"),
+          ),
+        )
+        .returning()
+    : [];
   const actorType = outcome.actor.userId
     ? ("user" as const)
     : outcome.actor.agentId
@@ -1204,8 +1227,30 @@ async function resolveLinkedSecretProposal(
       issueId: proposal.originIssueId,
       interactionId: interaction.id,
       reason: outcome.reason ?? null,
+      ...(bundledBindings.length > 0
+        ? { bindingProposalIds: bundledBindings.map((binding) => binding.id) }
+        : {}),
     },
   });
+  for (const binding of bundledBindings) {
+    await logActivity(db, {
+      companyId: interaction.companyId,
+      actorType,
+      actorId,
+      action: `secret.proposal.${binding.status}`,
+      entityType: "company_secret_proposal",
+      entityId: binding.id,
+      agentId: binding.proposedByAgentId,
+      runId: binding.originRunId,
+      details: {
+        ciphertextScrubbed: true,
+        issueId: binding.originIssueId,
+        interactionId: interaction.id,
+        reason: binding.resolutionReason,
+        cascadeFromProposalId: proposal.id,
+      },
+    });
+  }
 }
 
 function resolveActorKind(
@@ -3167,8 +3212,16 @@ export function issueThreadInteractionService(
             })
             .where(
               and(
-                eq(companySecretProposals.id, proposal.id),
+                eq(companySecretProposals.companyId, issue.companyId),
                 eq(companySecretProposals.status, "pending"),
+                or(
+                  eq(companySecretProposals.id, proposal.id),
+                  // Bundled bindings on a secret-with-bindings card.
+                  and(
+                    eq(companySecretProposals.secretProposalId, proposal.id),
+                    eq(companySecretProposals.interactionId, current.id),
+                  ),
+                ),
               ),
             );
           await logActivity(tx as unknown as Db, {

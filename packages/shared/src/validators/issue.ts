@@ -1604,8 +1604,16 @@ export const requestConfirmationToolActionPayloadSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
+export const requestConfirmationSecretProposalBindingSchema = z.object({
+  proposalId: z.string().guid(),
+  configPath: z.string().trim().min(1).max(500),
+  targetAgentId: z.string().guid(),
+  targetAgentName: z.string().trim().min(1).max(500),
+});
+
 export const requestConfirmationSecretProposalPayloadSchema = z.object({
   version: z.literal(1),
+  kind: z.enum(["binding", "secret_with_bindings"]).optional(),
   proposalId: z.string().guid(),
   sourceSecretLabel: z.string().trim().min(1).max(500),
   configPath: z.string().trim().min(1).max(500),
@@ -1613,6 +1621,7 @@ export const requestConfirmationSecretProposalPayloadSchema = z.object({
   targetAgentName: z.string().trim().min(1).max(500),
   justification: z.string().trim().min(1).max(20000),
   expiresAt: z.string().datetime({ offset: true }),
+  bindings: z.array(requestConfirmationSecretProposalBindingSchema).max(100).optional(),
 });
 
 export const requestConfirmationPayloadSchema = z.object({

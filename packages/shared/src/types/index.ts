@@ -773,6 +773,8 @@ export type {
   ConnectionIntentPayload,
   ConnectionIntentResult,
   RequestConfirmationSecretProposalPayload,
+  RequestConfirmationSecretProposalBinding,
+  IssueThreadInteractionSecretProposalReadiness,
   RequestConfirmationSecretProposalResult,
   RequestCheckboxConfirmationOption,
   RequestCheckboxConfirmationPayload,
