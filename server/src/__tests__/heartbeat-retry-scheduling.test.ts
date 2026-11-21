@@ -388,6 +388,12 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     );
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.codexTransientFallbackMode ?? null).toBeNull();
 
+    const resetAt = new Date("2030-04-22T21:00:00.000Z");
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(resetAt.getTime() - 1))).toEqual({
+      promoted: 0,
+      runIds: [],
+    });
+
     await expect
       .poll(
         () =>
@@ -399,6 +405,12 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         { timeout: 5_000, interval: 50 },
       )
       .toEqual({ status: "idle", errorReason: null });
+
+    // Post-reset continuation: the same successor is promoted once the reset passes.
+    expect(await heartbeat.promoteDueScheduledRetries(resetAt)).toEqual({
+      promoted: 1,
+      runIds: [retryRun!.id],
+    });
   });
 
   async function seedMaxTurnFixture(input?: {
