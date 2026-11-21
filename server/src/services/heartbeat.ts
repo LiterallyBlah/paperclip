@@ -776,13 +776,18 @@ function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
 }
 
+export type HeartbeatSchedulingSuppressionReason =
+  | "worktree_instance"
+  | "database_restore_in_progress"
+  | "task_drain"
+  | "server_shutdown";
+
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
   overrides: { allowWorktreeRunExecution?: boolean } = {},
 ): {
   suppressed: boolean;
-  reason:
-    "worktree_instance" | "database_restore_in_progress" | "task_drain" | null;
+  reason: HeartbeatSchedulingSuppressionReason | null;
 } {
   if (
     isTruthyRuntimeEnvValue(env.PAPERCLIP_IN_WORKTREE) &&
@@ -843,6 +848,12 @@ export function heartbeatService(
     resolveResponsibleUserIdForRunContext,
   } = createHeartbeatRunPreparation(db);
   let shutdownInProgress = false;
+  // Set at the very start of a planned shutdown, before the scheduler settles
+  // and the running-run drain takes its snapshot. From then on no queued run
+  // may start: a run admitted after the snapshot would never be drained and
+  // would be reaped as process_lost on the next boot. Like a task drain, this
+  // holds admission only; queued wakes stay durable for the next process.
+  let shutdownAdmissionStopped = false;
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -895,7 +906,13 @@ export function heartbeatService(
     }
     return cachedWorktreeRunExecutionOverride;
   };
-  const getSchedulingSuppression = async () => {
+  const getSchedulingSuppression = async (): Promise<{
+    suppressed: boolean;
+    reason: HeartbeatSchedulingSuppressionReason | null;
+  }> => {
+    if (shutdownAdmissionStopped) {
+      return { suppressed: true, reason: "server_shutdown" };
+    }
     const override = await resolveWorktreeRunExecutionOverride();
     return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
       allowWorktreeRunExecution: override.allowed,
@@ -4079,6 +4096,10 @@ export function heartbeatService(
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
+    // Idempotent: stops admission of new runs for the rest of this process.
+    beginShutdownAdmissionStop: () => {
+      shutdownAdmissionStopped = true;
+    },
     drainRunningRunsForShutdown,
     drainActiveRunExecutions,
     startTaskDrain,

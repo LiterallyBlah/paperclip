@@ -153,7 +153,10 @@ import {
   drainRunExecutionFinalizersForShutdown,
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
+  resolveShutdownRunCompletionGraceMs,
 } from "./shutdown.js";
+import { writePlannedShutdownMarker } from "./services/planned-shutdown-marker.js";
+import { legacyControllerBootId } from "./services/legacy-controller-lease.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
@@ -1186,6 +1189,7 @@ async function startServerWithDatabaseTeardown(
     runIds?: readonly string[] | null,
   ) => Promise<unknown>) | null = null;
   let drainHeartbeatExecutionFinalizers: (() => Promise<void>) | null = null;
+  let stopHeartbeatAdmissionForShutdown: (() => void) | null = null;
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{
     skipDrain: boolean;
     drainRunIds?: string[];
@@ -1454,8 +1458,11 @@ async function startServerWithDatabaseTeardown(
     const retentionExecutor = decisionRetentionService(db as any, {
       notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
     });
+    stopHeartbeatAdmissionForShutdown = heartbeat.beginShutdownAdmissionStop;
     drainHeartbeatRunsForShutdown = (signal, runIds) => (
-      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds)
+      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds, {
+        completionGraceMs: resolveShutdownRunCompletionGraceMs(process.env),
+      })
     );
     drainHeartbeatExecutionFinalizers = () =>
       heartbeat.drainActiveRunExecutions();
@@ -2055,10 +2062,33 @@ async function startServerWithDatabaseTeardown(
     );
   }
   
-  const shutdown = async (
+  let shutdownStarted: Promise<void> | null = null;
+  const shutdown = (
+    signal: "SIGINT" | "SIGTERM",
+    exitProcess: boolean,
+  ): Promise<void> => {
+    // One shutdown per process. A second SIGTERM/SIGINT (for example from a
+    // service manager that repeats the signal) joins the drain in progress
+    // instead of starting another one or killing the process mid-drain.
+    if (shutdownStarted) {
+      logger.warn({ signal }, "shutdown already in progress; ignoring repeated signal");
+      return shutdownStarted;
+    }
+    shutdownStarted = runShutdown(signal, exitProcess);
+    return shutdownStarted;
+  };
+  const runShutdown = async (
     signal: "SIGINT" | "SIGTERM",
     exitProcess: boolean,
   ) => {
+    // Stop admitting runs before anything else, so the drain snapshot below
+    // sees every run this process will ever start.
+    stopHeartbeatAdmissionForShutdown?.();
+    try {
+      writePlannedShutdownMarker({ bootId: legacyControllerBootId, pid: process.pid, signal });
+    } catch (err) {
+      logger.warn({ err, signal }, "could not record planned shutdown marker; leftover runs fall back to process-loss recovery");
+    }
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
     clearInterval(skillVersionRetentionInterval);
@@ -2174,10 +2204,12 @@ async function startServerWithDatabaseTeardown(
     if (exitProcess) process.exit(0);
   };
 
-  process.once("SIGINT", () => {
+  // `on`, not `once`: with `once`, a repeated signal falls through to Node's
+  // default handler and kills the process before the drain finishes.
+  process.on("SIGINT", () => {
     void shutdown("SIGINT", true);
   });
-  process.once("SIGTERM", () => {
+  process.on("SIGTERM", () => {
     void shutdown("SIGTERM", true);
   });
 

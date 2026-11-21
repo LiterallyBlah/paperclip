@@ -740,6 +740,82 @@ describe("execute", () => {
   });
 });
 
+describe("execute cancellation", () => {
+  function cancellableCtx(controller: AbortController) {
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 60 });
+    const onCancellationReady = vi.fn(async () => undefined);
+    return { ctx: { ...ctx, signal: controller.signal, onCancellationReady } as AdapterExecutionContext, onCancellationReady };
+  }
+
+  function gatewayFetch(finalStatus: string | null, onEvents?: () => void) {
+    return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        return new Response(JSON.stringify({ run_id: "run-live", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith("/events")) {
+        onEvents?.();
+        return new Promise<Response>(() => {});
+      }
+      if (url.endsWith("/stop")) {
+        return new Response(JSON.stringify({ status: "stopping" }), { status: 200 });
+      }
+      if (init?.method === "GET" && finalStatus) {
+        return new Response(JSON.stringify({ status: finalStatus }), { status: 200 });
+      }
+      return new Response("unavailable", { status: 503 });
+    });
+  }
+
+  it("stops the gateway run on abort and reports an acknowledged stop", async () => {
+    const controller = new AbortController();
+    const fetchMock = gatewayFetch("cancelled", () => setTimeout(() => controller.abort(), 0));
+    vi.stubGlobal("fetch", fetchMock);
+    const { ctx, onCancellationReady } = cancellableCtx(controller);
+
+    const result = await execute(ctx);
+
+    expect(onCancellationReady).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/v1/runs/run-live/stop"))).toBe(true);
+    expect(result).toMatchObject({ errorCode: "cancelled", timedOut: false });
+    expect(result.resultJson).toMatchObject({
+      run_id: "run-live",
+      executionCancellation: { state: "acknowledged", gatewayStatus: "cancelled" },
+    });
+  });
+
+  it("reports an unverified stop when the gateway does not confirm it", async () => {
+    // The turn finished on its own instead of stopping: not a confirmed stop.
+    const controller = new AbortController();
+    const fetchMock = gatewayFetch("completed", () => setTimeout(() => controller.abort(), 0));
+    vi.stubGlobal("fetch", fetchMock);
+    const { ctx } = cancellableCtx(controller);
+
+    const result = await execute(ctx);
+
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/stop"))).toBe(true);
+    expect(result.errorCode).toBe("cancelled");
+    expect(result.resultJson).toMatchObject({ executionCancellation: { state: "unverified" } });
+  });
+
+  it("creates no gateway run when aborted before dispatch", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const fetchMock = gatewayFetch("cancelled");
+    vi.stubGlobal("fetch", fetchMock);
+    const { ctx } = cancellableCtx(controller);
+
+    const result = await execute(ctx);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      errorCode: "cancelled",
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      resultJson: { executionCancellation: { state: "acknowledged" } },
+    });
+  });
+});
+
 describe("gateway connection failure reporting", () => {
   const config = { apiBaseUrl: "https://gateway.example.test", apiKey: "gateway-private-key" };
   const marker = (operation: string, reason: string) => ({
