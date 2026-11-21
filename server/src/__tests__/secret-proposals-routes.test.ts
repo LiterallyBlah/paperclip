@@ -694,14 +694,22 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       effectiveResolverPolicy: "human_only",
       resolverPolicyProvenance: "explicit",
       effectiveResolverPolicySource: "governed_action",
+      // One card per pending secret proposal, covering all of its bindings (BLA-3351).
       payload: expect.objectContaining({
         secretProposal: expect.objectContaining({
-          proposalId: bindingResponse.body.id,
+          kind: "secret_with_bindings",
+          proposalId: secretResponse.body.id,
           sourceSecretLabel: "dev/vendor/token",
           configPath: "env.VENDOR_TOKEN",
           targetAgentId: fixture.agentId,
           targetAgentName: "Proposer",
-          justification: "Inject for the task",
+          justification: "Needed by task",
+          bindings: [{
+            proposalId: bindingResponse.body.id,
+            configPath: "env.VENDOR_TOKEN",
+            targetAgentId: fixture.agentId,
+            targetAgentName: "Proposer",
+          }],
         }),
       }),
     });

@@ -27,6 +27,8 @@ import {
   pendingToolActionWriteInteraction,
   issueThreadInteractionFixtureMeta,
   pendingSecretProposalInteraction,
+  pendingSecretBundleInteraction,
+  blockedSecretBundleInteraction,
   pendingConnectionAuthorizationInteraction,
   resolvedConnectionAuthorizationInteraction,
   executedSecretProposalInteraction,
@@ -1602,6 +1604,53 @@ describe("IssueThreadInteractionCard secret-proposal card", () => {
       pendingSecretProposalInteraction,
       undefined,
     );
+  });
+
+  it("renders one card for a new secret with all its bindings", async () => {
+    const onAcceptInteraction = vi.fn(async () => undefined);
+    const host = renderCard({
+      interaction: pendingSecretBundleInteraction,
+      onAcceptInteraction,
+      onRejectInteraction: vi.fn(async () => undefined),
+    });
+    expect(host.textContent).toContain("Approve a new secret and its bindings");
+    expect(host.textContent).toContain("infra/light/training-ssh-ed25519");
+    expect(host.textContent).toContain("2 bindings");
+    expect(host.textContent).toContain("InfraEngineer");
+    expect(host.textContent).toContain("LabRunner");
+    expect(host.textContent).not.toContain("You cannot approve this from the card");
+    const approve = Array.from(host.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Approve secret & bindings"),
+    );
+    expect(approve?.disabled).toBe(false);
+    await act(async () => {
+      approve?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onAcceptInteraction).toHaveBeenCalledWith(pendingSecretBundleInteraction);
+  });
+
+  it("disables accept with a plain reason when the server says the cascade is not allowed", async () => {
+    const onAcceptInteraction = vi.fn(async () => undefined);
+    const onRejectInteraction = vi.fn(async () => undefined);
+    const host = renderCard({
+      interaction: blockedSecretBundleInteraction,
+      onAcceptInteraction,
+      onRejectInteraction,
+    });
+    expect(host.textContent).toContain("You cannot approve this from the card");
+    expect(host.textContent).toContain("Company owner or admin access is required");
+    const approve = Array.from(host.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Approve secret & bindings"),
+    );
+    expect(approve?.disabled).toBe(true);
+    await act(async () => {
+      approve?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onAcceptInteraction).not.toHaveBeenCalled();
+    const reject = Array.from(host.querySelectorAll("button")).find((button) =>
+      button.textContent?.trim() === "Reject",
+    );
+    expect(reject?.disabled).toBe(false);
   });
 
   it("renders an accepted proposal as executed rather than merely accepted", () => {

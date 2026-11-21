@@ -26,6 +26,7 @@ import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../services/native-runtime/native-workspace-finalization-recovery-state.js";
 import { monitorPoliciesEqual, applyActorMonitorScheduledBy, assertCanManageIssueMonitor, summarizeIssueMonitor } from "../services/issue-monitors.js";
 import type { IssuePrivacyConstraints } from "@paperclipai/shared";
+import type { IssueThreadInteractionSecretProposalReadiness } from "@paperclipai/shared";
 import { canActorReadHeartbeatRun } from "../services/heartbeat-run-privacy.js";
 import {
   childCreatedByRequest,
@@ -269,7 +270,11 @@ import {
   type QueuedCommentIssueContext,
 } from "../modules/wake-queue/index.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
-import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
+import {
+  actorHasSecretDefinitionAdminAccess,
+  assertCanResolveProposal,
+  proposalResolutionBlockReason,
+} from "../services/secret-proposal-authorization.js";
 import {
   buildDocumentReviewContext,
   buildPlanReviewContext,
@@ -3547,6 +3552,40 @@ export function issueRoutes(
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const secretProposals = createSecretProposalsService(db);
+  async function secretProposalCardReadiness(
+    req: Request,
+    companyId: string,
+    interaction: {
+      id: string;
+      kind: string;
+      status: string;
+      payload?: unknown;
+    },
+  ): Promise<IssueThreadInteractionSecretProposalReadiness | null> {
+    if (interaction.kind !== "request_confirmation" || interaction.status !== "pending") return null;
+    const linked = readObject(readObject(interaction.payload).secretProposal);
+    const proposalId = readNonEmptyString(linked.proposalId);
+    if (!proposalId) return null;
+    const plan = await secretProposals.planCardApproval(companyId, interaction.id, proposalId);
+    const base = {
+      approvesSecret: Boolean(plan.secret),
+      bindingCount: plan.bindings.length,
+    };
+    if (plan.blockReason) {
+      return { ...base, canAccept: false, blockReason: plan.blockReason };
+    }
+    for (const proposal of [...(plan.secret ? [plan.secret] : []), ...plan.bindings]) {
+      const reason = await proposalResolutionBlockReason({
+        db,
+        actor: req.actor,
+        companyId,
+        proposal,
+        targetAgentName: proposal.targetId ? plan.targetAgentNames.get(proposal.targetId) : null,
+      });
+      if (reason) return { ...base, canAccept: false, blockReason: reason };
+    }
+    return { ...base, canAccept: true, blockReason: null };
+  }
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
@@ -18993,7 +19032,20 @@ export function issueRoutes(
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const interactions =
       await issueThreadInteractionService(db).listForIssue(id);
-    res.json(interactions);
+    res.json(
+      await Promise.all(
+        interactions.map(async (interaction) => {
+          const readiness = await secretProposalCardReadiness(
+            req,
+            issue.companyId,
+            interaction,
+          );
+          return readiness
+            ? { ...interaction, secretProposalReadiness: readiness }
+            : interaction;
+        }),
+      ),
+    );
   });
 
   router.post(
@@ -19237,6 +19289,22 @@ export function issueRoutes(
       const actor = getActorInfo(req);
       if (
         current.kind === "request_confirmation" &&
+        current.status === "pending" &&
+        current.payload.secretProposal &&
+        !opts.approveSecretProposal
+      ) {
+        // Refuse before the card is marked accepted, with the same plain
+        // reason the card already shows, instead of failing after the click.
+        const readiness = await secretProposalCardReadiness(req, issue.companyId, current);
+        if (readiness && !readiness.canAccept) {
+          throw unprocessable(
+            readiness.blockReason ?? "This secret proposal cannot be approved from this card",
+            { code: "secret_proposal_not_approvable" },
+          );
+        }
+      }
+      if (
+        current.kind === "request_confirmation" &&
         current.payload.toolAction
       ) {
         if (!opts.approveToolActionRequest)
@@ -19346,13 +19414,20 @@ export function issueRoutes(
             );
             if (
               !proposal ||
-              proposal.kind !== "binding" ||
-              proposal.originIssueId !== issue.id ||
-              proposal.interactionId !== interaction.id
+              proposal.interactionId !== interaction.id ||
+              (proposal.kind === "binding" && proposal.originIssueId !== issue.id)
             ) {
               throw notFound("Secret proposal not found");
             }
-            await secretProposals.approve(issue.companyId, proposal.id, {
+            if (req.actor.type !== "board" || actor.actorType !== "user") {
+              throw forbidden("Only a board user can approve secret proposals");
+            }
+            // One decision: a pending secret proposal behind this card is
+            // approved together with every binding on it (cascade). Each
+            // proposal passes the same checks as Secrets › Proposals.
+            const approved = await secretProposals.approveFromCard(issue.companyId, {
+              interactionId: interaction.id,
+              proposalId: proposal.id,
               resolvedByUserId,
               assertCanResolve: (lockedProposal, txDb) =>
                 assertCanResolveProposal({
@@ -19360,10 +19435,23 @@ export function issueRoutes(
                   actor: req.actor,
                   companyId: issue.companyId,
                   proposal: lockedProposal,
+                  assertSecretDefinitionAdmin: () => {
+                    if (!actorHasSecretDefinitionAdminAccess(req.actor, issue.companyId)) {
+                      throw forbidden("Company admin access required");
+                    }
+                  },
                 }),
             });
+            const configPaths = approved.bindings
+              .map((binding) => binding.configPath)
+              .filter((value): value is string => Boolean(value));
             await notifySecretProposalResolution({
-              proposal,
+              proposal: {
+                originIssueId: approved.bindings[0]?.originIssueId ?? approved.anchor.originIssueId,
+                kind: configPaths.length > 0 ? "binding" : "secret",
+                proposedName: approved.secretProposal?.proposedName ?? approved.anchor.proposedName,
+                configPath: configPaths.join(", ") || null,
+              },
               status: "approved",
               userId: resolvedByUserId,
               issues: svc,
