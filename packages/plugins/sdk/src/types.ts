@@ -959,6 +959,14 @@ export interface PluginExecutionWorkspacesClient {
  * Requires `routines.managed` capability.
  */
 export interface PluginRoutinesClient {
+  /**
+   * Return the subset of `routineIds` that the company member `userId` may
+   * read, using the host's own routine read rule (routines in a private
+   * project need project access). Unknown ids, ids in another company, and
+   * users who are not active members of the company give no result. Returns
+   * ids only, never routine data. Needs no capability.
+   */
+  readableByUser(companyId: string, userId: string, routineIds: string[]): Promise<string[]>;
   managed: {
     get(routineKey: string, companyId: string): Promise<PluginManagedRoutineResolution>;
     reconcile(

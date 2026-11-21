@@ -793,6 +793,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       routines: {
+        async readableByUser(companyId: string, userId: string, routineIds: string[]) {
+          return callHost("routines.readableByUser", { companyId, userId, routineIds });
+        },
         managed: {
           async get(routineKey: string, companyId: string) {
             return callHost("routines.managed.get", { routineKey, companyId });

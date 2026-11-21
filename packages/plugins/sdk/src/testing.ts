@@ -1204,6 +1204,11 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
     },
     routines: {
+      // The in-memory harness has no project privacy model: every routine in
+      // the company counts as readable. Override in tests that need denial.
+      async readableByUser(companyId, _userId, routineIds) {
+        return routineIds.filter((id) => routines.get(id)?.companyId === companyId);
+      },
       managed: {
         async get(routineKey, companyId) {
           requireCapability(manifest, capabilitySet, "routines.managed");

@@ -18,6 +18,7 @@ import {
   pluginLogs,
   principalPermissionGrants,
   projects as projectsTable,
+  routines as routinesTable,
 } from "@paperclipai/db";
 import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, lte } from "drizzle-orm";
 import type {
@@ -88,6 +89,7 @@ import {
   canActorReadIssuePrivacy,
   issuePrivacyMode,
   issueReadSqlCondition,
+  projectReadSqlCondition,
   type AuthorizationActor,
   type IssuePrivacyRow,
 } from "./authorization.js";
@@ -815,6 +817,7 @@ export function buildHostServices(
   const documents = documentService(db);
   const goals = goalService(db);
   const access = accessService(db);
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const authorization = authorizationService(db);
   const budgets = budgetService(db);
   const issueApprovals = issueApprovalService(db);
@@ -2092,6 +2095,59 @@ export function buildHostServices(
     },
 
     routines: {
+      /**
+       * Which of the given routine ids the company member may read, using the
+       * same rule as the routines REST API (LR-1: a routine in a project is
+       * readable only by actors that may read that project). Lets a plugin
+       * apply the viewer's access to ids it stores without trusting ids sent
+       * by the browser. Returns ids only; never routine data.
+       */
+      async readableByUser(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const userId = typeof params.userId === "string" ? params.userId.trim() : "";
+        if (!userId || !Array.isArray(params.routineIds)) return [];
+        const ids = [...new Set(params.routineIds.filter((id): id is string => typeof id === "string" && UUID_RE.test(id)))];
+        if (ids.length === 0) return [];
+        if (ids.length > 1000) throw new Error("routineIds is limited to 1000 ids");
+        // Same company-access bar as the board routes: an active company
+        // member (viewers included; this is a read) or an instance admin.
+        // "local-board" is the implicit local_trusted operator.
+        const localImplicit = userId === "local-board";
+        const actor: AuthorizationActor = localImplicit
+          ? { type: "board", userId, isInstanceAdmin: true, source: "local_implicit" }
+          : { type: "board", userId, source: "session" };
+        if (!localImplicit) {
+          const [membership] = await db
+            .select({ id: companyMemberships.id })
+            .from(companyMemberships)
+            .where(and(
+              eq(companyMemberships.companyId, companyId),
+              eq(companyMemberships.principalType, "user"),
+              eq(companyMemberships.principalId, userId),
+              eq(companyMemberships.status, "active"),
+            ))
+            .limit(1);
+          if (!membership && !(await access.isInstanceAdmin(userId))) return [];
+        }
+        const rows = await db
+          .select({ id: routinesTable.id, projectId: routinesTable.projectId })
+          .from(routinesTable)
+          .where(and(eq(routinesTable.companyId, companyId), inArray(routinesTable.id, ids)));
+        const projectIds = [...new Set(rows.map((row) => row.projectId).filter((id): id is string => !!id))];
+        const readableProjects = projectIds.length === 0 ? new Set<string>() : new Set(
+          (await db
+            .select({ id: projectsTable.id })
+            .from(projectsTable)
+            .where(and(
+              eq(projectsTable.companyId, companyId),
+              inArray(projectsTable.id, projectIds),
+              await projectReadSqlCondition(db, actor),
+            )))
+            .map((row) => row.id),
+        );
+        return rows.filter((row) => !row.projectId || readableProjects.has(row.projectId)).map((row) => row.id);
+      },
       async managedGet(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);

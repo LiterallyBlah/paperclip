@@ -1857,6 +1857,14 @@ export interface WorkerToHostMethods {
     params: { projectKey: string; companyId: string },
     result: PluginManagedProjectResolution,
   ];
+  /**
+   * Which of `routineIds` the company member `userId` may read, by the same
+   * project-read rule as the routines REST API. Returns a subset of the input.
+   */
+  "routines.readableByUser": [
+    params: { companyId: string; userId: string; routineIds: string[] },
+    result: string[],
+  ];
   "routines.managed.get": [
     params: { routineKey: string; companyId: string },
     result: PluginManagedRoutineResolution,
