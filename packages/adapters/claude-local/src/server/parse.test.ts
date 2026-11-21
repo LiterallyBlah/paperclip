@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   claudeModelUsageTotals,
@@ -276,6 +277,59 @@ describe("isClaudeTransientUpstreamError", () => {
     expect(extractClaudeRetryNotBefore({ errorMessage }, now)?.toISOString()).toBe(
       "2026-08-29T02:30:00.000Z",
     );
+  });
+
+  describe("structured five-hour usage-limit envelope (subtype=success, is_error=true)", () => {
+    // Sanitised from a recorded terminal result: the CLI reports subtype=success
+    // with is_error=true, a 429 status and the reset clock in the result text.
+    const envelope = JSON.parse(
+      readFileSync(new URL("./__fixtures__/claude-five-hour-quota-result.json", import.meta.url), "utf8"),
+    ) as Record<string, unknown>;
+    const input = { parsed: envelope, stdout: JSON.stringify(envelope), stderr: "" };
+
+    it("is provider quota, not a generic transient upstream failure", () => {
+      expect(detectClaudeLoginRequired({ parsed: envelope, stdout: input.stdout, stderr: "" }).requiresLogin).toBe(false);
+      expect(isClaudeProviderQuotaError(input)).toBe(true);
+      expect(isClaudeTransientUpstreamError(input)).toBe(false);
+    });
+
+    it("waits for the reported reset time", () => {
+      const now = new Date("2026-11-20T18:49:23.316Z");
+      expect(extractClaudeRetryNotBefore(input, now)?.toISOString()).toBe("2026-11-20T18:50:00.000Z");
+    });
+
+    it("is quota from the structured api_error even without the prose", () => {
+      const structuredOnly = { ...envelope, result: "API Error" };
+      expect(isClaudeProviderQuotaError({ parsed: structuredOnly, stdout: JSON.stringify(structuredOnly) })).toBe(true);
+      expect(isClaudeTransientUpstreamError({ parsed: structuredOnly, stdout: JSON.stringify(structuredOnly) })).toBe(false);
+    });
+
+    it("keeps a genuine 429/529/503 in the same envelope shape transient", () => {
+      for (const variant of [
+        { api_error_status: 429, api_error: "rate_limit_error", result: "API Error: 429 Too Many Requests" },
+        { api_error_status: 529, api_error: "overloaded_error", result: "API Error: 529 Overloaded" },
+        { api_error_status: 503, api_error: "api_error", result: "API Error: 503 Service Unavailable" },
+      ]) {
+        const parsed = { ...envelope, ...variant };
+        const transientInput = { parsed, stdout: JSON.stringify(parsed) };
+        expect(isClaudeProviderQuotaError(transientInput)).toBe(false);
+        expect(isClaudeTransientUpstreamError(transientInput)).toBe(true);
+        expect(extractClaudeRetryNotBefore(transientInput)).toBeNull();
+      }
+    });
+
+    it("does not override a sign-in failure in the same envelope shape", () => {
+      const parsed = {
+        ...envelope,
+        api_error_status: 401,
+        api_error: "authentication_error",
+        result: "Failed to authenticate. API Error: 401 Invalid bearer token",
+      };
+      const authInput = { parsed, stdout: JSON.stringify(parsed), stderr: "" };
+      expect(detectClaudeLoginRequired({ ...authInput }).requiresLogin).toBe(true);
+      expect(isClaudeProviderQuotaError(authInput)).toBe(false);
+      expect(isClaudeTransientUpstreamError(authInput)).toBe(false);
+    });
   });
 
   it("classifies Anthropic API rate_limit_error and overloaded_error as transient", () => {
