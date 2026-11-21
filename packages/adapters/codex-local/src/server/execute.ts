@@ -96,6 +96,7 @@ import {
   resolveCodexAuthPrecedence,
 } from "./auth-precedence.js";
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
+import { readCodexThreadUsageTotals, resolveCodexExecutionUsage, type CodexUsageBaseline } from "./usage-baseline.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -1385,10 +1386,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       };
 
+      // Codex terminal counters are thread totals; on resume, subtract what the
+      // thread had already consumed. Remote homes are not readable here, so a
+      // remote resume records unknown usage rather than a guess.
+      const usageBaseline: CodexUsageBaseline = resumeSessionId
+        ? {
+            kind: "resumed",
+            sessionId: resumeSessionId,
+            totals: executionTargetIsRemote ? null : await readCodexThreadUsageTotals(effectiveCodexHome, resumeSessionId),
+          }
+        : { kind: "fresh" };
+      if (usageBaseline.kind === "resumed" && !usageBaseline.totals) {
+        await onLog(
+          "stdout",
+          `[paperclip] Codex thread "${resumeSessionId}" has no readable prior usage totals; this execution's usage will be recorded as unknown.\n`,
+        );
+      }
       const consumeAccounting = createCodexJsonlParser();
       const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
-        const parsed = consumeAccounting(stdout);
-        return { usage: parsed.usageReported ? parsed.usage : undefined, costStatus: parsed.usageComplete ? undefined : "unpriced", usageBasis: "per_run", provider: "openai", biller, billingType, model, pricingContext, costUsd: null, complete: parsed.usageComplete };
+        const resolved = resolveCodexExecutionUsage(consumeAccounting(stdout), usageBaseline);
+        return { usage: resolved.usage, costStatus: resolved.usageComplete ? undefined : "unpriced", usageBasis: "per_run", provider: "openai", biller, billingType, model, pricingContext, costUsd: null, complete: resolved.usageComplete };
       });
       try {
         const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
@@ -1423,6 +1440,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           },
           rawStderr: proc.stderr,
           parsed: parseCodexJsonl(proc.stdout),
+          usageBaseline,
           pricingContext,
           monitor: monitorFired
             ? {
@@ -1452,6 +1470,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
         parsed: ReturnType<typeof parseCodexJsonl>;
+        usageBaseline: CodexUsageBaseline;
         pricingContext?: AdapterExecutionResult["pricingContext"];
         monitor?:
           | { fired: false }
@@ -1460,19 +1479,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       clearSessionOnMissingSession = false,
       isRetry = false,
     ): AdapterExecutionResult => {
+      const executionUsage = resolveCodexExecutionUsage(attempt.parsed, attempt.usageBaseline);
+      const usageFields = {
+        usageComplete: executionUsage.usageComplete,
+        costStatus: executionUsage.usageComplete ? undefined : ("unpriced" as const),
+        usage: executionUsage.usage,
+        usageBasis: "per_run" as const,
+      };
       if (attempt.monitor?.fired) {
         const errorMessage = formatOutputInactivityMonitorErrorMessage(attempt.monitor.elapsedMsSinceLastEvent);
         return {
           exitCode: null,
           signal: attempt.monitor.terminationSignal ?? attempt.proc.signal,
           timedOut: false,
-          usageComplete: attempt.parsed.usageComplete,
-          costStatus: attempt.parsed.usageComplete ? undefined : "unpriced",
+          ...usageFields,
           errorMessage,
           errorCode: "codex_output_inactivity_monitor",
           errorFamily: null,
-          usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
-          usageBasis: attempt.parsed.usageBasis,
           sessionId: null,
           sessionParams: null,
           sessionDisplayId: null,
@@ -1501,10 +1524,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           exitCode: attempt.proc.exitCode,
           signal: attempt.proc.signal,
           timedOut: true,
-          usageComplete: attempt.parsed.usageComplete,
-          costStatus: attempt.parsed.usageComplete ? undefined : "unpriced",
-          usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
-          usageBasis: "per_run",
+          ...usageFields,
           provider: "openai",
           biller,
           model,
@@ -1590,8 +1610,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: attempt.proc.exitCode,
         signal: attempt.proc.signal,
         timedOut: false,
-        usageComplete: attempt.parsed.usageComplete,
-        costStatus: attempt.parsed.usageComplete ? undefined : "unpriced",
+        usageComplete: usageFields.usageComplete,
+        costStatus: usageFields.costStatus,
         errorMessage:
           (attempt.proc.exitCode ?? 0) === 0
             ? null
@@ -1613,8 +1633,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : null,
         errorFamily,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
-        usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
-        usageBasis: attempt.parsed.usageBasis,
+        usage: usageFields.usage,
+        usageBasis: usageFields.usageBasis,
         sessionId: resolvedSessionId,
         sessionParams: resolvedSessionParams,
         sessionDisplayId: resolvedSessionId,

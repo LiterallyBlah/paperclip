@@ -1842,3 +1842,157 @@ process.exit(1);
     }
   });
 });
+
+// Codex reports thread-cumulative totals in `turn.completed` and persists them
+// as `token_count` events in the thread's rollout, including across
+// `exec resume`. This fake reproduces that contract.
+async function writeCumulativeUsageCodexCommand(commandPath: string): Promise<void> {
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+fs.readFileSync(0, "utf8");
+const argv = process.argv.slice(2);
+const resumeIndex = argv.indexOf("resume");
+const resumed = resumeIndex >= 0 ? argv[resumeIndex + 1] : null;
+const threadId = process.env.FAKE_START_NEW_THREAD || resumed || "thread-fresh";
+const dir = path.join(process.env.CODEX_HOME, "sessions", "2026", "11", "19");
+fs.mkdirSync(dir, { recursive: true });
+const rollout = path.join(dir, "rollout-2026-11-19T05-02-17-" + threadId + ".jsonl");
+let totals = { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
+if (fs.existsSync(rollout) && process.env.FAKE_RESET_COUNTERS !== "1") {
+  for (const line of fs.readFileSync(rollout, "utf8").split("\\n")) {
+    if (!line.trim()) continue;
+    const info = JSON.parse(line).payload?.info;
+    if (info?.total_token_usage) totals = { ...info.total_token_usage };
+  }
+}
+const delta = JSON.parse(process.env.FAKE_TURN_USAGE);
+for (const key of Object.keys(delta)) totals[key] += delta[key];
+fs.appendFileSync(rollout, JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: totals, last_token_usage: delta } } }) + "\\n");
+console.log(JSON.stringify({ type: "thread.started", thread_id: threadId }));
+console.log(JSON.stringify({ type: "turn.started" }));
+console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "done" } }));
+console.log(JSON.stringify(process.env.FAKE_OMIT_USAGE === "1" ? { type: "turn.completed" } : { type: "turn.completed", usage: totals }));
+`;
+  await fs.writeFile(commandPath, script, "utf8");
+  await fs.chmod(commandPath, 0o755);
+}
+
+describe("codex execute per-execution usage on resumed threads", () => {
+  const turn = (input: number, cached: number, output: number) =>
+    JSON.stringify({ input_tokens: input, cached_input_tokens: cached, output_tokens: output });
+
+  async function setup() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-cumulative-usage-"));
+    const workspace = path.join(root, "workspace");
+    const codexHome = path.join(root, "codex-home");
+    const commandPath = path.join(root, "codex");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(codexHome, { recursive: true });
+    await fs.writeFile(path.join(codexHome, "auth.json"), `${fakeCodexAuthJson}\n`, "utf8");
+    await writeCumulativeUsageCodexCommand(commandPath);
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    const run = async (input: { sessionId: string | null; env: Record<string, string> }) => {
+      const logs: LogEntry[] = [];
+      const checkpoints: Array<{ usage?: unknown; complete: boolean }> = [];
+      const result = await execute({
+        runId: `run-${Math.random().toString(16).slice(2)}`,
+        agent: { id: "agent-1", companyId: "company-1", name: "Codex Coder", adapterType: "codex_local", adapterConfig: { engine: "cli" } },
+        runtime: {
+          sessionId: input.sessionId,
+          sessionParams: input.sessionId ? { sessionId: input.sessionId, cwd: workspace } : null,
+          sessionDisplayId: input.sessionId,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          env: { CODEX_HOME: codexHome, ...input.env },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onUsage: async (receipt) => {
+          checkpoints.push({ usage: receipt.usage, complete: receipt.complete });
+        },
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
+      });
+      return { result, logs, checkpoints };
+    };
+    const cleanup = async () => {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    };
+    return { root, codexHome, run, cleanup };
+  }
+
+  it("reports each execution's own usage across a fresh run and two resumes in a row", async () => {
+    const { run, cleanup } = await setup();
+    try {
+      const fresh = await run({ sessionId: null, env: { FAKE_TURN_USAGE: turn(353_684, 314_112, 1_944) } });
+      expect(fresh.result.sessionId).toBe("thread-fresh");
+      expect(fresh.result.usage).toEqual({ inputTokens: 39_572, cachedInputTokens: 314_112, outputTokens: 1_944 });
+      expect(fresh.result.usageComplete).toBe(true);
+
+      const resume1 = await run({ sessionId: "thread-fresh", env: { FAKE_TURN_USAGE: turn(334_292, 311_808, 1_226) } });
+      expect(resume1.result.sessionId).toBe("thread-fresh");
+      expect(resume1.result.usage).toEqual({ inputTokens: 22_484, cachedInputTokens: 311_808, outputTokens: 1_226 });
+      expect(resume1.result.usageBasis).toBe("per_run");
+      expect(resume1.result.usageComplete).toBe(true);
+      expect(resume1.result.costStatus).toBeUndefined();
+      expect(resume1.checkpoints.at(-1)).toEqual({
+        usage: { inputTokens: 22_484, cachedInputTokens: 311_808, outputTokens: 1_226 },
+        complete: true,
+      });
+
+      const resume2 = await run({ sessionId: "thread-fresh", env: { FAKE_TURN_USAGE: turn(390_428, 379_904, 1_252) } });
+      expect(resume2.result.usage).toEqual({ inputTokens: 10_524, cachedInputTokens: 379_904, outputTokens: 1_252 });
+      expect(resume2.checkpoints.every((c) => JSON.stringify(c.usage) !== JSON.stringify({
+        inputTokens: 72_580, cachedInputTokens: 1_005_824, outputTokens: 4_422,
+      }))).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("records unknown usage when a resumed thread has no readable prior totals", async () => {
+    const { run, cleanup } = await setup();
+    try {
+      // A thread from before this fix, or from another home: Codex still reports totals.
+      const resumed = await run({ sessionId: "thread-legacy", env: { FAKE_START_NEW_THREAD: "thread-legacy-x", FAKE_TURN_USAGE: turn(1, 0, 1) } });
+      // Codex started a different thread: its counters began at zero, so they are this execution's.
+      expect(resumed.result.usage).toEqual({ inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 });
+
+      const unknown = await run({ sessionId: "thread-unseen", env: { FAKE_TURN_USAGE: turn(32_305_677, 31_920_384, 37_104) } });
+      expect(unknown.result.usage).toBeUndefined();
+      expect(unknown.result.usageComplete).toBe(false);
+      expect(unknown.result.costStatus).toBe("unpriced");
+      expect(unknown.checkpoints.every((c) => c.usage === undefined && c.complete === false)).toBe(true);
+      expect(unknown.logs.some((l) => l.chunk.includes('Codex thread "thread-unseen" has no readable prior usage totals'))).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("records unknown usage when the thread counters go down, and when usage is missing", async () => {
+    const { run, cleanup } = await setup();
+    try {
+      await run({ sessionId: null, env: { FAKE_TURN_USAGE: turn(500_000, 400_000, 2_000) } });
+      const reset = await run({ sessionId: "thread-fresh", env: { FAKE_RESET_COUNTERS: "1", FAKE_TURN_USAGE: turn(1_000, 0, 10) } });
+      expect(reset.result.usage).toBeUndefined();
+      expect(reset.result.usageComplete).toBe(false);
+
+      const missing = await run({ sessionId: "thread-fresh", env: { FAKE_OMIT_USAGE: "1", FAKE_TURN_USAGE: turn(5, 0, 5) } });
+      expect(missing.result.usage).toBeUndefined();
+      expect(missing.result.usageComplete).toBe(false);
+      expect(missing.result.costStatus).toBe("unpriced");
+    } finally {
+      await cleanup();
+    }
+  });
+});
