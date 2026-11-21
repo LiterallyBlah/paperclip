@@ -1522,6 +1522,7 @@ export function heartbeatService(
   const {
     triggerIssueMonitor,
     tickTimers,
+    reconcileTriggeredIssueMonitors,
     recoverActiveSessionGoals,
     recoverPendingSessionGoalActions,
   } = createHeartbeatScheduling(db, {
@@ -4066,6 +4067,7 @@ export function heartbeatService(
     wakeup: trackWakeup,
     dispatchPendingNativeStatusWakeups,
     triggerIssueMonitor,
+    reconcileTriggeredIssueMonitors,
 
     reportRunActivity: clearDetachedRunWarning,
 
