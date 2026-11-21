@@ -52,6 +52,8 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "projects.managed.get": ["projects.managed"],
   "projects.managed.reconcile": ["projects.managed"],
   "projects.managed.reset": ["projects.managed"],
+  // Read-only access check: subset of ids the plugin already holds, no data.
+  "routines.readableByUser": [],
   "routines.managed.get": ["routines.managed"],
   "routines.managed.reconcile": ["routines.managed"],
   "routines.managed.reset": ["routines.managed"],

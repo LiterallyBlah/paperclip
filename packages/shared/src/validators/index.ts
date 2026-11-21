@@ -714,6 +714,7 @@ export {
   updateRoutineSchema,
   createRoutineTriggerSchema,
   updateRoutineTriggerSchema,
+  restoreRoutineRevisionSchema,
   routineVariableSchema,
   routineRevisionSnapshotRoutineV1Schema,
   routineRevisionSnapshotTriggerV1Schema,
@@ -725,6 +726,7 @@ export {
   type UpdateRoutine,
   type CreateRoutineTrigger,
   type UpdateRoutineTrigger,
+  type RestoreRoutineRevision,
   type RunRoutine,
   type RotateRoutineTriggerSecret,
 } from "./routine.js";

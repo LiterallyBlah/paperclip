@@ -217,8 +217,9 @@ export interface HostServices {
     get(params: WorkerToHostMethods["executionWorkspaces.get"][0]): Promise<WorkerToHostMethods["executionWorkspaces.get"][1]>;
   };
 
-  /** Provides `routines.managed.*`. */
+  /** Provides `routines.managed.*` and `routines.readableByUser`. */
   routines: {
+    readableByUser(params: WorkerToHostMethods["routines.readableByUser"][0]): Promise<WorkerToHostMethods["routines.readableByUser"][1]>;
     managedGet(params: WorkerToHostMethods["routines.managed.get"][0]): Promise<WorkerToHostMethods["routines.managed.get"][1]>;
     managedReconcile(params: WorkerToHostMethods["routines.managed.reconcile"][0]): Promise<WorkerToHostMethods["routines.managed.reconcile"][1]>;
     managedReset(params: WorkerToHostMethods["routines.managed.reset"][0]): Promise<WorkerToHostMethods["routines.managed.reset"][1]>;
@@ -452,6 +453,9 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "projects.managed.get": "projects.managed",
   "projects.managed.reconcile": "projects.managed",
     "projects.managed.reset": "projects.managed",
+    // Read-only access check over ids the plugin already holds; returns a
+    // subset of them and no routine data, so it needs no capability.
+    "routines.readableByUser": null,
     "routines.managed.get": "routines.managed",
     "routines.managed.reconcile": "routines.managed",
     "routines.managed.reset": "routines.managed",
@@ -875,6 +879,9 @@ export function createHostClientHandlers(
     }),
 
     // Routines
+    "routines.readableByUser": gated("routines.readableByUser", async (params) => {
+      return services.routines.readableByUser(params);
+    }),
     "routines.managed.get": gated("routines.managed.get", async (params) => {
       return services.routines.managedGet(params);
     }),
