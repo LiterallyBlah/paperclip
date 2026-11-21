@@ -607,12 +607,14 @@ export function getTaskDrainStatus(): {
   pendingWakes: number;
   quiescent: boolean;
   ownerId?: string;
+  operationId?: string;
 } {
   const state = readTaskDrain(new Date());
   const activeRuns = activeRunExecutionPromises.size;
   const pendingWakes = activeWakeupPromises.size;
   return {
     ...(state?.ownerId ? { ownerId: state.ownerId } : {}),
+    ...(state?.operationId ? { operationId: state.operationId } : {}),
     draining: state !== null,
     startedAt: state?.startedAt ?? null,
     expiresAt: state?.expiresAt ?? null,

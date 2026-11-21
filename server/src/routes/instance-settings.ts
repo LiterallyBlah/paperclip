@@ -7,7 +7,7 @@ import {
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
 } from "@paperclipai/shared";
-import { conflict, forbidden } from "../errors.js";
+import { conflict, forbidden, notFound } from "../errors.js";
 import {
   cloudTenantPrimaryCompanyId,
   getCloudStackContext,
@@ -19,6 +19,7 @@ import { readIdleLocalWork } from "../services/idle-local-work.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
+import { maintenanceRedispatchService } from "../services/maintenance-redispatch.js";
 import {
   companyService,
   heartbeatService,
@@ -137,6 +138,9 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
   const svc = instanceSettingsService(db);
   const environments = environmentService(db);
   const heartbeat = heartbeatService(db);
+  const maintenanceRedispatch = maintenanceRedispatchService(db, {
+    wakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts),
+  });
 
   router.get("/instance/settings", async (req, res) => {
     assertBoardOrgAccess(req);
@@ -380,6 +384,7 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
                 details: {
                   startedAt: computed.startedAt,
                   expiresAt: computed.expiresAt,
+                  ...(computed.operationId ? { operationId: computed.operationId } : {}),
                   ...(computed.ownerId ? { purpose: "idle", ownerId: computed.ownerId } : {}),
                 },
               }, postCommitActivityPublications),
@@ -437,6 +442,7 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
               entityId: "default",
               details: {
                 wasActive,
+                ...(priorStatus.operationId ? { operationId: priorStatus.operationId } : {}),
               },
             }, postCommitActivityPublications),
           ),
@@ -450,9 +456,45 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
       // that is already correct in the database, and must not report the
       // stop as failed when it succeeded.
       publishActivitiesBestEffort(postCommitActivityPublications, "instance.task_drain.stopped");
-      return wasActive;
+      return { wasActive, operationId: priorStatus.operationId ?? null };
     });
-    res.json({ wasActive });
+    // Maintenance exit: re-dispatch, once, the work this drain's window
+    // ended. The stop already committed, so a failure here is logged and
+    // left to the manifest route (which is safe to re-run) instead of
+    // failing the stop.
+    if (wasActive.wasActive && wasActive.operationId) {
+      const operationId = wasActive.operationId;
+      void maintenanceRedispatch.run({ operationId, activeOperationId: null, apply: true })
+        .then((manifest) => logger.info({ operationId, counts: manifest?.counts }, "maintenance exit re-dispatch applied"))
+        .catch((err) => logger.error({ err, operationId }, "maintenance exit re-dispatch failed"));
+    }
+    res.json({ wasActive: wasActive.wasActive });
+  });
+
+  // Affected-run manifest for one maintenance operation (default: the latest
+  // drain). GET is read-only: it lists every run or stage wake the window
+  // ended, the decision and any dispatched wake. POST applies the same plan,
+  // dispatching each eligible task at most once per operation; it refuses an
+  // operation whose drain is still active.
+  router.get("/instance/maintenance-redispatch", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const operationId = typeof req.query.operationId === "string" ? req.query.operationId : null;
+    const manifest = await maintenanceRedispatch.run({
+      operationId, activeOperationId: heartbeat.getTaskDrainStatus().operationId ?? null, apply: false,
+    });
+    if (!manifest) throw notFound("Maintenance operation not found");
+    res.json(manifest);
+  });
+
+  router.post("/instance/maintenance-redispatch", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const operationId = typeof req.body?.operationId === "string" ? req.body.operationId : null;
+    const activeOperationId = heartbeat.getTaskDrainStatus().operationId ?? null;
+    const operation = await maintenanceRedispatch.resolveOperation({ operationId, activeOperationId });
+    if (!operation) throw notFound("Maintenance operation not found");
+    if (!operation.endedAt) throw conflict("Maintenance operation is still active; stop the task drain first");
+    const manifest = await maintenanceRedispatch.run({ operationId: operation.operationId, activeOperationId, apply: true });
+    res.json(manifest);
   });
 
   // Cloud lifecycle read-back: the harness answers a tenant's archive
