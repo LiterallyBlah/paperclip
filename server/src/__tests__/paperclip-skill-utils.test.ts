@@ -321,6 +321,29 @@ describe("paperclip skill utils", () => {
     expect(body).toContain("**Step 8 — Update status and communicate.**");
   });
 
+  it("routes references conditionally on a wake card and keeps the default routing otherwise", async () => {
+    const body = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
+    const routing = body.split("**Wake-card reference routing.**")[1]?.split("**Step 1")[0]?.replace(/\s+/g, " ");
+    expect(routing).toBeTruthy();
+    expect(routing).toContain('"Paperclip Wake Payload"');
+    expect(routing).toContain("For that routine heartbeat work, do not load any file under `references/` or any other Paperclip skill");
+    for (const pointer of [
+      "references/api-reference.md",
+      "references/run-diagnostics.md",
+      "`paperclip-board` skill",
+      "`paperclip-create-agent` skill",
+      "references/routines.md",
+    ]) {
+      expect(routing).toContain(pointer);
+    }
+    expect(routing).toContain("at most once per run");
+    expect(routing).toContain("Without a wake card, use the reference routing in the rest of this file unchanged");
+    // The rule sits after the scoped-wake fast path and before the full procedure, which keeps its routing.
+    expect(body.indexOf("**Scoped-wake fast path.**")).toBeLessThan(body.indexOf("**Wake-card reference routing.**"));
+    expect(body).toContain("If you are asked to create or manage routines you MUST read:");
+    expect(body).toContain("If you are asked to install a skill for the company or an agent you MUST read:");
+  });
+
   it("keeps the external-chat shortcut behind the server-verified harness boundary", async () => {
     const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
     const shortcut = skillBody.match(

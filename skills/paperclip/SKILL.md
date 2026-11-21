@@ -98,6 +98,15 @@ chat shortcut above applies:
 
 **Scoped-wake fast path.** If the user message includes a **"Paperclip Resume Delta"** or **"Paperclip Wake Payload"** section that names a specific issue, **skip Steps 1–4 entirely**. Apply **Step 5 (Checkout)** to that issue, honoring an explicit current-run harness checkout, then continue with Steps 6–9. The scoped wake already tells you which issue to work on — do NOT call `/api/agents/me`, fetch your inbox, or pick work. **Exception:** a wake with a **"Question addressed to you"** section is only for answering that card: use its answer route and stop. Do not check out the issue, change its status or do its work.
 
+**Wake-card reference routing.** A wake card is a **"Paperclip Wake Payload"** or **"Paperclip Resume Delta"** section that names the issue. It already gives you that issue's checkout state and its current thread. This file covers reading, comments, documents, status and monitors. For that routine heartbeat work, do not load any file under `references/` or any other Paperclip skill. Load a reference only when this run needs an operation that neither the card nor this file covers, and load only the one named for that operation:
+
+- Issue-thread interaction cards (questions, confirmations, checkbox prompts): the "Questions and waiting for human input" section of `references/api-reference.md`.
+- Recovery holds, failed or stalled runs and liveness diagnosis: `references/run-diagnostics.md`; for a board action on them, the `paperclip-board` skill instead.
+- Hiring or changing agent configuration: the `paperclip-create-agent` skill.
+- Routines: `references/routines.md`.
+
+Load each one at most once per run, and do not load it again in the same run. Without a wake card, use the reference routing in the rest of this file unchanged.
+
 **Step 1 — Identity.** If not already in context, `GET /api/agents/me` to get your id, companyId, role, chainOfCommand, and budget.
 
 **Step 2 — Approval follow-up (when triggered).** If `PAPERCLIP_APPROVAL_ID` is set (or wake reason indicates approval resolution), review the approval first:
