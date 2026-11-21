@@ -13,6 +13,7 @@ import {
   updateDocumentAnnotationThreadSchema,
   updateRoutineSchema,
   updateRoutineTriggerSchema,
+  restoreRoutineRevisionSchema,
 } from "@paperclipai/shared";
 import { trackRoutineCreated } from "@paperclipai/shared/telemetry";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
@@ -695,11 +696,18 @@ export function routineRoutes(
       await assertTargetParentIssueReadable(req, routine.companyId, restoredParentIssueId);
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
-    const result = await svc.restoreRevision(routine.id, req.params.revisionId as string, {
+    // The restore body was never validated; keep that, and read only the optional guard.
+    const { baseRevisionId } = restoreRoutineRevisionSchema.parse(
+      req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {},
+    );
+    const restoreActor = {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
-    });
+    };
+    const result = baseRevisionId
+      ? await svc.restoreRevision(routine.id, req.params.revisionId as string, restoreActor, { baseRevisionId })
+      : await svc.restoreRevision(routine.id, req.params.revisionId as string, restoreActor);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: routine.companyId,

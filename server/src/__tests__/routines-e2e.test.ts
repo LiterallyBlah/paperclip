@@ -1502,4 +1502,156 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       executionWorkspaceSettings: { mode: "isolated_workspace" },
     });
   });
+
+  describe("optional baseRevisionId guard on trigger updates and revision restore", () => {
+    async function seedScheduledRoutine() {
+      const fixture = await seedFixture();
+      const app = await createApp({
+        type: "board",
+        userId: fixture.userId,
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [fixture.companyId],
+      });
+      const createRes = await request(app)
+        .post(`/api/companies/${fixture.companyId}/routines`)
+        .send({ projectId: fixture.projectId, title: "Weekly report", assigneeAgentId: fixture.agentId });
+      expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+      const routineId = createRes.body.id as string;
+      const triggerRes = await request(app)
+        .post(`/api/routines/${routineId}/triggers`)
+        .send({ kind: "schedule", cronExpression: "0 8 * * 1", timezone: "Europe/London" });
+      expect([200, 201], JSON.stringify(triggerRes.body)).toContain(triggerRes.status);
+      const triggerId = (triggerRes.body.trigger ?? triggerRes.body).id as string;
+      return { ...fixture, app, routineId, triggerId };
+    }
+
+    async function latestRevisionId(routineId: string) {
+      const [row] = await db.select({ latestRevisionId: routines.latestRevisionId }).from(routines).where(eq(routines.id, routineId));
+      return row!.latestRevisionId as string;
+    }
+
+    async function snapshotState(routineId: string, triggerId: string) {
+      const [trigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, triggerId));
+      const [routine] = await db.select().from(routines).where(eq(routines.id, routineId));
+      const revisions = await db.select({ id: routineRevisions.id }).from(routineRevisions).where(eq(routineRevisions.routineId, routineId));
+      return { trigger, routine, revisionCount: revisions.length };
+    }
+
+    it("applies a trigger update whose base matches and records it as the board user", async () => {
+      const { app, routineId, triggerId, companyId, userId } = await seedScheduledRoutine();
+      const base = await latestRevisionId(routineId);
+      const before = await snapshotState(routineId, triggerId);
+
+      const res = await request(app)
+        .patch(`/api/routine-triggers/${triggerId}`)
+        .send({ cronExpression: "0 10 * * 1", timezone: "Europe/London", baseRevisionId: base });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.cronExpression).toBe("0 10 * * 1");
+      const after = await snapshotState(routineId, triggerId);
+      expect(after.revisionCount).toBe(before.revisionCount + 1);
+      expect(after.routine?.latestRevisionId).not.toBe(base);
+      expect(after.trigger?.nextRunAt?.getUTCMinutes()).toBe(0);
+      expect(after.trigger?.updatedByUserId).toBe(userId);
+
+      const entries = await db
+        .select({ action: activityLog.action, actorType: activityLog.actorType, actorId: activityLog.actorId, details: activityLog.details })
+        .from(activityLog)
+        .where(eq(activityLog.companyId, companyId));
+      const updatedEntry = entries.find((entry) => entry.action === "routine.trigger_updated");
+      expect(updatedEntry).toMatchObject({ actorType: "user", actorId: userId, details: { triggerId } });
+    });
+
+    it("rejects a stale base with 409 and the current revision id, changing nothing", async () => {
+      const { app, routineId, triggerId } = await seedScheduledRoutine();
+      const staleBase = await latestRevisionId(routineId);
+      const moved = await request(app).patch(`/api/routine-triggers/${triggerId}`).send({ cronExpression: "0 9 * * 1" });
+      expect(moved.status).toBe(200);
+      const current = await latestRevisionId(routineId);
+      const before = await snapshotState(routineId, triggerId);
+
+      const res = await request(app)
+        .patch(`/api/routine-triggers/${triggerId}`)
+        .send({ cronExpression: "0 10 * * 1", baseRevisionId: staleBase });
+
+      expect(res.status).toBe(409);
+      expect(res.body).toMatchObject({ details: { currentRevisionId: current } });
+      const after = await snapshotState(routineId, triggerId);
+      expect(after).toEqual(before);
+      expect(after.trigger?.nextRunAt).toEqual(before.trigger?.nextRunAt);
+    });
+
+    it("lets exactly one of two concurrent updates with the same base succeed", async () => {
+      const { app, routineId, triggerId } = await seedScheduledRoutine();
+      const base = await latestRevisionId(routineId);
+      const before = await snapshotState(routineId, triggerId);
+
+      const results = await Promise.all([
+        request(app).patch(`/api/routine-triggers/${triggerId}`).send({ cronExpression: "0 10 * * 1", baseRevisionId: base }),
+        request(app).patch(`/api/routine-triggers/${triggerId}`).send({ cronExpression: "0 11 * * 1", baseRevisionId: base }),
+      ]);
+
+      expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+      const winner = results.find((r) => r.status === 200)!;
+      const after = await snapshotState(routineId, triggerId);
+      expect(after.revisionCount).toBe(before.revisionCount + 1);
+      expect(after.trigger?.cronExpression).toBe(winner.body.cronExpression);
+    });
+
+    it("keeps the previous behaviour when no base is sent", async () => {
+      const { app, routineId, triggerId } = await seedScheduledRoutine();
+      const first = await request(app).patch(`/api/routine-triggers/${triggerId}`).send({ cronExpression: "0 9 * * 1" });
+      const second = await request(app).patch(`/api/routine-triggers/${triggerId}`).send({ cronExpression: "0 10 * * 1", baseRevisionId: null });
+      expect([first.status, second.status]).toEqual([200, 200]);
+      expect((await snapshotState(routineId, triggerId)).trigger?.cronExpression).toBe("0 10 * * 1");
+      const malformed = await request(app).patch(`/api/routine-triggers/${triggerId}`).send({ enabled: false, baseRevisionId: "not-a-uuid" });
+      expect(malformed.status).toBe(400);
+      expect((await snapshotState(routineId, triggerId)).trigger?.enabled).toBe(true);
+    });
+
+    it("restores (undo) only while the base is still latest, recomputing nextRunAt", async () => {
+      const { app, routineId, triggerId } = await seedScheduledRoutine();
+      const preApply = await latestRevisionId(routineId);
+      const original = await snapshotState(routineId, triggerId);
+      const apply = await request(app)
+        .patch(`/api/routine-triggers/${triggerId}`)
+        .send({ cronExpression: "0 10 * * 1", baseRevisionId: preApply });
+      expect(apply.status).toBe(200);
+      const applied = await latestRevisionId(routineId);
+
+      // An intervening change makes the undo stale.
+      const other = await request(app).patch(`/api/routine-triggers/${triggerId}`).send({ label: "changed elsewhere" });
+      expect(other.status).toBe(200);
+      const beforeStale = await snapshotState(routineId, triggerId);
+      const stale = await request(app)
+        .post(`/api/routines/${routineId}/revisions/${preApply}/restore`)
+        .send({ baseRevisionId: applied });
+      expect(stale.status).toBe(409);
+      expect(stale.body).toMatchObject({ details: { currentRevisionId: beforeStale.routine?.latestRevisionId } });
+      expect(await snapshotState(routineId, triggerId)).toEqual(beforeStale);
+
+      // Fresh undo: apply again, then restore with the revision that apply created.
+      const base2 = await latestRevisionId(routineId);
+      const reapply = await request(app)
+        .patch(`/api/routine-triggers/${triggerId}`)
+        .send({ cronExpression: "30 10 * * 1", baseRevisionId: base2 });
+      expect(reapply.status).toBe(200);
+      const created = await latestRevisionId(routineId);
+      const undo = await request(app)
+        .post(`/api/routines/${routineId}/revisions/${preApply}/restore`)
+        .send({ baseRevisionId: created });
+      expect(undo.status, JSON.stringify(undo.body)).toBe(200);
+      const restored = await snapshotState(routineId, triggerId);
+      expect(restored.trigger?.cronExpression).toBe(original.trigger?.cronExpression);
+      expect(restored.trigger?.timezone).toBe(original.trigger?.timezone);
+      expect(restored.trigger?.label).toBe(original.trigger?.label);
+      expect(restored.trigger?.nextRunAt?.toISOString()).toBe(original.trigger?.nextRunAt?.toISOString());
+      expect(restored.routine?.latestRevisionId).not.toBe(created);
+
+      // No body still restores as before.
+      const plain = await request(app).post(`/api/routines/${routineId}/revisions/${created}/restore`);
+      expect(plain.status, JSON.stringify(plain.body)).toBe(200);
+    });
+  });
 });

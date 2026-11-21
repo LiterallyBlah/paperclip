@@ -2591,6 +2591,20 @@ export function routineService(
         const txDb = tx as unknown as Db;
         await notifyDeliveryWork(txDb, DELIVERY_QUEUES.routineSchedules);
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existing.routineId} for update`);
+        if (patch.baseRevisionId) {
+          // Checked under the routine row lock, so two writers with the same base cannot both pass.
+          const current = await txDb
+            .select({ latestRevisionId: routines.latestRevisionId })
+            .from(routines)
+            .where(eq(routines.id, existing.routineId))
+            .then((rows) => rows[0] ?? null);
+          if (!current) throw notFound("Routine not found");
+          if (patch.baseRevisionId !== current.latestRevisionId) {
+            throw conflict("Routine was updated by someone else", {
+              currentRevisionId: current.latestRevisionId,
+            });
+          }
+        }
         const [updated] = await txDb
           .update(routineTriggers)
           .set({
@@ -2720,6 +2734,7 @@ export function routineService(
       routineId: string,
       revisionId: string,
       actor: Actor,
+      options: { baseRevisionId?: string | null } = {},
     ): Promise<{
       routine: Routine;
       revision: RoutineRevision;
@@ -2756,6 +2771,11 @@ export function routineService(
           .where(eq(routines.id, existingRoutine.id))
           .then((rows) => rows[0] ?? null);
         if (!locked) throw notFound("Routine not found");
+        if (options.baseRevisionId && options.baseRevisionId !== locked.latestRevisionId) {
+          throw conflict("Routine was updated by someone else", {
+            currentRevisionId: locked.latestRevisionId,
+          });
+        }
         if (locked.latestRevisionId === targetRevision.id) {
           throw conflict("Selected revision is already the latest revision", {
             currentRevisionId: locked.latestRevisionId,
