@@ -32,6 +32,7 @@ import { statusCardRoutes } from "../routes/status-cards.js";
 import { withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
+import { STATUS_CARD_REACTIVE_MIN_SPACING_SECONDS } from "../services/status-card-update-engine.js";
 import { statusCardService } from "../services/status-cards.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -573,11 +574,15 @@ describeEmbeddedPostgres("status card residual privacy (R1/R2/N2)", () => {
     expect(afterIdle!.nextEvalAt!.getTime() - t0.getTime()).toBe(60_000);
 
     // A change to an underlying (private) task triggers a reactive update once
-    // the debounce passes.
+    // the debounce passes and the minimum spacing since the first summary has
+    // elapsed (a burst after a generation is coalesced into one run).
     await db.update(issues).set({ status: "in_progress", updatedAt: new Date() }).where(eq(issues.id, privateIssue.id));
     const t1 = new Date(t0.getTime() + 60_000);
     expect(await service.tickDueStatusCards(t1)).toMatchObject({ evaluated: 1, enqueued: [] });
-    const t2 = new Date(t1.getTime() + 61_000);
+    const waiting = await service.getById(created.body.id);
+    const spacedUntil = waiting!.lastGeneratedAt!.getTime() + STATUS_CARD_REACTIVE_MIN_SPACING_SECONDS * 1000;
+    expect(waiting!.nextEvalAt!.getTime()).toBe(Math.max(t1.getTime() + 60_000, spacedUntil));
+    const t2 = new Date(Math.max(t1.getTime() + 61_000, spacedUntil + 1000));
     const tick = await service.tickDueStatusCards(t2);
     expect(tick.enqueued).toHaveLength(1);
     const updateIssue = tick.enqueued[0]!.generatingIssue;

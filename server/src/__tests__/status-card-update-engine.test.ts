@@ -8,7 +8,9 @@ import {
   filterStatusCardChanges,
   isWithinStatusCardActiveHours,
   nextStatusCardEvaluationAt,
+  STATUS_CARD_REACTIVE_MIN_SPACING_SECONDS,
   statusCardChangesHash,
+  statusCardReactiveSpacingSeconds,
 } from "../services/status-card-update-engine.js";
 
 describe("status card update engine", () => {
@@ -100,5 +102,29 @@ describe("status card update engine", () => {
       issueIds: ["0f5a2c71-9f5c-4b6c-8a9e-1b2c3d4e5f60"],
     });
     expect(extractIssueMentions("No references here.")).toEqual({ identifiers: [], issueIds: [] });
+  });
+  it("keeps a minimum gap between reactive generations and leaves manual and interval runs alone", () => {
+    const reactive = statusCardRefreshPolicySchema.parse({ mode: "reactive", debounceSeconds: 60, maxUpdatesPerHour: 6 });
+    expect(STATUS_CARD_REACTIVE_MIN_SPACING_SECONDS).toBe(20 * 60);
+    // 3600 / 6 = 10 min is below the 20 min floor; a slower card keeps its own spread.
+    expect(statusCardReactiveSpacingSeconds(reactive)).toBe(20 * 60);
+    expect(statusCardReactiveSpacingSeconds({ ...reactive, maxUpdatesPerHour: 2 })).toBe(30 * 60);
+    expect(statusCardReactiveSpacingSeconds({ ...reactive, maxUpdatesPerHour: undefined })).toBe(20 * 60);
+
+    const lastGeneratedAt = new Date("2026-07-23T14:00:00.000Z");
+    const base = { policy: reactive, updatesLastHour: 1, tokensToday: 0, manual: false, lastGeneratedAt };
+    // Debounced but inside the spacing window: wait until the window closes.
+    expect(evaluateStatusCardPolicy({ ...base, now: new Date("2026-07-23T14:05:00.000Z"), lastChangeAt: new Date("2026-07-23T14:02:00.000Z") }))
+      .toEqual({ action: "wait", dueAt: new Date("2026-07-23T14:20:00.000Z") });
+    // Window closed but the change set is still settling: the debounce wins.
+    expect(evaluateStatusCardPolicy({ ...base, now: new Date("2026-07-23T14:20:30.000Z"), lastChangeAt: new Date("2026-07-23T14:20:00.000Z") }))
+      .toEqual({ action: "wait", dueAt: new Date("2026-07-23T14:21:00.000Z") });
+    expect(evaluateStatusCardPolicy({ ...base, now: new Date("2026-07-23T14:21:00.000Z"), lastChangeAt: new Date("2026-07-23T14:20:00.000Z") }).action).toBe("run");
+    // Never generated: only the debounce applies.
+    expect(evaluateStatusCardPolicy({ ...base, lastGeneratedAt: null, now: new Date("2026-07-23T14:01:00.000Z"), lastChangeAt: new Date("2026-07-23T14:00:00.000Z") }).action).toBe("run");
+    // Manual refresh and interval cards ignore the spacing.
+    expect(evaluateStatusCardPolicy({ ...base, manual: true, now: new Date("2026-07-23T14:01:00.000Z"), lastChangeAt: null }).action).toBe("run");
+    const interval = statusCardRefreshPolicySchema.parse({ mode: "interval", intervalMinutes: 15 });
+    expect(evaluateStatusCardPolicy({ ...base, policy: interval, now: new Date("2026-07-23T14:01:00.000Z"), lastChangeAt: null }).action).toBe("run");
   });
 });
