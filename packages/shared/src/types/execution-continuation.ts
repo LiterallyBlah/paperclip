@@ -26,7 +26,22 @@ export interface ExecutionContinuationEnvelope {
     updatedAt: string;
     deleted: boolean;
     sourceTrust: unknown;
+    /** Set only on recent-window copies whose body was capped for the prompt. */
+    bodyTruncated?: boolean;
   }>;
+  /**
+   * Bounded history for fresh (non-resumed) provider sessions on adapters that
+   * opt in. `messages` above stays complete so resume deltas and audits keep
+   * their baseline; renderers use this window only when no resume delta applies.
+   */
+  recentWindow?: {
+    messages: ExecutionContinuationEnvelope["messages"];
+    /** Task messages not included in the window. */
+    omittedCount: number;
+    /** Window messages whose body was capped. */
+    truncatedCount: number;
+    throughCommentId: string | null;
+  };
   /** Only direct human resolutions, projected from server-owned resolver columns. */
   humanResponses?: Array<{
     id: string;
@@ -74,8 +89,10 @@ export interface ExecutionContinuationEnvelope {
   };
   unresolvedInteractionIds: string[];
   coverage: {
-    kind: "full_task_history" | "task_history_delta";
+    kind: "full_task_history" | "task_history_delta" | "recent_window";
     baseRunId?: string;
+    /** Present for `recent_window`: task messages left out of the prompt. */
+    omittedCount?: number;
     throughCommentId: string | null;
     summaryThroughCommentId: null;
   };
