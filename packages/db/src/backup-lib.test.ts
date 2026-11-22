@@ -226,10 +226,27 @@ describeEmbeddedPostgres("runDatabaseBackup atomic publish", () => {
       fs.utimesSync(file, new Date(0), new Date(0));
     }
     const result = await withPgDumpFixture(dir, "printf 'SELECT 1;\\n'\n", () =>
-      runDatabaseBackup({ connectionString, backupDir, retention, backupEngine: "pg_dump" }));
+      runDatabaseBackup({ connectionString, backupDir, retention, backupEngine: "pg_dump", stalePartialMaxAgeMs: Infinity }));
     expect(result.prunedCount).toBe(1);
     expect(fs.existsSync(oldArchive)).toBe(false);
     expect(fs.existsSync(oldPartial)).toBe(true);
+    expect(archives(backupDir)).toEqual([path.basename(result.backupFile)]);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("each run removes stale .partial files but keeps fresh ones", async () => {
+    const connectionString = await createTempDatabase();
+    const dir = createTempDir("atomic-stale-");
+    const backupDir = path.join(dir, "backups");
+    fs.mkdirSync(backupDir);
+    const stale = path.join(backupDir, "paperclip-2020-01-02T00-00-00.sql.gz.partial");
+    const fresh = path.join(backupDir, "paperclip-concurrent.sql.gz.partial");
+    fs.writeFileSync(stale, "x");
+    fs.writeFileSync(fresh, "x");
+    fs.utimesSync(stale, new Date(Date.now() - 25 * 60 * 60 * 1000), new Date(Date.now() - 25 * 60 * 60 * 1000));
+    const result = await withPgDumpFixture(dir, "printf 'SELECT 1;\\n'\n", () =>
+      runDatabaseBackup({ connectionString, backupDir, retention, backupEngine: "pg_dump" }));
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(partials(backupDir)).toEqual([path.basename(fresh)]);
     expect(archives(backupDir)).toEqual([path.basename(result.backupFile)]);
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 

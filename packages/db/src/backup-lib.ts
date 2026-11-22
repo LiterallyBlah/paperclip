@@ -31,7 +31,15 @@ export type RunDatabaseBackupOptions = {
   backupEngine?: "auto" | "pg_dump" | "javascript";
   /** Optional durability gate. A rejected archive must not prune history. */
   verifyBeforePrune?: (backupFile: string) => Promise<void>;
+  /**
+   * Each run removes `<prefix>-*.sql.gz.partial` files older than this, left
+   * by a run that was killed. Defaults to 24 hours, far longer than any
+   * backup, so a concurrent run keeps its file. `Infinity` disables it.
+   */
+  stalePartialMaxAgeMs?: number;
 };
+
+const DEFAULT_STALE_PARTIAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export type RunDatabaseBackupResult = {
   backupFile: string;
@@ -697,6 +705,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
+  try {
+    cleanupStalePartialBackups(opts.backupDir, opts.stalePartialMaxAgeMs ?? DEFAULT_STALE_PARTIAL_MAX_AGE_MS, filenamePrefix);
+  } catch {
+    // Leftover cleanup must never block a new backup.
+  }
   // Initial and final sleep checks can run within the same second. A failed
   // second checkpoint must never overwrite the first verified recovery point.
   const checkpointSuffix = opts.verifyBeforePrune ? `-${randomUUID()}` : "";
