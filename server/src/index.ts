@@ -118,6 +118,7 @@ import {
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
   reconcilePendingMigrationHistory,
+  cleanupStalePartialBackups,
   authUsers,
   companies,
   companyMemberships,
@@ -1956,6 +1957,16 @@ async function startServerWithDatabaseTeardown(
       },
       "Automatic database backups enabled",
     );
+    // A backup killed mid-run leaves only a `.partial` file. Anything older
+    // than one interval cannot belong to a run that is still going.
+    try {
+      const removedPartials = cleanupStalePartialBackups(config.databaseBackupDir, backupIntervalMs, "paperclip");
+      if (removedPartials > 0) {
+        logger.warn({ backupDir: config.databaseBackupDir, removedPartials }, "Removed stale partial database backups");
+      }
+    } catch (error) {
+      logger.warn({ err: error, backupDir: config.databaseBackupDir }, "Could not clean up stale partial database backups");
+    }
     // The final pre-sleep dump remains on the volume throughout sleep. Take
     // a fresh backup on restart before idle eligibility is enabled, including
     // after rollback of the opt-in flag. Failure retains the marker for retry.

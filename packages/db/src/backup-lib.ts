@@ -1,8 +1,8 @@
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
-import { open as openFile } from "node:fs/promises";
+import { open as openFile, rename } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
@@ -31,7 +31,15 @@ export type RunDatabaseBackupOptions = {
   backupEngine?: "auto" | "pg_dump" | "javascript";
   /** Optional durability gate. A rejected archive must not prune history. */
   verifyBeforePrune?: (backupFile: string) => Promise<void>;
+  /**
+   * Each run removes `<prefix>-*.sql.gz.partial` files older than this, left
+   * by a run that was killed. Defaults to 24 hours, far longer than any
+   * backup, so a concurrent run keeps its file. `Infinity` disables it.
+   */
+  stalePartialMaxAgeMs?: number;
 };
+
+const DEFAULT_STALE_PARTIAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export type RunDatabaseBackupResult = {
   backupFile: string;
@@ -187,6 +195,74 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
   }
 
   return toDelete.length;
+}
+
+/**
+ * Suffix for an archive that is still being written. A backup only takes its
+ * final `.sql.gz` name once the stream has completed and been fsynced, so a
+ * process killed mid-run never leaves a truncated file under an archive name
+ * that retention, health checks or restore would treat as valid.
+ */
+export const PARTIAL_BACKUP_SUFFIX = ".partial";
+
+async function syncPath(path: string, flags: "r" | "r+"): Promise<void> {
+  const handle = await openFile(path, flags);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function publishBackupArchive(partialFile: string, backupFile: string): Promise<void> {
+  await syncPath(partialFile, "r+");
+  await rename(partialFile, backupFile);
+  // Persist the rename itself. Some platforms cannot fsync a directory; the
+  // archive is complete either way, so this step is best effort.
+  try {
+    await syncPath(dirname(backupFile), "r");
+  } catch {
+    // ignore
+  }
+}
+
+function removeFileQuietly(filePath: string): void {
+  if (!existsSync(filePath)) return;
+  try {
+    unlinkSync(filePath);
+  } catch {
+    // Preserve the original backup failure if cleanup also fails.
+  }
+}
+
+/**
+ * Removes `<prefix>-*.sql.gz.partial` files left by a backup that was killed
+ * before it finished. Only files older than `maxAgeMs` are removed, so a
+ * backup that is still running keeps its temporary file. Returns the number
+ * of files removed.
+ */
+export function cleanupStalePartialBackups(
+  backupDir: string,
+  maxAgeMs: number,
+  filenamePrefix = "paperclip",
+): number {
+  if (!existsSync(backupDir)) return 0;
+  const cutoff = Date.now() - Math.max(0, maxAgeMs);
+  let removed = 0;
+  for (const name of readdirSync(backupDir)) {
+    if (!name.startsWith(`${filenamePrefix}-`)) continue;
+    if (!name.endsWith(`.sql.gz${PARTIAL_BACKUP_SUFFIX}`)) continue;
+    const fullPath = resolve(backupDir, name);
+    try {
+      const stat = statSync(fullPath);
+      if (!stat.isFile() || stat.mtimeMs >= cutoff) continue;
+      unlinkSync(fullPath);
+      removed++;
+    } catch {
+      // A concurrent writer may have renamed or removed it; skip.
+    }
+  }
+  return removed;
 }
 
 function formatBackupSize(sizeBytes: number): string {
@@ -632,10 +708,18 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
+  try {
+    cleanupStalePartialBackups(opts.backupDir, opts.stalePartialMaxAgeMs ?? DEFAULT_STALE_PARTIAL_MAX_AGE_MS, filenamePrefix);
+  } catch {
+    // Leftover cleanup must never block a new backup.
+  }
   // Initial and final sleep checks can run within the same second. A failed
   // second checkpoint must never overwrite the first verified recovery point.
   const checkpointSuffix = opts.verifyBeforePrune ? `-${randomUUID()}` : "";
   const backupFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}${checkpointSuffix}.sql.gz`);
+  // Both engines stream into this temporary name and rename it to backupFile
+  // only after the stream has completed and been fsynced.
+  const partialFile = `${backupFile}${PARTIAL_BACKUP_SUFFIX}`;
   // The JavaScript engine opens its writer only after engine selection, so the
   // pg_dump path never shares the archive path with an open writer.
   let activeWriter: BufferedTextWriter | null = null;
@@ -648,14 +732,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await closeSql();
         await runPgDumpBackup({
           connectionString: opts.connectionString,
-          backupFile,
+          backupFile: partialFile,
           connectTimeout,
         });
         dumped = true;
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
-        }
+        removeFileQuietly(partialFile);
         if (backupEngine === "pg_dump") {
           throw error;
         }
@@ -667,6 +749,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         // Only an engine failure can select the JavaScript fallback. Once
         // pg_dump succeeds, archive verification or persistence failures
         // must retain their original error.
+        await publishBackupArchive(partialFile, backupFile);
         const sizeBytes = statSync(backupFile).size;
         await opts.verifyBeforePrune?.(backupFile);
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
@@ -676,9 +759,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     await sql`SELECT 1`;
 
-    // Stream the SQL text straight into the final gzip archive; no
-    // uncompressed intermediate file is written.
-    const writer = createGzipTextFileWriter(backupFile);
+    // Stream the SQL text straight into a gzip archive under the temporary
+    // name; no uncompressed intermediate file is written.
+    const writer = createGzipTextFileWriter(partialFile);
     activeWriter = writer;
     const emit = (line: string) => writer.emit(line);
     const emitStatement = (statement: string) => {
@@ -1154,6 +1237,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emit("");
 
     await writer.close();
+    await publishBackupArchive(partialFile, backupFile);
 
     const sizeBytes = statSync(backupFile).size;
     await opts.verifyBeforePrune?.(backupFile);
@@ -1166,9 +1250,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     };
   } catch (error) {
     await activeWriter?.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
-    }
+    removeFileQuietly(partialFile);
+    removeFileQuietly(backupFile);
     throw error;
   } finally {
     await closeSql();

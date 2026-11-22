@@ -30,6 +30,8 @@ export {
   type EmbeddedPostgresTestSupport,
 } from "./test-embedded-postgres.js";
 export {
+  cleanupStalePartialBackups,
+  PARTIAL_BACKUP_SUFFIX,
   runDatabaseBackup,
   runDatabaseRestore,
   formatDatabaseBackupResult,
