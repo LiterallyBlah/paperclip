@@ -4,7 +4,12 @@ import path from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  createGzipTextFileWriter,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
@@ -72,6 +77,50 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+});
+
+describe("createGzipTextFileWriter", () => {
+  it("gunzips to exactly what the plain buffered writer writes for the same calls", async () => {
+    const tempDir = createTempDir("paperclip-gzip-writer-");
+    const plainPath = path.join(tempDir, "plain.sql");
+    const gzipPath = path.join(tempDir, "stream.sql.gz");
+    const plain = createBufferedTextFileWriter(plainPath, 64);
+    const gzip = createGzipTextFileWriter(gzipPath, 64);
+    const writers = [plain, gzip];
+    const apply = async (step: (writer: typeof plain) => unknown) => {
+      for (const writer of writers) await step(writer);
+    };
+
+    await apply((w) => w.emit("-- header"));
+    await apply((w) => w.emit(""));
+    for (let i = 0; i < 500; i++) {
+      await apply((w) => w.emit(`INSERT INTO t VALUES (${i}, 'r\u00e9sum\u00e9 ${"x".repeat(i % 37)}');`));
+      if (i % 97 === 0) await apply((w) => w.drain());
+      if (i % 151 === 0) {
+        await apply((w) => w.writeRaw("\n"));
+        await apply((w) => w.writeRaw(Buffer.from(`${i}\tcopy row\n`)));
+        await apply((w) => w.writeRaw("\\.\n"));
+      }
+    }
+    await apply((w) => w.emit("COMMIT;"));
+    await apply((w) => w.emit(""));
+    await apply((w) => w.close());
+
+    const expected = fs.readFileSync(plainPath);
+    expect(expected.length).toBeGreaterThan(10_000);
+    expect(gunzipSync(fs.readFileSync(gzipPath)).equals(expected)).toBe(true);
+    expect(expected.toString("utf8").endsWith("COMMIT;\n")).toBe(true);
+  });
+
+  it("rethrows the underlying stream error and leaves no file when the output cannot be written", async () => {
+    const tempDir = createTempDir("paperclip-gzip-writer-fail-");
+    const gzipPath = path.join(tempDir, "missing-dir", "stream.sql.gz");
+    const writer = createGzipTextFileWriter(gzipPath, 1);
+    writer.emit("SELECT 1;");
+    await expect(writer.close()).rejects.toMatchObject({ code: "ENOENT" });
+    await writer.abort();
+    expect(fs.existsSync(gzipPath)).toBe(false);
   });
 });
 
@@ -662,5 +711,105 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       }
     },
     20_000,
+  );
+  it(
+    "streams JavaScript backups straight to gzip without an uncompressed file and restores them",
+    async () => {
+      const source = await createTempDatabase();
+      const target = await createSiblingDatabase(source, "stream_restore_target");
+      const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+      const targetSql = postgres(target, { max: 1, onnotice: () => {} });
+      const backupDir = createTempDir("paperclip-db-stream-");
+      const seen = new Set<string>();
+      const watcher = fs.watch(backupDir, (_event, name) => {
+        if (name) seen.add(String(name));
+      });
+      const poll = setInterval(() => {
+        for (const name of fs.readdirSync(backupDir)) seen.add(name);
+      }, 5);
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE public.stream_rows (id integer PRIMARY KEY, payload text NOT NULL);
+          INSERT INTO public.stream_rows
+          SELECT g, repeat(md5(g::text), 8) FROM generate_series(1, 20000) AS g;
+        `);
+        const backup = await runDatabaseBackup({
+          connectionString: source,
+          backupDir,
+          backupEngine: "javascript",
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        });
+        clearInterval(poll);
+        watcher.close();
+        for (const name of fs.readdirSync(backupDir)) seen.add(name);
+
+        expect(backup.backupFile.endsWith(".sql.gz")).toBe(true);
+        expect([...seen].filter((name) => !name.endsWith(".sql.gz"))).toEqual([]);
+        expect(fs.readdirSync(backupDir)).toEqual([path.basename(backup.backupFile)]);
+        const text = gunzipSync(fs.readFileSync(backup.backupFile)).toString("utf8");
+        expect(text.startsWith("-- Paperclip database backup\n-- Created: ")).toBe(true);
+        expect(text.endsWith("COMMIT;\n-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900\n")).toBe(true);
+
+        await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+        expect(await targetSql`SELECT count(*)::int AS n, sum(length(payload))::int AS bytes FROM public.stream_rows`)
+          .toEqual([{ n: 20000, bytes: 20000 * 256 }]);
+      } finally {
+        clearInterval(poll);
+        watcher.close();
+        await sourceSql.end();
+        await targetSql.end();
+      }
+    },
+    120_000,
+  );
+
+  it(
+    "removes the partial archive and rethrows the original error when a JavaScript backup fails mid-stream",
+    async () => {
+      const source = await createTempDatabase();
+      const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+      const backupDir = createTempDir("paperclip-db-stream-fail-");
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE public.stream_rows (id integer PRIMARY KEY, payload text NOT NULL);
+          INSERT INTO public.stream_rows
+          SELECT g, repeat(md5(g::text), 8) FROM generate_series(1, 200000) AS g;
+        `);
+        let terminated = false;
+        const killer = (async () => {
+          const deadline = Date.now() + 60_000;
+          while (Date.now() < deadline) {
+            const archive = fs.readdirSync(backupDir).find((name) => name.endsWith(".sql.gz"));
+            if (archive && fs.statSync(path.join(backupDir, archive)).size > 0) {
+              const rows = await sourceSql<{ pid: number }[]>`
+                SELECT pg_terminate_backend(pid) AS ok, pid FROM pg_stat_activity
+                WHERE datname = current_database() AND pid <> pg_backend_pid()
+              `;
+              terminated = rows.length > 0;
+              return;
+            }
+            await new Promise((resolveDelay) => setTimeout(resolveDelay, 2));
+          }
+        })();
+        const failure = await runDatabaseBackup({
+          connectionString: source,
+          backupDir,
+          backupEngine: "javascript",
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        }).then(() => null, (error: unknown) => error);
+        await killer;
+
+        expect(terminated).toBe(true);
+        expect(failure).toBeInstanceOf(Error);
+        // postgres.js surfaces the server's admin-shutdown error (57P01) or the
+        // dropped socket; either way it is the original driver error, not a
+        // cleanup or stream error from the backup writer.
+        expect(String((failure as Error).message)).not.toMatch(/stream|closed backup file/i);
+        expect(fs.readdirSync(backupDir)).toEqual([]);
+      } finally {
+        await sourceSql.end();
+      }
+    },
+    120_000,
   );
 });
