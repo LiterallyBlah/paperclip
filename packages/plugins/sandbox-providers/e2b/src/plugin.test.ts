@@ -307,7 +307,10 @@ describe("E2B sandbox provider plugin", () => {
     expect(stdinCall).toBeDefined();
     if (!stdinCall) throw new Error("stdinCall not found");
     expect(stdinCall[0]).toMatch(/\.profile/);
-    expect(stdinCall[0]).toMatch(/exec env FOO='bar' 'printf' 'hello' < '\/tmp\/paperclip-stdin-/);
+    // Env is staged through the files API and sourced; only its path is in the command (BLA-3978).
+    expect(sandbox.files.write).toHaveBeenCalledWith(expect.stringMatching(/^\/tmp\/paperclip-env-/), "__paperclip_env_0='bar'\n__paperclip_env_apply() { export FOO=\"$__paperclip_env_0\"; }\n__paperclip_env_export() { export __paperclip_env_0; }\n__paperclip_env_unset() { unset __paperclip_env_0; }\n__paperclip_env_names='1 FOO'\n__paperclip_env_split='-u __paperclip_env_0 -- FOO=${__paperclip_env_0}'\n");
+    expect(stdinCall[0]).not.toContain("bar");
+    expect(stdinCall[0]).toMatch(/&& exec \/bin\/sh -c '\. "\$1" \|\| exit 125\n[\s\S]*\nexit 126' paperclip-env '\/tmp\/paperclip-env-[^']+' 'printf' 'hello' < '\/tmp\/paperclip-stdin-/);
     expect(stdinCall[1]).toEqual(expect.objectContaining({ cwd: "/workspace", timeoutMs: 1000 }));
     expect(stdinCall[1]).not.toHaveProperty("envs");
     expect(stdinCall[1]).not.toHaveProperty("background");
@@ -367,7 +370,8 @@ describe("E2B sandbox provider plugin", () => {
     // The wrapper sources no `nvm.sh`; the sandbox image supplies node on PATH.
     expect(fgCall[0]).not.toMatch(/nvm\.sh/);
     expect(fgCall[0]).not.toMatch(/NVM_DIR/);
-    expect(fgCall[0]).toMatch(/exec env FOO='bar' 'printf' 'hello'$/);
+    expect(fgCall[0]).not.toContain("bar");
+    expect(fgCall[0]).toMatch(/&& exec \/bin\/sh -c '\. "\$1" \|\| exit 125\n[\s\S]*\nexit 126' paperclip-env '\/tmp\/paperclip-env-[^']+' 'printf' 'hello'$/);
     expect(fgCall[1]).toEqual(expect.objectContaining({ cwd: "/workspace", timeoutMs: 1000 }));
     expect(fgCall[1]).not.toHaveProperty("envs");
     expect(fgCall[1]).not.toHaveProperty("background");
@@ -438,7 +442,9 @@ describe("E2B sandbox provider plugin", () => {
   it("cleans up staged stdin even when writing it fails", async () => {
     const sandbox = createMockSandbox();
     const failure = new Error("write failed");
-    sandbox.files.write.mockRejectedValueOnce(failure);
+    sandbox.files.write.mockImplementation(async (remotePath: string) => {
+      if (remotePath.startsWith("/tmp/paperclip-stdin-")) throw failure;
+    });
     mockConnect.mockResolvedValue(sandbox);
 
     await expect(plugin.definition.onEnvironmentExecute?.({
@@ -461,6 +467,7 @@ describe("E2B sandbox provider plugin", () => {
     })).rejects.toThrow("write failed");
 
     expect(sandbox.files.remove).toHaveBeenCalledWith(expect.stringMatching(/^\/tmp\/paperclip-stdin-/));
+    expect(sandbox.files.remove).toHaveBeenCalledWith(expect.stringMatching(/^\/tmp\/paperclip-env-/));
     expect(sandbox.commands.sendStdin).not.toHaveBeenCalled();
     expect(sandbox.handle.wait).not.toHaveBeenCalled();
   });

@@ -152,6 +152,81 @@ function isValidShellEnvKey(value: string) {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
+// Render caller env as a POSIX script staged into the sandbox through the
+// provider file API, so no env value appears in the command text handed to the
+// SDK, in any remote argv, or in an `env` helper's argv (BLA-3978). Each value
+// is held in a private alias (`__paperclip_env_<i>`); single-quoting keeps the
+// exact bytes, including quotes, newlines and `$`. The script also defines
+// small functions that CALLER_ENV_EXEC_SCRIPT uses to apply the aliases under
+// the caller's names, plus the name list for the execve fallback. Names are
+// validated identifiers and are not secret.
+function buildEnvExportScript(env: Record<string, string> | undefined): string | null {
+  const entries = Object.entries(env ?? {});
+  for (const [key] of entries) {
+    if (!isValidShellEnvKey(key)) {
+      throw new Error(`Invalid sandbox environment variable key: ${key}`);
+    }
+  }
+  const kept = entries.filter((entry): entry is [string, string] => typeof entry[1] === "string");
+  if (kept.length === 0) return null;
+  const aliases = kept.map((_, index) => `__paperclip_env_${index}`);
+  const lines = [
+    ...kept.map(([, value], index) => `${aliases[index]}=${shellQuote(value)}`),
+    `__paperclip_env_apply() { ${kept.map(([key], index) => `export ${key}="$${aliases[index]}"`).join(" && ")}; }`,
+    `__paperclip_env_export() { export ${aliases.join(" ")}; }`,
+    `__paperclip_env_unset() { unset ${aliases.join(" ")}; }`,
+    `__paperclip_env_names=${shellQuote(`${kept.length} ${kept.map(([key]) => key).join(" ")}`)}`,
+    // `env -S` arguments: drop the aliases, then set each caller name from its
+    // alias. GNU env expands `${alias}` from its own environment, so values never
+    // enter argv. Contains only names.
+    `__paperclip_env_split=${shellQuote(
+      `${aliases.map((alias) => `-u ${alias}`).join(" ")} -- ${kept.map(([key], index) => `${key}=\${${aliases[index]}}`).join(" ")}`,
+    )}`,
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
+// Interpreter execve helpers, used only when `env -S` is unavailable. Both
+// read each value from its `__paperclip_env_<i>` alias in their own environment,
+// set it under the caller's name, drop the alias, and execvp the target; only
+// the name count and names are in their argv. Neither contains a single quote.
+const CALLER_ENV_PERL_EXEC =
+  'my $c=shift @ARGV; my @n=splice(@ARGV,0,$c); for my $i (0..$#n) { $ENV{$n[$i]}=delete $ENV{"__paperclip_env_$i"}; } exec { $ARGV[0] } @ARGV; print STDERR "paperclip-env: $ARGV[0]: $!\\n"; exit 127;';
+const CALLER_ENV_PYTHON_EXEC = [
+  "import os,sys",
+  "a=sys.argv[1:];c=int(a[0]);n=a[1:1+c];a=a[1+c:]",
+  'for i,k in enumerate(n): os.environ[k]=os.environ.pop("__paperclip_env_%d"%i)',
+  "try: os.execvp(a[0],a)",
+  "except OSError as e:",
+  '  sys.stderr.write("paperclip-env: %s: %s\\n"%(a[0],e.strerror)); sys.exit(127)',
+].join("\n");
+
+// Applies the staged caller env in a fresh `/bin/sh` that has not sourced any
+// profile, then execs the target. `$1` is the env file path; it is removed
+// before exec, and only the path is in argv (BLA-3978). Profiles can mark names
+// readonly; the fresh shell inherits only their exported values, not that
+// attribute. If `/bin/sh` itself refuses a caller name (bash owns readonly UID,
+// EUID, PPID, BASHOPTS, SHELLOPTS and BASH_VERSINFO even as `sh --posix`), the
+// trial in a subshell fails and the env is applied without shell assignment,
+// so every name `exec env K=v` used to accept still reaches the child (BLA-4033).
+// GNU coreutils `env -S` does this with no interpreter: it expands each
+// `${__paperclip_env_<i>}` from its own environment, so its kernel argv holds
+// only names. Where `env` lacks `-S` (for example busybox), a perl or python3
+// execve helper does the same. Only when the shell refuses a name and none of
+// these exists does it fail, loudly, with exit 126.
+const CALLER_ENV_EXEC_SCRIPT = [
+  '. "$1" || exit 125',
+  '{ rm -f "$1" || true; }',
+  "shift",
+  'if ( __paperclip_env_apply ) >/dev/null 2>&1; then __paperclip_env_apply || exit 125; __paperclip_env_unset; exec "$@"; fi',
+  "__paperclip_env_export",
+  'if env -S -i >/dev/null 2>&1; then exec env -S "$__paperclip_env_split" "$@"; fi',
+  `if command -v perl >/dev/null 2>&1; then exec perl -e ${shellQuote(CALLER_ENV_PERL_EXEC)} $__paperclip_env_names "$@"; fi`,
+  `if command -v python3 >/dev/null 2>&1; then exec python3 -I -c ${shellQuote(CALLER_ENV_PYTHON_EXEC)} $__paperclip_env_names "$@"; fi`,
+  'echo "paperclip-env: /bin/sh refuses a caller env name and no env -S, perl or python3 is available" >&2',
+  "exit 126",
+].join("\n");
+
 // Source the user's login profiles before exec so commands run with the same
 // PATH the user sees in an interactive shell. e2b's `sandbox.commands.run`
 // otherwise spawns a non-login, non-interactive shell whose PATH does not
@@ -159,25 +234,16 @@ function isValidShellEnvKey(value: string) {
 // .profile/.bashrc — which makes the hello probe fail with
 // `exec: <cli>: not found` even when the binary is on disk. The wrapper no
 // longer sources `nvm.sh`; the sandbox image supplies `node` on the PATH.
+// Caller env is applied from the staged env file after the profiles, in a
+// fresh shell (see CALLER_ENV_EXEC_SCRIPT), so it still wins over anything the
+// profiles export. Only the file path is in the command text.
 function buildLoginShellScript(input: {
   command: string;
   args: string[];
-  env?: Record<string, string>;
+  envPath?: string;
 }): string {
-  const env = input.env ?? {};
-  for (const key of Object.keys(env)) {
-    if (!isValidShellEnvKey(key)) {
-      throw new Error(`Invalid sandbox environment variable key: ${key}`);
-    }
-  }
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
-  const execLine = envArgs.length > 0
-    ? `exec env ${envArgs.join(" ")} ${commandParts}`
-    : `exec ${commandParts}`;
-  return [
+  const steps = [
     'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
     // .bash_profile typically sources .bashrc itself; only source .bashrc
@@ -186,8 +252,13 @@ function buildLoginShellScript(input: {
     // .bash_profile -> .bashrc.
     'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-    execLine,
-  ].join(" && ");
+  ];
+  steps.push(
+    input.envPath
+      ? `exec /bin/sh -c ${shellQuote(CALLER_ENV_EXEC_SCRIPT)} paperclip-env ${shellQuote(input.envPath)} ${commandParts}`
+      : `exec ${commandParts}`,
+  );
+  return steps.join(" && ");
 }
 
 async function killSandboxBestEffort(sandbox: Sandbox, reason: string): Promise<void> {
@@ -401,13 +472,12 @@ const plugin = definePlugin({
     } catch {
       // ignore — keep going with the existing sandbox lifetime
     }
-    const baseCommand = buildLoginShellScript({
-      command: params.command,
-      args: params.args ?? [],
-      env: params.env,
-    });
+    const envScript = buildEnvExportScript(params.env);
     const timeoutMs = params.timeoutMs ?? config.timeoutMs;
 
+    // Caller env (which carries the agent's PAPERCLIP_API_KEY) is staged to a
+    // private file through the files API, never interpolated into the command.
+    let stagedEnvPath: string | null = null;
     // For commands with stdin, stage the payload to a temp file inside the
     // sandbox and shell-redirect it. Streaming stdin via `sendStdin` raced
     // with fast-failing commands (the process exits before the RPC lands),
@@ -416,26 +486,40 @@ const plugin = definePlugin({
     // keeps execution synchronous, avoids the race, and is unaffected by
     // whether the command exits in microseconds or minutes.
     let stagedStdinPath: string | null = null;
-    if (params.stdin != null) {
-      stagedStdinPath = `/tmp/paperclip-stdin-${randomUUID()}`;
-      try {
-        await sandbox.files.write(stagedStdinPath, params.stdin);
-      } catch (error) {
-        // Best-effort cleanup in case the write partially succeeded; ignore
-        // remove failures so the original error is what propagates.
-        await sandbox.files.remove(stagedStdinPath).catch(() => undefined);
-        throw error;
+    const removeStaged = async () => {
+      for (const stagedPath of [stagedEnvPath, stagedStdinPath]) {
+        if (stagedPath) await sandbox.files.remove(stagedPath).catch(() => undefined);
       }
+    };
+    try {
+      if (envScript != null) {
+        stagedEnvPath = `/tmp/paperclip-env-${randomUUID()}`;
+        await sandbox.files.write(stagedEnvPath, envScript);
+      }
+      if (params.stdin != null) {
+        stagedStdinPath = `/tmp/paperclip-stdin-${randomUUID()}`;
+        await sandbox.files.write(stagedStdinPath, params.stdin);
+      }
+    } catch (error) {
+      // Best-effort cleanup in case a write partially succeeded; ignore
+      // remove failures so the original error is what propagates.
+      await removeStaged();
+      throw error;
     }
 
+    const baseCommand = buildLoginShellScript({
+      command: params.command,
+      args: params.args ?? [],
+      envPath: stagedEnvPath ?? undefined,
+    });
     const command = stagedStdinPath
       ? `${baseCommand} < ${shellQuote(stagedStdinPath)}`
       : baseCommand;
 
     try {
-      // Env is interpolated into the script via `exec env KEY=val …` after
-      // profile sourcing so user-configured env wins over anything profiles
-      // export. No need to pass `envs:` separately.
+      // Env is sourced from the staged file after profile sourcing so
+      // user-configured env wins over anything profiles export. `envs:` is
+      // not used because profiles would override it.
       const result = await sandbox.commands.run(command, {
         cwd: params.cwd,
         timeoutMs,
@@ -464,9 +548,7 @@ const plugin = definePlugin({
       }
       throw error;
     } finally {
-      if (stagedStdinPath) {
-        await sandbox.files.remove(stagedStdinPath).catch(() => undefined);
-      }
+      await removeStaged();
     }
   },
 });
