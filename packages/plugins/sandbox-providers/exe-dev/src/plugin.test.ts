@@ -30,6 +30,7 @@ class MockChildProcess extends EventEmitter {
     end: () => {
       this.stdin.ended = true;
     },
+    on: () => this.stdin,
   };
   kill = vi.fn();
 
@@ -633,12 +634,14 @@ describe("exe.dev sandbox provider plugin", () => {
     expect(spawnMock.mock.calls[0]?.[0]).toBe("ssh");
     const remoteScript = String(spawnMock.mock.calls[0]?.[1]?.at(-1) ?? "");
     expect(remoteScript).toContain("/workspace");
-    expect(remoteScript).toContain("FOO='");
+    // Env values ride the stdin header, never the ssh argv (BLA-3999).
+    expect(remoteScript).not.toContain("bar");
+    expect(remoteScript).not.toMatch(/\benv [A-Z_]+=/);
     // The wrapper sources no `nvm.sh`; the sandbox image supplies node on PATH.
     expect(remoteScript).not.toContain("nvm.sh");
     expect(remoteScript).not.toContain("NVM_DIR");
     const child = spawnMock.mock.results[0]?.value as MockChildProcess;
-    expect(child.stdin.written).toBe("input-body");
+    expect(child.stdin.written).toMatch(/^\d+\n__paperclip_env_0='bar'\n[\s\S]*\ninput-body$/);
     expect(child.stdin.ended).toBe(true);
     expect(result).toMatchObject({
       exitCode: 0,

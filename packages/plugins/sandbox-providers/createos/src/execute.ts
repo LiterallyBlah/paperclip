@@ -3,6 +3,7 @@ import { StringDecoder } from "node:string_decoder";
 import { setTimeout as delay } from "node:timers/promises";
 import type { PluginEnvironmentExecuteParams, PluginEnvironmentExecuteResult } from "@paperclipai/plugin-sdk";
 import { CreateosApiError, CreateosClient, identifier, object } from "./client.js";
+import { buildCallerEnvScript, CALLER_ENV_FILE_EXEC } from "./caller-env.js";
 
 const MAX_LINE_BYTES = 1_048_576;
 const MAX_CAPTURE_CHARS = 4_194_304;
@@ -14,18 +15,27 @@ export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-function commandScript(params: PluginEnvironmentExecuteParams, stdinPath: string | null): string {
-  if (!params.command) throw new Error("A sandbox command is required.");
-  const env = Object.entries(params.env ?? {}).map(([key, value]) => {
+function callerEnvEntries(params: PluginEnvironmentExecuteParams): Array<[string, string]> {
+  return Object.entries(params.env ?? {}).map(([key, value]) => {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== "string") {
       throw new Error("Invalid sandbox environment variable.");
     }
-    return `${key}=${shellQuote(value)}`;
+    return [key, value];
   });
+}
+
+// Caller env is applied from the staged env file in a fresh `/bin/sh` after
+// `bash -l` has sourced the profiles, so it still wins over anything a profile
+// exports. Only the env file path is in the command text (BLA-3999).
+function commandScript(params: PluginEnvironmentExecuteParams, envPath: string | null, stdinPath: string | null): string {
+  if (!params.command) throw new Error("A sandbox command is required.");
   const command = [params.command, ...(params.args ?? [])].map(shellQuote).join(" ");
+  const target = envPath
+    ? `/bin/sh -c ${shellQuote(CALLER_ENV_FILE_EXEC)} paperclip-env ${shellQuote(envPath)} ${command}`
+    : command;
   return [
     params.cwd ? `cd -- ${shellQuote(params.cwd)} || exit` : "",
-    `exec env ${env.join(" ")} ${command}${stdinPath ? ` < ${shellQuote(stdinPath)}` : ""}`,
+    `exec ${target}${stdinPath ? ` < ${shellQuote(stdinPath)}` : ""}`,
   ].filter(Boolean).join("\n");
 }
 
@@ -96,18 +106,27 @@ export async function execute(
   log: (stream: "stdout" | "stderr", text: string) => void = () => {},
 ): Promise<PluginEnvironmentExecuteResult> {
   const id = identifier(params.lease.providerLeaseId);
+  // Caller env (which carries the agent's PAPERCLIP_API_KEY) is staged to a
+  // file through the files API, never interpolated into the command text that
+  // CreateOS receives and may log, nor into any argv in the sandbox.
+  const envScript = buildCallerEnvScript(callerEnvEntries(params));
+  const envPath = envScript != null ? `/tmp/paperclip-env-${randomUUID()}` : null;
   const stdinPath = params.stdin != null ? `/tmp/paperclip-stdin-${randomUUID()}` : null;
-  const script = commandScript(params, stdinPath);
+  const script = commandScript(params, envPath, stdinPath);
   const output = new Output(log);
   let processId: string | null = null;
   let creationMayHaveSucceeded = false;
   let completed = false;
-  let staged = false;
+  const staged: string[] = [];
   let cursor = 0;
   const base = `/sandboxes/${id}/processes`;
   try {
+    if (envPath) {
+      staged.push(envPath);
+      await client.upload(id, envPath, envScript!, signal);
+    }
     if (stdinPath) {
-      staged = true;
+      staged.push(stdinPath);
       await client.upload(id, stdinPath, params.stdin!, signal);
     }
     let created: Record<string, unknown>;
@@ -117,8 +136,8 @@ export async function execute(
         cmd: "/bin/bash", args: ["-lc", script],
         ...(params.cwd ? { cwd: params.cwd } : {}),
         // CreateOS API overrides are limited to keys declared at sandbox
-        // creation. Per-command variables are already safely quoted in the
-        // command's `env` invocation, including on a reused sandbox.
+        // creation, and would put values in the request. Per-command variables
+        // come from the staged env file instead, including on a reused sandbox.
       }, signal);
     } catch (error) {
       if (error instanceof CreateosApiError && error.status < 500) creationMayHaveSucceeded = false;
@@ -217,11 +236,13 @@ export async function execute(
         catch (error) { if (!(error instanceof CreateosApiError && error.status === 404)) throw new CreateosCleanupError("CreateOS command cleanup failed; process termination is unconfirmed."); }
       }
     } finally {
-      if (staged && stdinPath) {
+      if (staged.length > 0) {
         // /files has no delete verb. /exec supplies a bounded, one-shot removal
         // after the managed process finishes, without retaining another record.
+        // The env file is normally gone already (removed before exec); this
+        // covers a failed upload, a failed creation or an early exit.
         await client.json(`/sandboxes/${id}/exec`, "POST", {
-          cmd: "/bin/rm", args: ["-f", "--", stdinPath],
+          cmd: "/bin/rm", args: ["-f", "--", ...staged],
         }, cleanupSignal).catch(() => undefined);
       }
     }
