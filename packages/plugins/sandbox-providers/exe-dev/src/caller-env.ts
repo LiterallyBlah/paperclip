@@ -4,7 +4,8 @@
 // travel as a POSIX script outside every command string, are applied in a fresh
 // `/bin/sh` that has sourced no profile, and only names and paths reach argv.
 // Each provider plugin ships on its own, so this file is copied per provider,
-// as PR #59 did. Keep the createos and exe-dev copies identical.
+// as PR #59 did. Keep every copy identical: createos, exe-dev, daytona,
+// cloudflare/bridge-template, kubernetes and novita (BLA-4139).
 
 function quote(value: string): string {
   // An env value cannot hold NUL (execve would cut it), so reject it rather
@@ -92,3 +93,35 @@ export const CALLER_ENV_FILE_EXEC = 'set +xv; . "$1" || exit 125; { rm -f "$1" |
  * Use as `/bin/sh -c BODY paperclip-env <cmd> <args…>`.
  */
 export const CALLER_ENV_VAR_EXEC = 'set +xv; eval "$__pc_env" || exit 125; unset __pc_env; __paperclip_env_run "$@"';
+
+/**
+ * Stdin header for a provider with no file API (PR #57, exe-dev, kubernetes):
+ * one decimal line count N, then the N lines of the env script. A quoted value
+ * can span lines, so multiline values survive. Returns null when there is
+ * nothing to send.
+ */
+export function buildCallerEnvStdinHeader(entries: Array<[string, string]>): string | null {
+  const script = buildCallerEnvScript(entries);
+  if (script == null) return null;
+  return `${script.slice(0, -1).split("\n").length}\n${script}`;
+}
+
+/**
+ * Reads the stdin header into the unexported `__pc_env` using only shell
+ * builtins. A POSIX shell reads a pipe one byte at a time, so it stops exactly
+ * at the end of the header and the caller's own stdin, and its EOF, reach the
+ * target untouched. A short or malformed header exits 125 before any target
+ * runs. Single line, `;` separated; tracing is switched off first. Follow it
+ * with `export __pc_env && exec /bin/sh -c CALLER_ENV_VAR_EXEC paperclip-env …`.
+ */
+export const CALLER_ENV_STDIN_READER = [
+  "set +xv",
+  "__pc_nl=$(printf '\\n_')",
+  "__pc_nl=${__pc_nl%_}",
+  "__pc_env=",
+  "IFS= read -r __pc_n || exit 125",
+  "case \"$__pc_n\" in ''|*[!0-9]*) exit 125;; esac",
+  "__pc_i=0",
+  "while [ \"$__pc_i\" -lt \"$__pc_n\" ]; do IFS= read -r __pc_l || exit 125; __pc_env=\"$__pc_env$__pc_l$__pc_nl\"; __pc_i=$((__pc_i + 1)); done",
+  "unset __pc_l __pc_i __pc_n __pc_nl",
+].join("; ");

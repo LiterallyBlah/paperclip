@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { definePlugin } from "@paperclipai/plugin-sdk";
+import { buildCallerEnvScript, CALLER_ENV_FILE_EXEC } from "./caller-env.js";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -108,22 +109,40 @@ function buildStdinPath(): string {
   return `/tmp/.paperclip-stdin-${randomUUID()}`;
 }
 
-export function buildShellCommand(input: {
-  command: string;
-  args?: string[];
-  cwd?: string;
-  env?: Record<string, string>;
-  stdin?: string;
-}): string {
-  const envEntries = Object.entries(input.env ?? {});
-  for (const [key] of envEntries) {
+// Validate caller env and render it as the staged env script, or null when
+// there is nothing to send. Caller env carries the agent's PAPERCLIP_API_KEY,
+// so it travels only through the Novita files API, never the command text or
+// any argv (BLA-4139; the PR #59 e2b pattern).
+export function buildNovitaCallerEnvScript(env: Record<string, string> | undefined): string | null {
+  const entries = Object.entries(env ?? {});
+  for (const [key] of entries) {
     if (!isValidShellEnvKey(key)) {
       throw new Error(`Invalid sandbox environment variable key: ${key}`);
     }
   }
+  return buildCallerEnvScript(
+    entries.filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
+}
 
-  const exports = envEntries.map(([key, value]) => `export ${key}=${shellQuote(value)};`);
-  const argv = [input.command, ...(input.args ?? [])].map(shellQuote).join(" ");
+export function buildEnvPath(): string {
+  return `/tmp/.paperclip-env-${randomUUID()}`;
+}
+
+export function buildShellCommand(input: {
+  command: string;
+  args?: string[];
+  cwd?: string;
+  envPath?: string | null;
+  stdin?: string;
+}): string {
+  const commandParts = [input.command, ...(input.args ?? [])].map(shellQuote).join(" ");
+  // Caller env is applied from the staged env file in a fresh `/bin/sh` that
+  // sources no profile (CALLER_ENV_FILE_EXEC). Only the file path is in the
+  // command text; the fresh shell removes the file before exec.
+  const argv = input.envPath
+    ? `/bin/sh -c ${shellQuote(CALLER_ENV_FILE_EXEC)} paperclip-env ${shellQuote(input.envPath)} ${commandParts}`
+    : commandParts;
   const stdinPath = typeof input.stdin === "string" ? buildStdinPath() : null;
   const stdin = stdinPath ? `printf '%s' ${singleQuoteForPrintf(input.stdin ?? "")} > ${shellQuote(stdinPath)}` : "";
   const cwd = input.cwd?.trim() || "/";
@@ -140,7 +159,6 @@ export function buildShellCommand(input: {
     "set -e",
     stdin,
     `cd ${shellQuote(cwd)}`,
-    ...exports,
     ...commandLines,
   ].filter(Boolean).join("\n");
 }
@@ -238,14 +256,20 @@ async function executeInSandbox(
   params: PluginEnvironmentExecuteParams,
   config: NovitaDriverConfig,
 ): Promise<PluginEnvironmentExecuteResult> {
+  // Validate and render caller env before anything is staged.
+  const envScript = buildNovitaCallerEnvScript(params.env);
+  const envPath = envScript != null ? buildEnvPath() : null;
   const command = buildShellCommand({
     command: params.command,
     args: params.args,
     cwd: params.cwd,
-    env: params.env,
+    envPath,
     stdin: params.stdin,
   });
   try {
+    if (envPath && envScript != null) {
+      await sandbox.files.write(envPath, envScript, { requestTimeoutMs: config.requestTimeoutMs });
+    }
     const result = await sandbox.commands.run(command, {
       cwd: "/",
       timeoutMs: params.timeoutMs ?? config.timeoutMs,
@@ -283,6 +307,12 @@ async function executeInSandbox(
       };
     }
     throw error;
+  } finally {
+    // The fresh shell removes the env file before exec; this covers a failed
+    // upload, a failed command or a timeout.
+    if (envPath) {
+      await sandbox.files.remove(envPath, { requestTimeoutMs: config.requestTimeoutMs }).catch(() => undefined);
+    }
   }
 }
 

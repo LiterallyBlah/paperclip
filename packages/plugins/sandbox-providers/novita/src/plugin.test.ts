@@ -11,7 +11,7 @@ vi.mock("novita-sandbox", () => ({
   },
 }));
 
-import plugin, { buildShellCommand, parseNovitaDriverConfig } from "./plugin.js";
+import plugin, { buildNovitaCallerEnvScript, buildShellCommand, parseNovitaDriverConfig } from "./plugin.js";
 
 describe("Novita sandbox provider plugin", () => {
   it("declares a sandbox provider environment driver", () => {
@@ -62,18 +62,19 @@ describe("Novita sandbox provider plugin", () => {
     });
   });
 
-  it("builds a quoted shell command with cwd, env, args, and stdin", () => {
+  it("builds a quoted shell command with cwd, staged env path, args, and stdin", () => {
     const command = buildShellCommand({
       command: "node",
       args: ["-e", "console.log(process.env.MESSAGE)"],
       cwd: "/workspace/project",
-      env: { MESSAGE: "hello world" },
+      envPath: "/tmp/.paperclip-env-test",
       stdin: "input body",
     });
 
     expect(command).toContain("cd '/workspace/project'");
-    expect(command).toContain("export MESSAGE='hello world';");
-    expect(command).toContain("'node' '-e' 'console.log(process.env.MESSAGE)'");
+    // Caller env comes from the staged file (BLA-4139); only its path is here.
+    expect(command).not.toContain("export MESSAGE");
+    expect(command).toContain("paperclip-env '/tmp/.paperclip-env-test' 'node' '-e' 'console.log(process.env.MESSAGE)'");
     expect(command).toContain("printf '%s' 'input body' > '/tmp/.paperclip-stdin-");
     expect(command).toMatch(/< '\/tmp\/\.paperclip-stdin-[^']+'/);
     expect(command).toMatch(/rm -f '\/tmp\/\.paperclip-stdin-[^']+'/);
@@ -110,10 +111,7 @@ describe("Novita sandbox provider plugin", () => {
   });
 
   it("rejects unsafe environment variable keys", () => {
-    expect(() => buildShellCommand({
-      command: "env",
-      env: { "BAD-KEY": "value" },
-    })).toThrow("Invalid sandbox environment variable key");
+    expect(() => buildNovitaCallerEnvScript({ "BAD-KEY": "value" })).toThrow("Invalid sandbox environment variable key");
   });
 
   it("returns a command failure when execute is called for an expired sandbox lease", async () => {
