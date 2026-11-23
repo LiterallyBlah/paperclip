@@ -16,6 +16,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { attentionService } from "../services/attention.js";
 import {
   classifyRecoveryOwnerRoute,
   isOperatorHeldRecoveryAction,
@@ -264,6 +265,22 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
       returnOwnerAgentId: fixture.workerId,
       previousOwnerAgentId: fixture.workerId,
     });
+  });
+
+  it("keeps coordinator-owned routine actions off the board attention feed", async () => {
+    const fixture = await seed();
+    const routed = await boardUpsert(fixture);
+    expect(routed.ownerType).toBe("agent");
+    const reservedFixture = await seed();
+    const reserved = await boardUpsert(reservedFixture, { cause: "provider_auth_required" });
+    expect(reserved.ownerType).toBe("board");
+
+    const recoveryIds = async (companyId: string) =>
+      (await attentionService(db).list(companyId, { userId: "board-user" })).items
+        .filter((item) => item.sourceKind === "recovery_action")
+        .map((item) => item.subject.id);
+    expect(await recoveryIds(fixture.companyId)).not.toContain(routed.id);
+    expect(await recoveryIds(reservedFixture.companyId)).toContain(reserved.id);
   });
 
   it("routes retry-budget exhaustion to the coordinator without recording it as the source owner", async () => {
