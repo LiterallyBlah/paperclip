@@ -8,6 +8,7 @@ import {
   isPrivateAgentCommentaryHttpRequest,
   isPrivateAgentObservabilityHttpRequest,
   isPrivateMuseHttpRequest,
+  isAgentSecretValueBodyHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
 import {
@@ -184,7 +185,7 @@ export function createHttpLogger(baseLogger: Logger) {
         if (/^\/mcp\/(?:oauth|paperclip)(?:\/|$)/.test(requestClassificationUrl(req) ?? "")) {
           return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
         }
-        if (isPrivateWebhook(req) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
+        if (isPrivateWebhook(req) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req)) || isAgentSecretValueBodyHttpRequest(requestClassificationUrl(req))) {
           // Omit, rather than recursively redact, the entire provider payload.
           // This applies equally before/after parsing and with/without context.
           return {
