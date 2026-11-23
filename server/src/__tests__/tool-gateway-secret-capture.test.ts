@@ -263,7 +263,7 @@ rl.on("line", (line) => {
   return { application, connection, templateKey };
 }
 
-type ProviderReply = { result?: unknown; error?: unknown; status?: number };
+type ProviderReply = { result?: unknown; error?: unknown; status?: number; extra?: Record<string, unknown>; sse?: (id: unknown) => string };
 
 async function fixture(options: { permissions?: Record<string, unknown>; reply?: () => ProviderReply } = {}) {
   const f = await createCompanyFixture(options.permissions);
@@ -283,9 +283,12 @@ async function fixture(options: { permissions?: Record<string, unknown>; reply?:
     if (message.method === "initialize") {
       return Response.json({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" } } });
     }
+    // A client reply to a server request (for example an elicitation cancel).
+    if (message.method === undefined) return new Response(null, { status: 202 });
     const next = reply();
     if (next.status && next.status >= 400) return new Response(`upstream failure ${SENTINEL}`, { status: next.status });
-    return Response.json({ jsonrpc: "2.0", id: message.id, ...(next.error ? { error: next.error } : { result: next.result }) });
+    if (next.sse) return new Response(next.sse(message.id), { headers: { "content-type": "text/event-stream" } });
+    return Response.json({ jsonrpc: "2.0", id: message.id, ...(next.error ? { error: next.error } : { result: next.result }), ...next.extra });
   });
   const gateway = createToolGatewayService(db, { promptInjectionProvider: classifier, remoteHttpRequest, toolActionSigningSecret: "capture-signing" });
   const session = await gateway.createSession({ companyId: f.company.id, agentId: f.agent.id, runId: f.run.id });
@@ -454,6 +457,62 @@ describe("tool gateway secret capture", () => {
       expect(dump.audit.some((row) => row.action === "call_failed" && (row.details as { secretCapture?: { captureReason?: string } }).secretCapture?.captureReason === testCase.reason)).toBe(true);
     });
   }
+
+  // Provider interactions are refused in capture mode before anything records
+  // them (issue interactions, call events, retained handoff summaries).
+  const tokenResult = () => ({ content: [{ type: "text", text: cloudflareTokenText() }] });
+  const formElicitation = { message: `Confirm ${SENTINEL}`, requestedSchema: { type: "object", properties: { answer: { type: "string", description: SENTINEL } } } };
+  const sseEvent = (message: unknown) => `event: message\ndata: ${JSON.stringify(message)}\n\n`;
+  const interactionCases: Array<{ name: string; reply: () => ProviderReply }> = [
+    { name: "result elicitation", reply: () => ({ result: { ...tokenResult(), elicitation: formElicitation } }) },
+    { name: "result _meta elicitation", reply: () => ({ result: { ...tokenResult(), _meta: { elicitation: formElicitation } } }) },
+    { name: "top-level elicitation", reply: () => ({ result: tokenResult(), extra: { elicitation: formElicitation } }) },
+    { name: "streamed elicitation request", reply: () => ({ sse: (id) =>
+      sseEvent({ jsonrpc: "2.0", id: "elicit-1", method: "elicitation/create", params: formElicitation })
+      + sseEvent({ jsonrpc: "2.0", id, result: tokenResult() }) }) },
+    { name: "upstream authorization handoff", reply: () => ({ error: { code: -32042, message: `Authorize ${SENTINEL}`, data: { elicitations: [
+      { mode: "url", elicitationId: `elic-${SENTINEL}`, url: `https://dash.cloudflare.com/oauth?code=${SENTINEL}`, message: SENTINEL },
+    ] } } }) },
+    { name: "streamed upstream handoff", reply: () => ({ sse: (id) =>
+      sseEvent({ jsonrpc: "2.0", id: "elicit-2", method: "elicitation/create", params: {
+        mode: "url", elicitationId: `elic-${SENTINEL}`, url: `https://dash.cloudflare.com/oauth?code=${SENTINEL}`, message: SENTINEL } })
+      + sseEvent({ jsonrpc: "2.0", id, result: tokenResult() }) }) },
+  ];
+
+  for (const testCase of interactionCases) {
+    it(`refuses a provider interaction before it is recorded: ${testCase.name}`, async () => {
+      const f = await fixture({ reply: testCase.reply });
+      let caught: unknown;
+      try {
+        await f.gateway.executeTool({
+          sessionToken: f.session.token, tool: f.tool.name, parameters: { code: "mint" },
+          secretCapture: { directive: directive(), actor: standardActor(f) },
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ToolGatewayHttpError);
+      const error = caught as InstanceType<typeof ToolGatewayHttpError>;
+      expect(error.reasonCode).toBe("secret_capture_failed");
+      expect(error.details).toEqual({ captureReason: "provider_error", upstreamReasonCode: "secret_capture_interaction_refused" });
+      const dump = await expectNoLeak(f, { message: error.message, details: error.details });
+      expect(f.classifier).not.toHaveBeenCalled();
+      expect(dump.proposals).toHaveLength(0);
+      expect(dump.interactions).toHaveLength(0);
+      expect(dump.events.some((row) => /elicitation|provider_interaction/.test(JSON.stringify(row)))).toBe(false);
+      const [invocation] = dump.invocations;
+      expect(invocation).toMatchObject({ status: "failed", errorCode: "secret_capture_failed", resultSummary: null, resultHash: null });
+    });
+  }
+
+  it("still records an elicitation for an ordinary call without a directive", async () => {
+    const f = await fixture({ reply: () => ({ result: { content: [{ type: "text", text: "ok" }], elicitation: { message: "Pick one", requestedSchema: { type: "object", properties: { answer: { type: "string" } } } } } }) });
+    const issueSession = await f.gateway.createSession({ companyId: f.company.id, agentId: f.agent.id, runId: f.run.id, issueId: f.issue.id });
+    await expect(f.gateway.executeTool({ sessionToken: issueSession.token, tool: f.tool.name, parameters: { code: "plain" } }))
+      .rejects.toMatchObject({ reasonCode: "elicitation_required" });
+    const dump = await sinkDump(f.company.id);
+    expect(dump.interactions).toHaveLength(1);
+  });
 
   it("keeps the stdio child argv free of the value", async () => {
     const f = await createCompanyFixture();

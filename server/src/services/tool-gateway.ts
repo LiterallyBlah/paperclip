@@ -6171,7 +6171,17 @@ export function createToolGatewayService(
     invocationId: string,
     callerHeaders?: ExecuteGatewayToolInput["callerHeaders"],
     useDefaultTimeout = false,
+    secretCaptureMode = false,
   ): Promise<RemoteHttpExecutionResult> {
+    // In secret-capture mode the provider's elicitations and handoffs are
+    // refused before anything records them: issue interactions, call events,
+    // retained summaries and audit could otherwise hold provider text that
+    // the capture boundary has not yet scrubbed.
+    const refuseCaptureInteraction = () => new ToolGatewayHttpError(
+      409,
+      "Secret capture does not support provider interactions.",
+      "secret_capture_interaction_refused",
+    );
     const { entry, connection } = await resolveConnectedRemoteTool(
       session,
       tool,
@@ -6459,6 +6469,13 @@ export function createToolGatewayService(
             maxBytes: MAX_REMOTE_MCP_RESPONSE_BYTES,
             onRequest: async (message) => {
               const pending = extractRemoteMcpPending(message);
+              if (secretCaptureMode && (pending || extractMcpElicitationRequest(message))) {
+                await dispatchRemote(endpoint, {
+                  method: "POST", headers: mcpHttpRequestHeaders(requestHeaders),
+                  body: JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { action: "cancel" } }),
+                });
+                throw refuseCaptureInteraction();
+              }
               if (pending) {
                 await retainUpstreamHandoff(invocationId, pending);
                 // Defer this interaction to the user. Do not claim that consent
@@ -6526,6 +6543,13 @@ export function createToolGatewayService(
       const payloadRecord = asRecord(payload);
       if (!payloadRecord) throw malformedRemoteMcpResponse();
       const upstreamPending = extractRemoteMcpPending(payloadRecord, String(connection.config.sourceTemplateKey ?? ""), entry.toolName);
+      if (secretCaptureMode && (
+        upstreamPending ||
+        extractMcpElicitationRequest(payloadRecord) ||
+        (Object.prototype.hasOwnProperty.call(payloadRecord, "result") && extractMcpElicitationRequest(payloadRecord.result))
+      )) {
+        throw refuseCaptureInteraction();
+      }
       if (upstreamPending) {
         await retainUpstreamHandoff(invocationId, upstreamPending);
         throw new ToolGatewayHttpError(409, "Complete the provider's authorization or approval before continuing. The original call has not been replayed.", "provider_interaction_required", { upstreamPending, invocationId });
@@ -11041,6 +11065,7 @@ export function createToolGatewayService(
                   invocationId,
                   input.callerHeaders,
                   input.timeoutMs === undefined,
+                  Boolean(captureDirective),
                 )
               : tool.providerType === "mcp_local_stdio"
                 ? await executeLocalStdioTool(
