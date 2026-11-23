@@ -582,6 +582,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
         timeoutMs?: number;
         approvedActionRequestId?: unknown;
         idempotencyKey?: unknown;
+        secretCapture?: unknown;
       };
       if (typeof body.tool !== "string" || body.tool.trim().length === 0) {
         res.status(400).json({ error: '"tool" is required and must be a string' });
@@ -598,6 +599,11 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
           typeof body.approvedActionRequestId === "string" ? body.approvedActionRequestId : null,
         idempotencyKey: typeof body.idempotencyKey === "string" ? body.idempotencyKey : null,
         callerHeaders: callerHeaders(req),
+        // The directive stays server-side. Capture is authorized against the
+        // caller's own Paperclip credential, never the session token alone.
+        secretCapture: body.secretCapture !== undefined
+          ? { directive: body.secretCapture, actor: req.actor?.type === "agent" ? req.actor : null }
+          : null,
       }));
       res.json(result);
     } catch (err) {
