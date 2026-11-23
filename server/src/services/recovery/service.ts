@@ -160,7 +160,11 @@ import {
 import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  isAvailableRecoveryCoordinatorStatus,
   isCoordinatorRoutedRecoveryAction,
+  isOperatorHeldRecoveryAction,
+  readRecoveryOwnerRouting,
+  RECOVERY_COORDINATOR_REWAKE_MS,
   RECOVERY_COORDINATOR_WAKE_REASON,
   RECOVERY_OWNER_ROUTING_EVIDENCE_KEY,
   resolveRecoveryOwner,
@@ -3536,6 +3540,77 @@ export function recoveryService(
     return Boolean(run || wake);
   }
 
+  /**
+   * Give a coordinator-owned recovery action an accountable next step: one
+   * source-scoped recovery wake for the coordinator agent. The wake uses the
+   * existing `source_scoped_recovery_action` path, which admits only the
+   * action's own owner agent and never takes the source execution lock. At
+   * most one wake is outstanding per action; a finished wake is repeated no
+   * more often than {@link RECOVERY_COORDINATOR_REWAKE_MS}.
+   */
+  async function ensureRecoveryCoordinatorWake(
+    action: typeof issueRecoveryActions.$inferSelect,
+    now = new Date(),
+  ) {
+    if (!isCoordinatorRoutedRecoveryAction(action) || !action.ownerAgentId) return null;
+    const routing = readRecoveryOwnerRouting(action.evidence);
+    if (routing?.coordinator !== "assigned") return null;
+    const latest = await latestRecoveryActionRun(action);
+    if (
+      latest &&
+      latest.agentId === action.ownerAgentId &&
+      (EXECUTION_PATH_HEARTBEAT_RUN_STATUSES as readonly string[]).includes(latest.status)
+    ) {
+      return null;
+    }
+    const lastQueuedAt = typeof routing.wakeQueuedAt === "string" ? Date.parse(routing.wakeQueuedAt) : NaN;
+    if (Number.isFinite(lastQueuedAt) && now.getTime() - lastQueuedAt < RECOVERY_COORDINATOR_REWAKE_MS) {
+      return null;
+    }
+    const coordinatorAgent = await getAgent(action.ownerAgentId);
+    if (!coordinatorAgent || !isAvailableRecoveryCoordinatorStatus(coordinatorAgent.status)) return null;
+    const context = {
+      issueId: action.sourceIssueId,
+      taskId: action.sourceIssueId,
+      wakeReason: "source_scoped_recovery_action",
+      recoveryActionId: action.id,
+      recoveryCause: action.cause,
+      recoveryKind: action.kind,
+      recoveryOwnerRole: "coordinator",
+      source: RECOVERY_COORDINATOR_WAKE_REASON,
+    };
+    const queued = await deps.enqueueWakeup(action.ownerAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "source_scoped_recovery_action",
+      payload: withRecoveryContext({ ...context }, "normal_model"),
+      idempotencyKey: `${RECOVERY_COORDINATOR_WAKE_REASON}:${action.id}:${action.attemptCount}:${Math.floor(now.getTime() / RECOVERY_COORDINATOR_REWAKE_MS)}`,
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      contextSnapshot: withRecoveryContext({ ...context }, "normal_model"),
+    });
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        evidence: {
+          ...(action.evidence ?? {}),
+          [RECOVERY_OWNER_ROUTING_EVIDENCE_KEY]: {
+            ...routing,
+            wakeQueuedAt: now.toISOString(),
+            wakeRunId: queued?.id ?? null,
+          },
+        },
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueRecoveryActions.id, action.id),
+        eq(issueRecoveryActions.companyId, action.companyId),
+        eq(issueRecoveryActions.ownerAgentId, action.ownerAgentId),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      ));
+    return queued;
+  }
+
   async function reconcileActiveRecoveryActions() {
     const rows = await db
       .select({ action: issueRecoveryActions, issue: issues })
@@ -3557,13 +3632,18 @@ export function recoveryService(
       issueIds: [] as string[],
     };
     for (const { action, issue } of rows) {
+      const coordinatorRouted = isCoordinatorRoutedRecoveryAction(action);
+      // The coordinator wake does not take the source execution lock, so it
+      // is safe even while a native finalization owner is still unverified.
+      if (coordinatorRouted && issue.status !== "done" && issue.status !== "cancelled") {
+        await ensureRecoveryCoordinatorWake(action);
+      }
       if (await hasUnverifiedNativeWorkspaceFinalizationOwner(db, action)) {
         result.skipped += 1;
         continue;
       }
       const wakePolicy = parseObject(action.wakePolicy);
       const wakePolicyType = readNonEmptyString(wakePolicy.type);
-      const coordinatorRouted = isCoordinatorRoutedRecoveryAction(action);
       if (
         wakePolicyType !== "bounded_recovery_owner" &&
         wakePolicyType !== "bounded_owner_disposition_repair" &&
@@ -3571,9 +3651,6 @@ export function recoveryService(
         !coordinatorRouted
       ) {
         continue;
-      }
-      if (coordinatorRouted && issue.status !== "done" && issue.status !== "cancelled") {
-        await ensureRecoveryCoordinatorWake(action);
       }
 
       if (issue.status === "done" || issue.status === "cancelled") {
@@ -4867,7 +4944,7 @@ export function recoveryService(
         issue.companyId,
         issue.id,
       );
-      if (activeRecoveryAction?.ownerType === "board") {
+      if (activeRecoveryAction && isOperatorHeldRecoveryAction(activeRecoveryAction)) {
         result.skipped += 1;
         continue;
       }

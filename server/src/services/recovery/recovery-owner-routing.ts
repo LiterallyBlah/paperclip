@@ -24,6 +24,8 @@ type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 export const RECOVERY_OWNER_ROUTING_EVIDENCE_KEY = "recoveryOwnerRouting";
 export const RECOVERY_COORDINATOR_WAKE_REASON = "recovery_action_owner_assigned";
+/** Minimum gap before a finished coordinator wake is repeated for the same action. */
+export const RECOVERY_COORDINATOR_REWAKE_MS = 60 * 60 * 1000;
 
 /** Recovery action kinds whose board-owned actions route to the coordinator. */
 export const COORDINATOR_ROUTED_RECOVERY_KINDS: ReadonlySet<IssueRecoveryActionKind> = new Set<IssueRecoveryActionKind>([
@@ -87,6 +89,10 @@ export function classifyRecoveryOwnerRoute(input: {
 
 const AVAILABLE_COORDINATOR_STATUSES = new Set(["active", "idle", "running", "error"]);
 
+export function isAvailableRecoveryCoordinatorStatus(status: string) {
+  return AVAILABLE_COORDINATOR_STATUSES.has(status);
+}
+
 export type RecoveryCoordinatorResolution =
   | { status: "available"; agentId: string; source: "configured" | "root_ceo" }
   | { status: "unavailable"; reason: string };
@@ -135,7 +141,15 @@ export async function resolveRecoveryCoordinator(
 }
 
 export type RecoveryOwnerRoutingEvidence =
-  | { coordinator: "assigned"; agentId: string; source: "configured" | "root_ceo"; routedAt: string }
+  | {
+    coordinator: "assigned";
+    agentId: string;
+    source: "configured" | "root_ceo";
+    routedAt: string;
+    backfilledAt?: string;
+    wakeQueuedAt?: string;
+    wakeRunId?: string | null;
+  }
   | { coordinator: "unavailable"; reason: string; routedAt: string };
 
 export type ResolvedRecoveryOwner = {
@@ -216,4 +230,26 @@ export function isCoordinatorRoutedRecoveryAction(action: {
     routing?.coordinator === "assigned" &&
     routing.agentId === action.ownerAgentId
   );
+}
+
+/**
+ * True for an action held for an operator decision: board-owned, or owned by
+ * the recovery coordinator through routing. Automatic repair flows that act
+ * only on operator-held actions use this instead of `ownerType === "board"`,
+ * so routing changes the owner and nothing else.
+ */
+export function isOperatorHeldRecoveryAction(action: {
+  ownerType: string;
+  ownerAgentId: string | null;
+  evidence: Record<string, unknown> | null | undefined;
+}) {
+  return action.ownerType === "board" || isCoordinatorRoutedRecoveryAction(action);
+}
+
+/** SQL twin of {@link isOperatorHeldRecoveryAction} for raw-SQL predicates. */
+export function operatorHeldRecoveryActionSql(alias: string) {
+  return `((${alias}.owner_type = 'board' AND ${alias}.owner_agent_id IS NULL)
+    OR (${alias}.owner_type = 'agent'
+      AND ${alias}.evidence->'${RECOVERY_OWNER_ROUTING_EVIDENCE_KEY}'->>'coordinator' = 'assigned'
+      AND ${alias}.evidence->'${RECOVERY_OWNER_ROUTING_EVIDENCE_KEY}'->>'agentId' = ${alias}.owner_agent_id::text))`;
 }

@@ -6,6 +6,7 @@ import { conflict } from "../../errors.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
 import { currentNativeWorkspaceRecoveryResult } from "./native-workspace-recovery-binding.js";
 import { evaluateNativeControllerTakeover } from "./native-restart-recovery.js";
+import { isOperatorHeldRecoveryAction } from "../recovery/recovery-owner-routing.js";
 
 const OWNER_KEY = "nativeWorkspaceFinalizationOwner";
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -32,7 +33,7 @@ export async function resumeNativeWorkspaceAfterOwnerStop(input: {
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.nativeIssueId, input.issueId), eq(heartbeatRuns.id, input.runId))).for("update");
     const [action] = await tx.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId), eq(issueRecoveryActions.id, input.actionId))).for("update");
     if (!issue || !run || !coordinator || !action || action.evidence?.runId !== run.id
-      || action.cause !== "native_workspace_finalization_owner_unverified" || action.ownerType !== "board"
+      || action.cause !== "native_workspace_finalization_owner_unverified" || !isOperatorHeldRecoveryAction(action)
       || action.kind !== "active_run_watchdog" || !["active", "escalated"].includes(action.status)
       || (coordinator.leaseOwner && (!coordinator.leaseExpiresAt || coordinator.leaseExpiresAt.getTime() > Date.now()))) throw changed();
     const result = await currentNativeWorkspaceRecoveryResult(tx as unknown as Db, {

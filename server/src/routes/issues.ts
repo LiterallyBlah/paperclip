@@ -385,6 +385,7 @@ import {
   queuedCommentIdsFromWakePayload,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
+import { isOperatorHeldRecoveryAction } from "../services/recovery/recovery-owner-routing.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -9855,7 +9856,7 @@ export function issueRoutes(
         ) {
           if (
             lockedIssue.status !== "blocked" ||
-            activeRecoveryAction.ownerType !== "board" ||
+            !isOperatorHeldRecoveryAction(activeRecoveryAction) ||
             (!workspaceBaseRef && !workspaceRetry && activeRecoveryAction.wakePolicy?.type !== "board_escalation") ||
             !activeRecoveryAction.returnOwnerAgentId ||
             lockedIssue.assigneeAgentId !== activeRecoveryAction.returnOwnerAgentId

@@ -11,6 +11,7 @@ import { withNativeWorkspaceFinalizationOwnership } from "./native-workspace-fin
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import type { EnvironmentRuntimeService } from "../environment-runtime.js";
 import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
+import { isOperatorHeldRecoveryAction } from "../recovery/recovery-owner-routing.js";
 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const changed = () => conflict("The recorded export repair is no longer current. Refresh the task and inspect its run.", { code: "workspace_export_retry_stale" });
@@ -29,7 +30,7 @@ export async function retryNativeWorkspaceExport(input: {
     const run = await one(db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.nativeIssueId, input.issueId))).limit(1));
     const action = await one(db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId), eq(issueRecoveryActions.id, input.actionId))).limit(1));
     if (!issue || !run || !coordinator || !action || action.evidence?.runId !== run.id
-      || action.kind !== "active_run_watchdog" || !isNativeWorkspaceExportRepairCause(action.cause) || action.ownerType !== "board"
+      || action.kind !== "active_run_watchdog" || !isNativeWorkspaceExportRepairCause(action.cause) || !isOperatorHeldRecoveryAction(action)
       || !["active", "escalated"].includes(action.status) || run.runtimeMode !== "native"
       || !(issue.status === "blocked" || (issue.status === "in_review" && action.cause === "native_workspace_sync_out_retry_exhausted")) || issue.assigneeAgentId !== run.agentId
       || (issue.executionRunId && issue.executionRunId !== run.id)
