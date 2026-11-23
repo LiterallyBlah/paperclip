@@ -616,7 +616,7 @@ describe("execute", () => {
     ] }],
     ["https://localhost", { code: "ECONNREFUSED", syscall: "connect", address: "127.0.0.1", port: 443 }],
     ["http://localhost", { code: "ECONNREFUSED", syscall: "connect", address: "127.0.0.1", port: 80 }],
-  ])("explains the server-side loopback gateway at %s without claiming non-dispatch", async (apiBaseUrl, cause) => {
+  ])("explains the server-side loopback gateway at %s and records non-dispatch", async (apiBaseUrl, cause) => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
       throw Object.assign(new Error("fetch failed"), { cause });
     });
@@ -632,13 +632,13 @@ describe("execute", () => {
     expect(result.errorMeta).toEqual({ category: "gateway_loopback_connection_refused", phase: "create_run" });
     expect(result).toMatchObject({ exitCode: 1, signal: null, timedOut: false,
       errorCode: "hermes_gateway_connect_failed", errorFamily: "transient_upstream", retryNotBefore: null });
-    expect(result.executionRecovery).toBeUndefined();
+    expect(result.executionRecovery).toEqual({ kind: "bootstrap", providerWorkStarted: false });
     expect(result.resultJson).toEqual({ connectionFailure: {
       schemaVersion: 1, provider: "hermes_gateway", operation: "create_run", reason: "connection_refused",
     } });
     expect(ctx.onDispatch).toHaveBeenCalledOnce();
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(fetchMock.mock.calls[0]?.[1]?.redirect).toBeUndefined();
+    expect(fetchMock.mock.calls[0]?.[1]?.redirect).toBe("manual");
   });
 
   it.each([
@@ -661,7 +661,13 @@ describe("execute", () => {
     expect(result.errorCode).toBe("hermes_gateway_connect_failed");
     expect(result.errorMessage).not.toContain("refers to the Paperclip server");
     expect(result.errorMeta).toEqual({});
-    expect(result.executionRecovery).toBeUndefined();
+    // Non-dispatch evidence follows the transport cause, not the loopback hint.
+    const connectPhase = (value: Record<string, unknown>): boolean => Array.isArray(value.errors)
+      ? value.errors.length > 0 && value.errors.every((item) => connectPhase(item as Record<string, unknown>))
+      : ["ECONNREFUSED", "EHOSTUNREACH"].includes(String(value.code));
+    expect(result.executionRecovery).toEqual(connectPhase(cause as Record<string, unknown>)
+      ? { kind: "bootstrap", providerWorkStarted: false }
+      : undefined);
   });
 
   it("does not infer loopback refusal from an HTTP provider response", async () => {
@@ -740,6 +746,141 @@ describe("execute", () => {
   });
 });
 
+describe("create_run non-dispatch receipt", () => {
+  const config = { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "gateway-private-key" };
+  const receipt = { kind: "bootstrap", providerWorkStarted: false };
+  const fetchFailed = (cause: unknown) => new TypeError("fetch failed", { cause });
+
+  it.each([
+    ["ECONNREFUSED", { code: "ECONNREFUSED", syscall: "connect", address: "127.0.0.1", port: 8642 }],
+    ["ENOTFOUND", { code: "ENOTFOUND", syscall: "getaddrinfo", hostname: "hermes.invalid" }],
+    ["EAI_AGAIN", { code: "EAI_AGAIN", syscall: "getaddrinfo", hostname: "hermes.invalid" }],
+    ["EHOSTUNREACH", { code: "EHOSTUNREACH", syscall: "connect", address: "10.0.0.9", port: 8642 }],
+    ["ENETUNREACH", { code: "ENETUNREACH", syscall: "connect", address: "10.0.0.9", port: 8642 }],
+    ["UND_ERR_CONNECT_TIMEOUT", { code: "UND_ERR_CONNECT_TIMEOUT", name: "ConnectTimeoutError" }],
+    ["aggregate of refusals", Object.assign(new AggregateError([
+      Object.assign(new Error("connect ECONNREFUSED ::1:8642"), { code: "ECONNREFUSED", syscall: "connect" }),
+      Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:8642"), { code: "ECONNREFUSED", syscall: "connect" }),
+    ]), { code: "ECONNREFUSED" })],
+    ["aggregate of mixed connect-phase failures", new AggregateError([
+      { code: "ENETUNREACH", syscall: "connect" }, { code: "ECONNREFUSED", syscall: "connect" },
+    ])],
+  ])("records providerWorkStarted=false when create_run fails before connect: %s", async (_label, cause) => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => { throw fetchFailed(cause); });
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx = makeCtx(config);
+    ctx.onDispatch = vi.fn();
+    const result = await execute(ctx);
+    expect(result).toMatchObject({ exitCode: 1, errorCode: "hermes_gateway_connect_failed", executionRecovery: receipt });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("http://127.0.0.1:8642/v1/runs");
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "POST", redirect: "manual" });
+  });
+
+  it.each([
+    ["ECONNRESET", { code: "ECONNRESET", syscall: "read" }],
+    ["EPIPE", { code: "EPIPE", syscall: "write" }],
+    ["UND_ERR_SOCKET", { code: "UND_ERR_SOCKET", name: "SocketError" }],
+    ["UND_ERR_HEADERS_TIMEOUT", { code: "UND_ERR_HEADERS_TIMEOUT", name: "HeadersTimeoutError" }],
+    ["UND_ERR_BODY_TIMEOUT", { code: "UND_ERR_BODY_TIMEOUT", name: "BodyTimeoutError" }],
+    ["ETIMEDOUT", { code: "ETIMEDOUT", syscall: "connect" }],
+    ["TLS failure after connect", { code: "CERT_HAS_EXPIRED" }],
+    ["refusal code on a post-connect syscall", { code: "ECONNREFUSED", syscall: "read" }],
+    ["redirect rejected by fetch", new Error("unexpected redirect")],
+    ["no cause", undefined],
+    ["aggregate with one reset", new AggregateError([
+      { code: "ECONNREFUSED", syscall: "connect" }, { code: "ECONNRESET", syscall: "read" },
+    ])],
+    ["empty aggregate", Object.assign(new AggregateError([]), { code: "ECONNREFUSED" })],
+    ["aggregate member without a code", new AggregateError([{ code: "ECONNREFUSED" }, { syscall: "connect" }])],
+  ])("never records a receipt for an ambiguous create_run transport failure: %s", async (_label, cause) => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw fetchFailed(cause); }));
+    const result = await execute(makeCtx(config));
+    expect(result.errorCode).toBe("hermes_gateway_connect_failed");
+    expect(result.executionRecovery).toBeUndefined();
+  });
+
+  it("never records a receipt for an aborted create_run", async () => {
+    const aborted = Object.assign(new Error("aborted", { cause: { code: "ECONNREFUSED", syscall: "connect" } }), { name: "AbortError" });
+    vi.stubGlobal("fetch", vi.fn(async () => { throw aborted; }));
+    const result = await execute(makeCtx(config));
+    expect(result.executionRecovery).toBeUndefined();
+  });
+
+  it.each([301, 302, 303, 307, 308])("treats HTTP %i from create_run as a protocol error without following it", async (status) => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(null, {
+      status, headers: { location: "http://127.0.0.1:9999/v1/runs" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await execute(makeCtx(config));
+    expect(result).toMatchObject({ exitCode: 1, errorCode: "hermes_gateway_protocol_error", errorMeta: { status } });
+    expect(result.executionRecovery).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[1]?.redirect).toBe("manual");
+  });
+
+  it.each([500, 502, 503, 400, 401, 404, 429])("never records a receipt for HTTP %i from create_run", async (status) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "ECONNREFUSED" }), { status })));
+    const result = await execute(makeCtx(config));
+    expect(result.exitCode).toBe(1);
+    expect(result.executionRecovery).toBeUndefined();
+  });
+
+  it("never records a receipt when the create response body fails after connect", async () => {
+    const response = new Response("unread");
+    vi.spyOn(response, "text").mockRejectedValue(new TypeError("terminated", { cause: { code: "ECONNREFUSED", syscall: "connect" } }));
+    vi.stubGlobal("fetch", vi.fn(async () => response));
+    const result = await execute(makeCtx(config));
+    expect(result.exitCode).toBe(1);
+    expect(result.executionRecovery).toBeUndefined();
+  });
+
+  it("never records a receipt when a status, events or stop request is refused after create_run", async () => {
+    const refused = () => fetchFailed({ code: "ECONNREFUSED", syscall: "connect", address: "127.0.0.1", port: 8642 });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs") && init?.method === "POST") {
+        return new Response(JSON.stringify({ run_id: "run-created", status: "started" }), { status: 200 });
+      }
+      throw refused();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await execute(makeCtx({ ...config, timeoutSec: 0.3, pollIntervalMs: 250, eventReconnectMs: 250 }));
+    expect(result.timedOut).toBe(true);
+    expect(result.executionRecovery).toBeUndefined();
+    const followUps = fetchMock.mock.calls.filter(([input]) => !String(input).endsWith("/v1/runs"));
+    expect(followUps.length).toBeGreaterThan(0);
+    expect(followUps.every(([, init]) => init?.redirect === undefined)).toBe(true);
+  });
+
+  it("does not record a receipt from a real loopback server that resets the create request", async () => {
+    vi.unstubAllGlobals();
+    const { createServer } = await import("node:net");
+    const server = createServer((socket) => socket.destroy());
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const port = (server.address() as { port: number }).port;
+      const result = await execute(makeCtx({ apiBaseUrl: `http://127.0.0.1:${port}`, apiKey: "gateway-private-key" }));
+      expect(result.errorCode).toBe("hermes_gateway_connect_failed");
+      expect(result.executionRecovery).toBeUndefined();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("records a receipt from a real refused loopback connection", async () => {
+    vi.unstubAllGlobals();
+    const { createServer } = await import("node:net");
+    const server = createServer();
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const result = await execute(makeCtx({ apiBaseUrl: `http://127.0.0.1:${port}`, apiKey: "gateway-private-key" }));
+    expect(result).toMatchObject({ errorCode: "hermes_gateway_connect_failed", executionRecovery: receipt,
+      errorMeta: { category: "gateway_loopback_connection_refused", phase: "create_run" } });
+  });
+});
+
 describe("gateway connection failure reporting", () => {
   const config = { apiBaseUrl: "https://gateway.example.test", apiKey: "gateway-private-key" };
   const marker = (operation: string, reason: string) => ({
@@ -811,7 +952,10 @@ describe("gateway connection failure reporting", () => {
       errorCode: "hermes_gateway_connect_failed", errorFamily: "transient_upstream", retryNotBefore: null,
       resultJson: { connectionFailure: marker("create_run", reason) } });
     expect(result.errorMessage).toContain(code);
-    expect(result.executionRecovery).toBeUndefined();
+    const connectPhase = ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "UND_ERR_CONNECT_TIMEOUT"];
+    expect(result.executionRecovery).toEqual(connectPhase.includes(code)
+      ? { kind: "bootstrap", providerWorkStarted: false }
+      : undefined);
   });
 
   it("classifies a network failure reading the create response without rewriting its error", async () => {

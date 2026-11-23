@@ -120,6 +120,41 @@ function rememberNetworkFailure(target: Error, error: unknown): void {
   });
 }
 
+// Failures that happen before a TCP connection to the gateway exists. The
+// create_run request is sent with redirect: "manual", so a throw with one of
+// these causes means no request bytes reached any HTTP server. Resets, socket
+// errors and header/body timeouts happen after connect and stay ambiguous.
+const CONNECT_PHASE_FAILURE_CODES = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+const CONNECT_PHASE_SYSCALLS = new Set(["connect", "getaddrinfo"]);
+const fetchTransportFailures = new WeakSet<Error>();
+
+function isConnectPhaseFailure(value: unknown, depth = 0): boolean {
+  const cause = asRecord(value);
+  if (!cause || depth > 2 || cause.name === "AbortError") return false;
+  if (cause.code !== undefined && (typeof cause.code !== "string" || !CONNECT_PHASE_FAILURE_CODES.has(cause.code))) return false;
+  if (cause.syscall !== undefined && (typeof cause.syscall !== "string" || !CONNECT_PHASE_SYSCALLS.has(cause.syscall))) return false;
+  if (cause.errors !== undefined) {
+    // AggregateError (for example Happy Eyeballs): every attempt must have failed before connect.
+    if (!Array.isArray(cause.errors) || cause.errors.length === 0 || cause.errors.length > 8) return false;
+    return cause.errors.every((error) => isConnectPhaseFailure(error, depth + 1));
+  }
+  return typeof cause.code === "string";
+}
+
+/** Positive non-dispatch evidence for a create_run request that never connected. */
+function createRunNotDispatched(err: unknown): boolean {
+  if (!(err instanceof Error) || !fetchTransportFailures.has(err)) return false;
+  const hermesError = err as HermesHttpError;
+  return hermesError.code === "hermes_gateway_connect_failed" && isConnectPhaseFailure(hermesError.transportCause);
+}
+
 function httpFailureReason(status: number): GatewayRequestFailure["reason"] | null {
   if (status === 401 || status === 403) return "authentication_failed";
   if (status === 404) return "endpoint_not_found";
@@ -448,6 +483,7 @@ async function fetchJson(input: RequestInfo | URL, init: RequestInit): Promise<u
     fetchErr.code = "hermes_gateway_connect_failed";
     fetchErr.transportCause = err instanceof Error ? err.cause : undefined;
     rememberNetworkFailure(fetchErr, err);
+    if (!(err instanceof Error && err.name === "AbortError")) fetchTransportFailures.add(fetchErr);
     throw fetchErr;
   }
   let body: unknown;
@@ -870,7 +906,12 @@ function isConfiguredLoopbackRefusal(error: HermesHttpError, baseUrl: URL): bool
   });
 }
 
-function errorResult(err: unknown, baseUrl: URL, redactText: TextRedactor = sanitizeSensitiveText): AdapterExecutionResult {
+function errorResult(
+  err: unknown,
+  baseUrl: URL,
+  redactText: TextRedactor = sanitizeSensitiveText,
+  options: { createRunNotDispatched?: boolean } = {},
+): AdapterExecutionResult {
   const hermesError = err as HermesHttpError;
   const code = hermesError.code ?? "hermes_gateway_protocol_error";
   const classified = hermesError.status ? classifyHttpError(hermesError.status) : null;
@@ -882,6 +923,7 @@ function errorResult(err: unknown, baseUrl: URL, redactText: TextRedactor = sani
       ? `${redactErrorMessage(err, redactText)}. The configured loopback gateway refers to the Paperclip server, not an agent sandbox or your browser's machine. Check that the Hermes API server is running there, or set adapterConfig.apiBaseUrl to its address reachable from the Paperclip server. Hermes Gateway connects to an already-running gateway; use hermes_local if Paperclip should launch the local Hermes CLI.`
       : redactErrorMessage(err, redactText);
   return {
+    ...(options.createRunNotDispatched ? { executionRecovery: { kind: "bootstrap" as const, providerWorkStarted: false as const } } : {}),
     exitCode: 1,
     signal: null,
     timedOut: false,
@@ -891,8 +933,8 @@ function errorResult(err: unknown, baseUrl: URL, redactText: TextRedactor = sani
     errorMessage,
     ...(connectionFailure ? { resultJson: { connectionFailure } } : {}),
     errorMeta: {
-      // Diagnosis only: a redirected request may have received a response
-      // before refusing a later connection. This never proves non-dispatch.
+      // Diagnosis only. Non-dispatch evidence is executionRecovery, which is
+      // derived from the create_run transport cause, not from this category.
       ...(loopbackRefused ? { category: "gateway_loopback_connection_refused", phase: "create_run" } : {}),
       ...(hermesError.status ? { status: hermesError.status } : {}),
       ...(hermesError.body ? { body: redactForLog(hermesError.body, [], 0, redactText) as Record<string, unknown> } : {}),
@@ -1009,6 +1051,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       method: "POST",
       headers: runHeaders,
       body: JSON.stringify(body),
+      // Never follow a redirect: a 3xx is a protocol error, and a connect
+      // failure then proves that no server received this create request.
+      redirect: "manual",
     });
     runId = extractRunId(created);
     if (!runId) {
@@ -1022,7 +1067,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
   } catch (err) {
-    return errorResult(err, baseUrl, redactText);
+    return errorResult(err, baseUrl, redactText, { createRunNotDispatched: createRunNotDispatched(err) });
   }
 
   await ctx.onLog("stdout", `[hermes-gateway] run created: ${runId}\n`);
