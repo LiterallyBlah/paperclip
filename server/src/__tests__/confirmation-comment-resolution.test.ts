@@ -26,7 +26,7 @@ const support = await getEmbeddedPostgresTestSupport();
   // A conversational reply can only be recorded by an agent when the card
   // admits agents. A card with no agent addressee that omits resolverPolicy
   // inherits human_only, so these fixtures set the policy explicitly.
-  async function seed(checkbox = false, conversation = false, resolverPolicy: "anyone" | undefined = "anyone") {
+  async function seed(checkbox = false, conversation = false, resolverPolicy: "anyone" | null = "anyone") {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Replies", issuePrefix: companyId.slice(0, 8) });
     if (conversation) {
@@ -221,7 +221,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await readCard(f.card.id)).status).toBe("pending");
   });
   it.each([false, true])("refuses to record a reply on an ordinary task card that omitted resolverPolicy (checkbox: %s)", async (checkbox) => {
-    const f = await seed(checkbox, false, undefined);
+    const f = await seed(checkbox, false, null);
     expect(f.card.requestedResolverPolicy).toBe("human_only");
     expect(f.card.effectiveResolverPolicy).toBe("human_only");
     await expect(resolveConfirmationFromComment(db, f.args)).rejects.toThrow();
@@ -229,7 +229,7 @@ const support = await getEmbeddedPostgresTestSupport();
   });
 
   it("keeps recording replies on an Agent Chat card that omitted resolverPolicy", async () => {
-    const f = await seed(false, true, undefined);
+    const f = await seed(false, true, null);
     expect(f.card.requestedResolverPolicy).toBe("anyone");
     expect(f.card.resolverPolicyProvenance).toBe("inherited");
     const result = await resolveConfirmationFromComment(db, f.args);
