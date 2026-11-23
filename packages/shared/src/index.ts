@@ -2190,6 +2190,8 @@ export {
   secretProviderConfigPayloadSchema,
   createSecretBindingSchema,
   rotateSecretSchema,
+  agentRotateBoundSecretSchema,
+  AGENT_BOUND_SECRET_ROTATE_MAX_VALUE_BYTES,
   secretBindingTargetSchema,
   updateSecretSchema,
   createToolActionRequestSchema,
