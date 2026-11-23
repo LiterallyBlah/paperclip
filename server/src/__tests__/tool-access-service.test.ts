@@ -18043,6 +18043,35 @@ describeEmbeddedPostgres("tool access service", () => {
     ]);
   });
 
+  it("syncs a newly added shared reconnect key onto the default organization grant", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([readTool("list_zaps", "List")]);
+    const actor = { actorType: "user" as const, actorId: "board" };
+    const connect = await withGalleryServerUrl("github", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(company.id, {
+        galleryKey: "github", connectionMethodKey: "mcp-key", name: "GitHub shared reconnect",
+        credentialValues: { "credentials.authorization": "old-secret" },
+      }, actor));
+    // A shared connection without a stored key (as in the US-8 e2e fixture):
+    // reconnect must create a new secret rather than rotate an existing one.
+    await db.update(toolConnections).set({ credentialRefs: [], credentialSecretRefs: [] })
+      .where(eq(toolConnections.id, connect.connectionId));
+    await db.update(connectionGrants).set({ credentialSecretRefs: [] })
+      .where(and(eq(connectionGrants.connectionId, connect.connectionId), eq(connectionGrants.kind, "organization")));
+
+    const result = await service.reconnectGalleryApp(connect.connectionId, company.id,
+      { credentialValues: { "credentials.authorization": "new-secret" } }, actor);
+
+    expect(result.connection.healthStatus).toBe("ok");
+    const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connect.connectionId));
+    const [grant] = await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, connect.connectionId),
+      eq(connectionGrants.kind, "organization"), eq(connectionGrants.isDefault, true)));
+    expect(row!.credentialSecretRefs).toEqual([expect.objectContaining({ configPath: "credentials.authorization" })]);
+    expect(grant).toMatchObject({ status: "active", credentialSecretRefs: row!.credentialSecretRefs });
+  });
+
   it("orders static-key reconnect with concurrent personal grant revocation", async () => {
     const company = await createCompany(db);
     await createAgent(db, company.id);

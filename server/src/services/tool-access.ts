@@ -3693,6 +3693,11 @@ export function toolAccessService(
         })
         .where(eq(toolConnections.id, connection.id))
         .returning();
+      // Health and invocation read a shared connection's default organization
+      // grant, so the reconnected refs must reach it in this transaction. The
+      // sync skips non-shared policies and never creates or reactivates a grant.
+      if (!personalIdentity)
+        await syncDefaultOrganizationGrantCredentials(nextConnection!, tx as unknown as Db);
       await syncConnectionCredentialBindings(tx, nextConnection,
         personalIdentity ? credentialSecretRefs : []);
       return nextConnection;
