@@ -19847,8 +19847,11 @@ describeEmbeddedPostgres("tool access service", () => {
         actorId: "board",
       }),
     ).rejects.toMatchObject({
+      // The ref exists only on the connection row, so the default organization
+      // grant that invocation uses cannot supply it: health fails with the
+      // same code invocation would, before touching the secret store.
       status: 422,
-      details: expect.objectContaining({ code: "secret_missing" }),
+      details: expect.objectContaining({ code: "mcp_remote_missing_secret" }),
     });
     const [updatedConnection] = await db
       .select()
@@ -19866,7 +19869,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(audit).toMatchObject({
       action: "tool_connection.health_check",
       outcome: "failure",
-      reasonCode: "secret_missing",
+      reasonCode: "mcp_remote_missing_secret",
       details: { status: "missing_secret", transport: "mcp_remote" },
     });
     expect(JSON.stringify(audit)).not.toContain("Bearer ");
