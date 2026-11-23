@@ -234,15 +234,24 @@ function buildEnvExportScript(env: Record<string, string> | undefined): string |
   return lines.length > 0 ? `${lines.join("\n")}\n` : null;
 }
 
+// Applies the staged caller env in a fresh `/bin/sh` that has not sourced any
+// profile, then execs the target. A profile can mark a name readonly, and
+// assigning caller env in the profile shell would then fail, where
+// `exec env K=v` used to override it for the child. The fresh shell inherits
+// only the profile's exported values, not readonly attributes, so caller env
+// still wins. `$1` is the env file path; it is removed before exec, and only
+// the path is ever in argv (BLA-3978).
+const CALLER_ENV_EXEC_SCRIPT = '. "$1" && { rm -f "$1" || true; } && shift && exec "$@"';
+
 // Modal's `sandbox.exec` takes an argv array and bypasses the shell entirely,
 // so adapter probes that rely on PATH mutations from /etc/profile or ~/.bashrc
 // do not work without an explicit profile source. Wrap the user command in a
 // `sh -c` script that sources the common login profiles before it runs. The
 // script sources no `nvm.sh`; the sandbox image supplies node on the PATH. The
 // script sources the profiles itself, so a non-login shell (`sh -c`) is enough.
-// Caller env is sourced from the staged env file after profile sourcing so
-// caller env wins; the file is removed before exec and only its path is in the
-// script. Stdin is staged to a temp file and shell-redirected so fast-failing
+// Caller env is applied from the staged env file after profile sourcing, in a
+// fresh shell (see CALLER_ENV_EXEC_SCRIPT), so caller env wins; only the file
+// path is in the script. Stdin is staged to a temp file and shell-redirected so fast-failing
 // commands do not race a streaming stdin writer.
 function buildLoginShellScript(input: {
   command: string;
@@ -264,11 +273,11 @@ function buildLoginShellScript(input: {
   if (input.cwd) {
     lines.push(`cd ${shellQuote(input.cwd)}`);
   }
-  if (input.envPath) {
-    const quoted = shellQuote(input.envPath);
-    lines.push(`. ${quoted}`, `{ rm -f ${quoted} || true; }`);
-  }
-  lines.push(`exec ${redirected}`);
+  lines.push(
+    input.envPath
+      ? `exec /bin/sh -c ${shellQuote(CALLER_ENV_EXEC_SCRIPT)} paperclip-env ${shellQuote(input.envPath)} ${redirected}`
+      : `exec ${redirected}`,
+  );
   return lines.join(" && ");
 }
 

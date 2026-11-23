@@ -170,6 +170,15 @@ function buildEnvExportScript(env: Record<string, string> | undefined): string |
   return lines.length > 0 ? `${lines.join("\n")}\n` : null;
 }
 
+// Applies the staged caller env in a fresh `/bin/sh` that has not sourced any
+// profile, then execs the target. Profile shells can mark names readonly (or,
+// for bash, own builtin readonly names such as UID); assigning caller env
+// there would fail, where `exec env K=v` used to override them for the child.
+// The fresh shell inherits only the profile's exported values, not its
+// readonly attributes, so caller env still wins. `$1` is the env file path; it
+// is removed before exec, and only the path is ever in argv (BLA-3978).
+const CALLER_ENV_EXEC_SCRIPT = '. "$1" && { rm -f "$1" || true; } && shift && exec "$@"';
+
 // Source the user's login profiles before exec so commands run with the same
 // PATH the user sees in an interactive shell. e2b's `sandbox.commands.run`
 // otherwise spawns a non-login, non-interactive shell whose PATH does not
@@ -177,9 +186,9 @@ function buildEnvExportScript(env: Record<string, string> | undefined): string |
 // .profile/.bashrc — which makes the hello probe fail with
 // `exec: <cli>: not found` even when the binary is on disk. The wrapper no
 // longer sources `nvm.sh`; the sandbox image supplies `node` on the PATH.
-// Caller env is sourced from the staged env file after the profiles, so it
-// still wins over anything the profiles export; the file is removed before
-// exec. Only the file path is in the command text.
+// Caller env is applied from the staged env file after the profiles, in a
+// fresh shell (see CALLER_ENV_EXEC_SCRIPT), so it still wins over anything the
+// profiles export. Only the file path is in the command text.
 function buildLoginShellScript(input: {
   command: string;
   args: string[];
@@ -196,11 +205,11 @@ function buildLoginShellScript(input: {
     'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
   ];
-  if (input.envPath) {
-    const quoted = shellQuote(input.envPath);
-    steps.push(`. ${quoted}`, `{ rm -f ${quoted} || true; }`);
-  }
-  steps.push(`exec ${commandParts}`);
+  steps.push(
+    input.envPath
+      ? `exec /bin/sh -c ${shellQuote(CALLER_ENV_EXEC_SCRIPT)} paperclip-env ${shellQuote(input.envPath)} ${commandParts}`
+      : `exec ${commandParts}`,
+  );
   return steps.join(" && ");
 }
 

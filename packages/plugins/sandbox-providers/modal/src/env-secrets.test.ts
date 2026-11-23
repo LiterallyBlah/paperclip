@@ -36,14 +36,17 @@ const PROBE = [
   "const stdin=process.env.PROBE_READ_STDIN?fs.readFileSync(0,'utf8'):null;",
   "const leftovers=fs.readdirSync(dir).filter((n)=>n.startsWith('paperclip-env-'));",
   "process.stdout.write(JSON.stringify({key:process.env.PAPERCLIP_API_KEY??null,other:process.env.OTHER_SECRET??null,",
-  "multi:process.env.MULTI??null,argv:process.argv,stdin,leftovers}));",
+  "multi:process.env.MULTI??null,uid:process.env.UID??null,profileOnly:process.env.PROFILE_ONLY??null,",
+  "argv:process.argv,stdin,leftovers}));",
   "process.exit(Number(process.env.PROBE_EXIT??0));",
 ].join("");
 
 let root: string;
 
 function createRealShellSandbox(options: { failOpen?: (remotePath: string) => boolean } = {}) {
-  const toLocal = (text: string) => text.split("/tmp/paperclip-").join(`${root}/paperclip-`);
+  // Only rewrite sandbox staging paths (at the start or right after a quote),
+  // never a host TMPDIR that itself contains `/tmp/paperclip-`.
+  const toLocal = (text: string) => text.replace(/(^|')\/tmp\/paperclip-/g, (_m, lead: string) => `${lead}${root}/paperclip-`);
   const execArgvs: string[][] = [];
   const execParams: unknown[] = [];
   const sandbox = {
@@ -187,5 +190,24 @@ describe("Modal execute keeps env secrets out of exec argv (BLA-3978)", () => {
     expectNoSecretIn(fake.execArgvs, [DUMMY_API_KEY]);
     expect(fake.execArgvs.some((argv) => /rm -f '\/tmp\/paperclip-env-/.test(argv.join(" ")))).toBe(true);
     expect(stagedLeftovers()).toEqual([]);
+  });
+  it("keeps caller env over a name the login profile marks readonly", async () => {
+    fs.writeFileSync(
+      path.join(root, ".profile"),
+      "export OTHER_SECRET='profile-dummy'\nreadonly OTHER_SECRET\nreadonly PAPERCLIP_API_KEY='profile-key'\nexport PROFILE_ONLY='from-profile'\n",
+    );
+    const fake = createRealShellSandbox();
+    mockSandboxesFromId.mockResolvedValue(fake.sandbox);
+
+    const result = await execute({ PAPERCLIP_API_KEY: DUMMY_API_KEY, OTHER_SECRET: DUMMY_OTHER });
+
+    expect(result?.exitCode).toBe(0);
+    const out = JSON.parse(result!.stdout);
+    expect(out.key).toBe(DUMMY_API_KEY);
+    expect(out.other).toBe(DUMMY_OTHER);
+    expect(out.profileOnly).toBe("from-profile");
+    expect(out.leftovers).toEqual([]);
+    expectNoSecretIn(fake.execArgvs, [DUMMY_API_KEY, DUMMY_OTHER]);
+    expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);
   });
 });

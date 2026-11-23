@@ -44,7 +44,8 @@ const PROBE = [
   "const stdin=process.env.PROBE_READ_STDIN?fs.readFileSync(0,'utf8'):null;",
   "const leftovers=fs.readdirSync(dir).filter((n)=>n.startsWith('paperclip-env-'));",
   "process.stdout.write(JSON.stringify({key:process.env.PAPERCLIP_API_KEY??null,other:process.env.OTHER_SECRET??null,",
-  "multi:process.env.MULTI??null,argv:process.argv,stdin,leftovers}));",
+  "multi:process.env.MULTI??null,uid:process.env.UID??null,profileOnly:process.env.PROFILE_ONLY??null,",
+  "argv:process.argv,stdin,leftovers}));",
   "process.exit(Number(process.env.PROBE_EXIT??0));",
 ].join("");
 
@@ -69,7 +70,7 @@ function createRealShellSandbox() {
       run: vi.fn(async (command: string, options?: unknown) => {
         commandTexts.push(command);
         runOptions.push(options);
-        const localCommand = command.split("/tmp/paperclip-").join(`${root}/paperclip-`);
+        const localCommand = command.replace(/'\/tmp\/paperclip-/g, () => `'${root}/paperclip-`);
         const res = spawnSync("bash", ["-c", localCommand], {
           cwd: root,
           env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, PROBE_DIR: root },
@@ -190,6 +191,39 @@ describe("E2B execute keeps env secrets out of command text and argv (BLA-3978)"
     );
     expect(fake.commandTexts).toEqual([]);
     expect(fake.sandbox.files.remove).toHaveBeenCalledWith(expect.stringMatching(/^\/tmp\/paperclip-env-/));
+    expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);
+  });
+  it("keeps caller env over a name the login profile marks readonly", async () => {
+    fs.writeFileSync(
+      path.join(root, ".profile"),
+      "export OTHER_SECRET='profile-dummy'\nreadonly OTHER_SECRET\nreadonly PAPERCLIP_API_KEY='profile-key'\nexport PROFILE_ONLY='from-profile'\n",
+    );
+    const fake = createRealShellSandbox();
+    mockConnect.mockResolvedValue(fake.sandbox);
+
+    const result = await execute({ PAPERCLIP_API_KEY: DUMMY_API_KEY, OTHER_SECRET: DUMMY_OTHER });
+
+    expect(result?.exitCode).toBe(0);
+    const out = JSON.parse(result!.stdout);
+    expect(out.key).toBe(DUMMY_API_KEY);
+    expect(out.other).toBe(DUMMY_OTHER);
+    expect(out.profileOnly).toBe("from-profile");
+    expect(out.leftovers).toEqual([]);
+    expectNoSecretIn(fake.commandTexts, [DUMMY_API_KEY, DUMMY_OTHER]);
+    expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);
+  });
+
+  it("keeps caller env for a name that is a bash builtin readonly variable (UID)", async () => {
+    const fake = createRealShellSandbox();
+    mockConnect.mockResolvedValue(fake.sandbox);
+
+    const result = await execute({ PAPERCLIP_API_KEY: DUMMY_API_KEY, UID: "dummy-uid-bla3978" });
+
+    expect(result?.exitCode).toBe(0);
+    const out = JSON.parse(result!.stdout);
+    expect(out.uid).toBe("dummy-uid-bla3978");
+    expect(out.key).toBe(DUMMY_API_KEY);
+    expectNoSecretIn(fake.commandTexts, [DUMMY_API_KEY]);
     expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);
   });
 });

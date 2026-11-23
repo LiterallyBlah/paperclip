@@ -310,7 +310,7 @@ describe("E2B sandbox provider plugin", () => {
     // Env is staged through the files API and sourced; only its path is in the command (BLA-3978).
     expect(sandbox.files.write).toHaveBeenCalledWith(expect.stringMatching(/^\/tmp\/paperclip-env-/), "export FOO='bar'\n");
     expect(stdinCall[0]).not.toContain("bar");
-    expect(stdinCall[0]).toMatch(/&& \. '\/tmp\/paperclip-env-[^']+' && \{ rm -f '\/tmp\/paperclip-env-[^']+' \|\| true; \} && exec 'printf' 'hello' < '\/tmp\/paperclip-stdin-/);
+    expect(stdinCall[0]).toMatch(/&& exec \/bin\/sh -c '\. "\$1" && \{ rm -f "\$1" \|\| true; \} && shift && exec "\$@"' paperclip-env '\/tmp\/paperclip-env-[^']+' 'printf' 'hello' < '\/tmp\/paperclip-stdin-/);
     expect(stdinCall[1]).toEqual(expect.objectContaining({ cwd: "/workspace", timeoutMs: 1000 }));
     expect(stdinCall[1]).not.toHaveProperty("envs");
     expect(stdinCall[1]).not.toHaveProperty("background");
@@ -371,7 +371,7 @@ describe("E2B sandbox provider plugin", () => {
     expect(fgCall[0]).not.toMatch(/nvm\.sh/);
     expect(fgCall[0]).not.toMatch(/NVM_DIR/);
     expect(fgCall[0]).not.toContain("bar");
-    expect(fgCall[0]).toMatch(/&& \. '\/tmp\/paperclip-env-[^']+' && \{ rm -f '\/tmp\/paperclip-env-[^']+' \|\| true; \} && exec 'printf' 'hello'$/);
+    expect(fgCall[0]).toMatch(/&& exec \/bin\/sh -c '\. "\$1" && \{ rm -f "\$1" \|\| true; \} && shift && exec "\$@"' paperclip-env '\/tmp\/paperclip-env-[^']+' 'printf' 'hello'$/);
     expect(fgCall[1]).toEqual(expect.objectContaining({ cwd: "/workspace", timeoutMs: 1000 }));
     expect(fgCall[1]).not.toHaveProperty("envs");
     expect(fgCall[1]).not.toHaveProperty("background");
