@@ -2955,6 +2955,79 @@ describeEmbeddedPostgres("tool access service", () => {
     ]);
   });
 
+  it("round-trips credential refs on the same default organization grant without touching its identity, members or delegations", async () => {
+    // Exact-rollback route for the BLA-3923 repair: [] -> [ref] -> [] must
+    // edit the existing grant in place and leave everything else alone.
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const agent = await createAgent(db, company.id);
+    const secret = await secretService(db).create(company.id, {
+      name: `Rollback grant token ${randomUUID()}`,
+      key: `rollback_grant_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: "rollback-grant-test-token",
+    });
+    const connection = await service.createConnection(company.id, {
+      name: "Rollback grant fixture",
+      transport: "mcp_remote",
+      config: { url: "http://127.0.0.1:8848/mcp" },
+    });
+    const defaultGrants = () => db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, connection.id),
+      eq(connectionGrants.kind, "organization"),
+      eq(connectionGrants.isDefault, true),
+    ));
+    const [original] = await defaultGrants();
+    expect(original).toBeDefined();
+    expect(original!.credentialSecretRefs).toEqual([]);
+    await db.insert(connectionGrantMembers).values({
+      companyId: company.id,
+      grantId: original!.id,
+      subjectType: "user",
+      subjectId: "rollback-member",
+    });
+    await db.insert(connectionGrantDelegations).values({
+      companyId: company.id,
+      grantId: original!.id,
+      agentId: agent.id,
+      createdByUserId: "rollback-member",
+    });
+    const snapshot = async () => ({
+      members: await db.select().from(connectionGrantMembers)
+        .where(eq(connectionGrantMembers.grantId, original!.id)),
+      delegations: await db.select().from(connectionGrantDelegations)
+        .where(eq(connectionGrantDelegations.grantId, original!.id)),
+    });
+    const before = await snapshot();
+    expect(before.members).toHaveLength(1);
+    expect(before.delegations).toHaveLength(1);
+    const ref = {
+      secretId: secret.id, versionSelector: "latest" as const,
+      configPath: "credentials.authorization", required: true, label: "Bearer token",
+    };
+
+    await service.updateConnection(connection.id, { credentialSecretRefs: [ref] });
+    const afterApply = await defaultGrants();
+    expect(afterApply).toHaveLength(1);
+    expect(afterApply[0]!.id).toBe(original!.id);
+    expect(afterApply[0]!.credentialSecretRefs).toEqual([
+      expect.objectContaining({ secretId: secret.id, configPath: "credentials.authorization" }),
+    ]);
+
+    await service.updateConnection(connection.id, { credentialSecretRefs: [] });
+    const afterRollback = await defaultGrants();
+    expect(afterRollback).toHaveLength(1);
+    const rolledBack = afterRollback[0]!;
+    expect(rolledBack.id).toBe(original!.id);
+    expect(rolledBack.credentialSecretRefs).toEqual([]);
+    expect(rolledBack.isDefault).toBe(original!.isDefault);
+    expect(rolledBack.status).toBe(original!.status);
+    expect(await snapshot()).toEqual(before);
+    const allGrants = await db.select().from(connectionGrants)
+      .where(eq(connectionGrants.connectionId, connection.id));
+    expect(allGrants.map((grant) => grant.id)).toEqual([original!.id]);
+  });
+
   it("sends the MCP Streamable HTTP Accept header and decodes an SSE catalog response", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
