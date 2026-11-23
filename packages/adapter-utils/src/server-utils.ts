@@ -103,6 +103,11 @@ interface SpawnTarget {
   args: string[];
   cwd?: string;
   env?: Record<string, string | undefined>;
+  /**
+   * Bytes written to the child's stdin before the caller's own stdin. The SSH
+   * target uses it to carry env values outside every process argument.
+   */
+  stdinPrefix?: string | null;
   cleanup?: () => Promise<void>;
 }
 
@@ -3734,6 +3739,7 @@ async function resolveSpawnTarget(
       command: sshResolved,
       args: spawnTarget.args,
       cwd: process.cwd(),
+      stdinPrefix: spawnTarget.stdinPrefix,
       cleanup: spawnTarget.cleanup,
     };
   }
@@ -4835,12 +4841,18 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
+        // The SSH env header must precede the caller's stdin. With a header
+        // and no caller stdin, the child still gets EOF right after the header.
+        const stdinPayload =
+          target.stdinPrefix != null
+            ? target.stdinPrefix + (opts.stdin ?? "")
+            : opts.stdin;
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
           detached: process.platform !== "win32",
           shell: false,
-          stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+          stdio: [stdinPayload != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
@@ -5014,10 +5026,14 @@ export async function runChildProcess(
         });
 
         const stdin = child.stdin;
-        if (opts.stdin != null && stdin) {
+        if (stdinPayload != null && stdin) {
+          // A child that exits before it reads stdin (an ssh auth failure, for
+          // one) makes the write fail with EPIPE. The exit path reports the
+          // failure; an unhandled stream error must not crash the server.
+          stdin.on("error", () => {});
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
+            stdin.write(stdinPayload);
             stdin.end();
           });
         }
