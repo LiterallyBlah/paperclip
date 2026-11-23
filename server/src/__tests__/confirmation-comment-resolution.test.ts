@@ -23,7 +23,10 @@ const support = await getEmbeddedPostgresTestSupport();
   let db: ReturnType<typeof createDb>;
   beforeAll(async () => { temporary = await startEmbeddedPostgresTestDatabase("confirmation-replies-"); db = createDb(temporary.connectionString); }, 30_000);
   afterAll(async () => { await temporary?.cleanup(); });
-  async function seed(checkbox = false, conversation = false) {
+  // A conversational reply can only be recorded by an agent when the card
+  // admits agents. A card with no agent addressee that omits resolverPolicy
+  // inherits human_only, so these fixtures set the policy explicitly.
+  async function seed(checkbox = false, conversation = false, resolverPolicy: "anyone" | undefined = "anyone") {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Replies", issuePrefix: companyId.slice(0, 8) });
     if (conversation) {
@@ -37,8 +40,9 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     const svc = issueThreadInteractionService(db);
     const card = await svc.create(issue, checkbox ? {
+      ...(resolverPolicy ? { resolverPolicy } : {}),
       kind: "request_checkbox_confirmation", payload: { version: 1, prompt: "Approve selected work?", options: [{ id: "note", label: "Welcome note" }, { id: "poster", label: "Poster" }], minSelected: 1, defaultSelectedOptionIds: ["poster"] },
-    } : { kind: "request_confirmation", payload: { version: 1, prompt: "Approve the welcome note?" } }, { agentId });
+    } : { ...(resolverPolicy ? { resolverPolicy } : {}), kind: "request_confirmation", payload: { version: 1, prompt: "Approve the welcome note?" } }, { agentId });
     const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "operator", authorType: "user", body: "Yes, write the welcome note." }).returning();
     const args = { companyId, issueId, interactionId: card.id, actor: { agentId, runId }, input: { commentId: comment.id, decision: "accept" as const, ...(checkbox ? { selectedOptionIds: ["note"] } : {}) } };
     return { args, card, issue, comment, svc, companyId, issueId, agentId, runId };
@@ -216,6 +220,22 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(resolveConfirmationFromComment(db, f.args)).rejects.toThrow();
     expect((await readCard(f.card.id)).status).toBe("pending");
   });
+  it.each([false, true])("refuses to record a reply on an ordinary task card that omitted resolverPolicy (checkbox: %s)", async (checkbox) => {
+    const f = await seed(checkbox, false, undefined);
+    expect(f.card.requestedResolverPolicy).toBe("human_only");
+    expect(f.card.effectiveResolverPolicy).toBe("human_only");
+    await expect(resolveConfirmationFromComment(db, f.args)).rejects.toThrow();
+    expect((await readCard(f.card.id)).status).toBe("pending");
+  });
+
+  it("keeps recording replies on an Agent Chat card that omitted resolverPolicy", async () => {
+    const f = await seed(false, true, undefined);
+    expect(f.card.requestedResolverPolicy).toBe("anyone");
+    expect(f.card.resolverPolicyProvenance).toBe("inherited");
+    const result = await resolveConfirmationFromComment(db, f.args);
+    expect(result.interaction.status).toBe("accepted");
+  });
+
   it.each(["human_only", "not_creator", "addressee", "toolAction", "secretProposal", "connectionAuthorization", "questions", "closed"])("preserves %s restrictions", async kind => {
     const f = await seed();
     if (kind === "closed") await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
