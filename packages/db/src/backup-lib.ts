@@ -426,10 +426,16 @@ async function runPgDumpBackup(opts: {
     throw new Error("pg_dump did not expose stdout");
   }
 
-  await Promise.all([
+  // Wait for both sides to settle before failing. With Promise.all a non-zero
+  // exit rejected while the write stream was still opening or flushing the
+  // archive, so the caller's cleanup could run before the file existed and
+  // leave a stray .partial behind.
+  const [piped, exited] = await Promise.allSettled([
     pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
     waitForChildExit(child, pgDumpBin),
   ]);
+  if (exited.status === "rejected") throw exited.reason;
+  if (piped.status === "rejected") throw piped.reason;
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
