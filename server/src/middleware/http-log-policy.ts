@@ -43,10 +43,30 @@ const SECRET_SENSITIVE_HTTP_PATHS = [
   /^\/mcp\/(?:oauth|paperclip)(?:\/|$)/,
   /^\/api\/mcp(?:\/|$)/,
   /^\/api\/chat-endpoints\/[^/]+\/setup(?:-secret)?(?:\/|$)/,
-  // Agent bound-secret rotation carries a new secret value in its body.
-  /^\/api\/agents\/me\/secrets\/[^/]+\/rotate(?:\/|$)/i,
 ];
 const SECRET_SENSITIVE_HTTP_METHODS = new Set(["POST", "PUT", "PATCH"]);
+
+/**
+ * Agent bound-secret rotation carries a new secret value in its body. Express
+ * routes are case-insensitive and also accept absolute-form request targets,
+ * so the origin is removed and percent-encoding unwound before matching, and
+ * every method is covered so a rejected or malformed request stays private.
+ */
+export function isAgentBoundSecretRotateHttpRequest(url: string | undefined): boolean {
+  if (!url) return false;
+  let pathname = normalizePath(url).replace(/^https?:\/\/[^/]*/i, "");
+  for (let depth = 0; depth < 4; depth++) {
+    if (/^\/api\/agents\/me\/secrets\/[^/]+\/rotate(?:\/|$)/i.test(pathname)) return true;
+    try {
+      const decoded = decodeURIComponent(pathname);
+      if (decoded === pathname) break;
+      pathname = decoded;
+    } catch {
+      break;
+    }
+  }
+  return false;
+}
 
 /** Free-form agent feedback must never be copied into HTTP diagnostics. */
 export function isPrivateAgentCommentaryHttpRequest(url: string | undefined): boolean {
@@ -111,6 +131,7 @@ export function isSecretSensitiveHttpRequest(
   if (isPrivateWebhookHttpRequest(method, url) || isPrivateMuseHttpRequest(url)) return true;
   if (url && normalizePath(url).startsWith("/mcp/files/")) return true;
   if (isPrivateAgentCommentaryHttpRequest(url)) return true;
+  if (isAgentBoundSecretRotateHttpRequest(url)) return true;
   // Custom OTLP header values are arbitrary credentials, including on rejected
   // methods or malformed subpaths. Named-field redaction cannot identify them.
   if (isPrivateAgentObservabilityHttpRequest(url)) return true;

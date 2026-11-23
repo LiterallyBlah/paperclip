@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
+import { createServer, request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { Writable } from "node:stream";
 import express from "express";
+import pino from "pino";
 import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -23,7 +26,8 @@ import {
 import type { AgentApiKeyScope } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/error-handler.js";
 import { isSecretSensitiveHttpRequest } from "../middleware/http-log-policy.js";
-import { logger } from "../middleware/logger.js";
+import { createHttpLogger, logger } from "../middleware/logger.js";
+import { HttpError } from "../errors.js";
 import { secretRoutes } from "../routes/secrets.js";
 import { accessService } from "../services/access.js";
 import { authorizationService, parseBoundSecretRotationScope } from "../services/authorization.js";
@@ -73,6 +77,72 @@ describe("agent bound-secret rotate log policy", () => {
   it("classes the route as secret-sensitive", () => {
     expect(isSecretSensitiveHttpRequest("POST", "/api/agents/me/secrets/any_key/rotate")).toBe(true);
     expect(isSecretSensitiveHttpRequest("POST", "/API/AGENTS/ME/SECRETS/ANY_KEY/ROTATE")).toBe(true);
+  });
+
+  it.each([
+    ["absolute http", "http://localhost/api/agents/me/secrets/any_key/rotate"],
+    ["absolute https upper case", "HTTPS://LOCALHOST:3100/API/Agents/Me/Secrets/ANY_KEY/Rotate?x=1"],
+    ["trailing slash", "/api/agents/me/secrets/any_key/rotate/"],
+    ["percent-encoded", "/api/agents/me/secrets/any_key/%72otate"],
+    ["encoded key", "/api/agents/me/secrets/a%2Fb/rotate"],
+  ])("classes the %s form as secret-sensitive for every method", (_name, url) => {
+    for (const method of ["POST", "PUT", "GET", "DELETE", "OPTIONS"]) {
+      expect(isSecretSensitiveHttpRequest(method, url), `${method} ${url}`).toBe(true);
+    }
+  });
+
+  it.each([
+    [422, "origin", "/api/agents/me/secrets/dummy/rotate"],
+    [422, "absolute", "http://localhost/api/agents/me/secrets/dummy/rotate"],
+    [502, "origin", "/api/agents/me/secrets/dummy/rotate"],
+    [502, "absolute", "http://localhost/api/agents/me/secrets/dummy/rotate"],
+    [502, "absolute upper case", "HTTP://LOCALHOST/API/AGENTS/ME/SECRETS/dummy/ROTATE"],
+  ])("keeps an echoed value out of the %i response and HTTP log for the %s form", async (status, _form, target) => {
+    const canary = "fixture-rotate-echo-canary";
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(createHttpLogger(pino({}, stream)));
+    app.use(express.json());
+    let reached = false;
+    app.post("/api/agents/me/secrets/:key/rotate", (_req, _res, next) => {
+      reached = true;
+      // A controlled provider-style error that echoes the submitted value.
+      next(new HttpError(status, `Provider refused ${canary}`));
+    });
+    app.use(errorHandler);
+    const server = createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    let body = "";
+    let responseStatus = 0;
+    try {
+      const { port } = server.address() as { port: number };
+      await new Promise<void>((resolve, reject) => {
+        const client = httpRequest(
+          { hostname: "127.0.0.1", port, method: "POST", path: target, headers: { "content-type": "application/json" } },
+          (res) => {
+            responseStatus = res.statusCode ?? 0;
+            res.on("data", (chunk) => { body += chunk; });
+            res.on("end", resolve);
+          },
+        );
+        client.on("error", reject);
+        client.end(JSON.stringify({ value: canary }));
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    }
+    // Wait for the asynchronous log write to land.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(reached).toBe(true);
+    expect(responseStatus).toBe(status);
+    expect(body).not.toContain(canary);
+    expect(chunks.join("")).not.toContain(canary);
   });
 });
 
@@ -386,27 +456,80 @@ describeEmbeddedPostgres("agent bound-secret rotate route", () => {
     await grant(caller, { secretId: target.secret.id, bindingId: target.binding.id });
     const before = await secretState(target.secret.id);
 
-    const cases: Array<{ name: string; app: express.Express }> = [
-      { name: "peer agent bound to the record without a grant", app: agentApp(peer) },
-      { name: "board actor", app: boardApp(companyId) },
-      { name: "task bridge key", app: agentApp(caller, { source: "agent_key", keyScope: { kind: "task_bridge", parentIssueId: randomUUID() } }) },
-      { name: "task bridge scope on a run token", app: agentApp(caller, { keyScope: { kind: "task_bridge", parentIssueId: randomUUID() } }) },
-      { name: "skill test scope", app: agentApp(caller, { keyScope: { kind: "skill_test", issueId: randomUUID() } }) },
-      { name: "standard agent key", app: agentApp(caller, { source: "agent_key" }) },
-      { name: "non-run token", app: agentApp(caller, { runId: null }) },
-      { name: "token for an unknown run", app: agentApp(caller, { runId: randomUUID() }) },
-      { name: "token for a malformed run id", app: agentApp(caller, { runId: "not-a-run-id" }) },
-      { name: "token for another agent's run", app: agentApp(caller, { runId: peer.heartbeatRunId }) },
+    const logs = captureLogs();
+    const cases: Array<{ name: string; app: express.Express; reason: string | null; runId?: string }> = [
+      { name: "peer agent bound to the record without a grant", app: agentApp(peer), reason: "deny_missing_grant", runId: peer.heartbeatRunId },
+      { name: "board actor", app: boardApp(companyId), reason: null },
+      { name: "task bridge key", app: agentApp(caller, { source: "agent_key", keyScope: { kind: "task_bridge", parentIssueId: randomUUID() } }), reason: "deny_agent_key" },
+      { name: "task bridge scope on a run token", app: agentApp(caller, { keyScope: { kind: "task_bridge", parentIssueId: randomUUID() } }), reason: "deny_key_scope_task_bridge" },
+      { name: "skill test scope", app: agentApp(caller, { keyScope: { kind: "skill_test", issueId: randomUUID() } }), reason: "deny_key_scope_skill_test" },
+      { name: "standard agent key", app: agentApp(caller, { source: "agent_key" }), reason: "deny_agent_key" },
+      { name: "non-run token", app: agentApp(caller, { runId: null }), reason: "deny_no_run" },
+      { name: "token for an unknown run", app: agentApp(caller, { runId: randomUUID() }), reason: "deny_run_not_verified" },
+      { name: "token for a malformed run id", app: agentApp(caller, { runId: "not-a-run-id" }), reason: "deny_run_not_verified" },
+      { name: "token for another agent's run", app: agentApp(caller, { runId: peer.heartbeatRunId }), reason: "deny_run_not_verified" },
     ];
     for (const testCase of cases) {
+      const deniedBefore = (await db.select().from(activityLog)).filter((row) => row.action === "secret.rotate_denied").length;
       const res = await rotate(testCase.app, "rotate_target");
       expect(res.status, testCase.name).toBe(403);
       expect(JSON.stringify(res.body), testCase.name).not.toContain(NEW_VALUE);
+      const denied = (await db.select().from(activityLog)).filter((row) => row.action === "secret.rotate_denied");
+      if (testCase.reason === null) {
+        // A board actor has no single company here, so no activity row is
+        // attributed; a sanitised server audit line records the denial.
+        expect(denied.length, testCase.name).toBe(deniedBefore);
+        continue;
+      }
+      expect(denied.length, testCase.name).toBe(deniedBefore + 1);
+      const latest = denied.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()).at(-1)!;
+      expect((latest.details as { reason?: string }).reason, testCase.name).toBe(testCase.reason);
+      expect(latest.actorType, testCase.name).toBe("agent");
+      expect(latest.companyId, testCase.name).toBe(companyId);
+      // An unverified run claim is never stored as the audit run id.
+      expect(latest.runId, testCase.name).toBe(testCase.runId ?? null);
     }
+    const logText = logs();
+    expect(logText).toContain("secret.rotate_denied");
+    expect(logText).not.toContain(NEW_VALUE);
 
     expect(await secretState(target.secret.id)).toEqual(before);
     expect(await resolvedValue(companyId, target.secret.id)).toBe(OLD_VALUE);
     const activity = await db.select().from(activityLog);
+    expect(activity.filter((row) => row.action === "secret.rotated")).toEqual([]);
+    expect(JSON.stringify(activity)).not.toContain(NEW_VALUE);
+  });
+
+  it("records a denial when the access list refuses secret reads", async () => {
+    const companyId = await seedCompany();
+    const caller = await seedAgent(companyId, "Rotator");
+    const target = await createBoundSecret(caller, "ROTATE_TARGET", OLD_VALUE);
+    await grant(caller, { secretId: target.secret.id, bindingId: target.binding.id });
+    // A low-trust review preset denies `secrets:read`, so the access list
+    // itself rejects the caller before any binding is selected.
+    await db.update(agents).set({
+      permissions: {
+        trustPreset: "low_trust_review",
+        authorizationPolicy: { trustBoundary: { mode: "low_trust_review", rootIssueId: randomUUID() } },
+      },
+    }).where(eq(agents.id, caller.agentId));
+    const before = await secretState(target.secret.id);
+
+    const res = await rotate(agentApp(caller), "rotate_target");
+    expect(res.status).toBe(403);
+    expect(JSON.stringify(res.body)).not.toContain(NEW_VALUE);
+    expect(await secretState(target.secret.id)).toEqual(before);
+
+    const activity = await db.select().from(activityLog);
+    const denied = activity.filter((row) => row.action === "secret.rotate_denied");
+    expect(denied).toHaveLength(1);
+    expect(denied[0]).toMatchObject({
+      actorType: "agent",
+      actorId: caller.agentId,
+      agentId: caller.agentId,
+      runId: caller.heartbeatRunId,
+      details: expect.objectContaining({ stage: "secret_access", runVerified: true, secretId: null }),
+    });
     expect(activity.filter((row) => row.action === "secret.rotated")).toEqual([]);
     expect(JSON.stringify(activity)).not.toContain(NEW_VALUE);
   });

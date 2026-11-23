@@ -23,7 +23,8 @@ import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleReso
 import { logActivity, secretService } from "../services/index.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
-import { forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { authorizationDeniedDetails, authorizationService } from "../services/authorization.js";
 import { accessService } from "../services/access.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -373,14 +374,70 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   // the audit rows or the logs.
   router.post("/agents/me/secrets/:key/rotate", async (req, res) => {
     res.set("Cache-Control", "no-store");
-    const context = agentSecretContext(req);
-    if (req.actor.source !== "agent_jwt" || req.actor.keyScope?.kind === "task_bridge" || req.actor.keyScope?.kind === "skill_test") {
-      throw forbidden("Secret rotation requires a verified run-bound agent token");
+    // Every authenticated rejection leaves one sanitised denial record. The
+    // agent and company come from the verified actor; the run id is attached
+    // only once it is confirmed as this agent's live run, so an unverified run
+    // claim never becomes an audit foreign key. No part of the body is read.
+    const actor = req.actor;
+    const verifiedAgent = actor.type === "agent" && actor.agentId && actor.companyId
+      ? { agentId: actor.agentId, companyId: actor.companyId }
+      : null;
+    let verifiedRunId: string | null = null;
+
+    async function deny(input: {
+      explanation: string;
+      details: Record<string, unknown>;
+      secretId?: string | null;
+      bindingId?: string | null;
+      grantId?: string | null;
+    }): Promise<never> {
+      if (verifiedAgent) {
+        await logActivity(db, {
+          companyId: verifiedAgent.companyId,
+          actorType: "agent",
+          actorId: verifiedAgent.agentId,
+          action: "secret.rotate_denied",
+          entityType: input.secretId ? "secret" : "agent",
+          entityId: input.secretId ?? verifiedAgent.agentId,
+          agentId: verifiedAgent.agentId,
+          runId: verifiedRunId,
+          details: {
+            ...input.details,
+            runVerified: verifiedRunId !== null,
+            secretId: input.secretId ?? null,
+            bindingId: input.bindingId ?? null,
+            grantId: input.grantId ?? null,
+          },
+        });
+      } else if (actor.type === "board") {
+        // A board actor has no single company on this agent-only route, so an
+        // activity row cannot be attributed without guessing. Keep a
+        // sanitised server audit line instead.
+        logger.warn(
+          { event: "secret.rotate_denied", actorType: "user", userId: actor.userId ?? null, reason: input.details.reason },
+          "Agent bound-secret rotation denied",
+        );
+      }
+      throw forbidden(input.explanation, input.details);
     }
+
+    if (actor.type !== "agent") {
+      return deny({ explanation: "Run-bound agent authentication required", details: { reason: "deny_not_agent" } });
+    }
+    if (!verifiedAgent || !actor.runId) {
+      return deny({ explanation: "Run-bound agent authentication required", details: { reason: "deny_no_run" } });
+    }
+    if (actor.source !== "agent_jwt" || actor.keyScope?.kind === "task_bridge" || actor.keyScope?.kind === "skill_test") {
+      return deny({
+        explanation: "Secret rotation requires a verified run-bound agent token",
+        details: { reason: actor.source !== "agent_jwt" ? "deny_agent_key" : `deny_key_scope_${actor.keyScope?.kind}` },
+      });
+    }
+    const context = agentSecretContext(req);
     // Confirm the token's run is this agent's live run before the value is
     // registered against it. The check reads no part of the body.
     if (!isUuidLike(context.heartbeatRunId)) {
-      throw forbidden("Agent secret access requires a verified heartbeat run");
+      return deny({ explanation: "Agent secret access requires a verified heartbeat run", details: { reason: "deny_run_not_verified" } });
     }
     const liveRun = await db
       .select({ id: heartbeatRuns.id })
@@ -392,7 +449,10 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
         eq(heartbeatRuns.status, "running"),
       ))
       .then((rows) => rows[0] ?? null);
-    if (!liveRun) throw forbidden("Agent secret access requires a verified heartbeat run");
+    if (!liveRun) {
+      return deny({ explanation: "Agent secret access requires a verified heartbeat run", details: { reason: "deny_run_not_verified" } });
+    }
+    verifiedRunId = liveRun.id;
     const parsed = agentRotateBoundSecretSchema.safeParse(req.body);
     const rawValue = (req.body as { value?: unknown } | undefined)?.value;
     if (typeof rawValue === "string" && rawValue.length > 0 && parsed.success) {
@@ -406,33 +466,24 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     const value = parsed.data.value;
     const key = req.params.key as string;
 
-    async function deny(input: {
-      explanation: string;
-      details: Record<string, unknown>;
-      secretId?: string | null;
-      bindingId?: string | null;
-      grantId?: string | null;
-    }): Promise<never> {
-      await logActivity(db, {
-        companyId: context.companyId,
-        actorType: "agent",
-        actorId: context.agentId,
-        action: "secret.rotate_denied",
-        entityType: input.secretId ? "secret" : "agent",
-        entityId: input.secretId ?? context.agentId,
-        agentId: context.agentId,
-        runId: context.heartbeatRunId,
-        details: {
-          ...input.details,
-          secretId: input.secretId ?? null,
-          bindingId: input.bindingId ?? null,
-          grantId: input.grantId ?? null,
-        },
-      });
-      throw forbidden(input.explanation, input.details);
+    let available: Awaited<ReturnType<typeof svc.listAgentSecretAccess>>;
+    try {
+      available = await svc.listAgentSecretAccess(context.companyId, context);
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 403) {
+        const reason = (error.details as { reason?: unknown } | undefined)?.reason;
+        const code = (error.details as { code?: unknown } | undefined)?.code;
+        return deny({
+          explanation: error.message,
+          details: {
+            ...(typeof code === "string" ? { code } : {}),
+            reason: typeof reason === "string" ? reason : "deny_secret_access",
+            stage: "secret_access",
+          },
+        });
+      }
+      throw error;
     }
-
-    const available = await svc.listAgentSecretAccess(context.companyId, context);
     const secret = available.find((entry) => entry.key === key);
     if (!secret) {
       return deny({ explanation: "Secret access is not granted for this agent", details: { reason: "deny_no_binding" } });
