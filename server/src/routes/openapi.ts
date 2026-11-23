@@ -3577,10 +3577,11 @@ const createAgentSecretProposalSchema = z
     z.object({
       kind: z.literal("secret"),
       name: z.string().min(1),
+      key: z.string().optional().nullable(),
       description: z.string().optional().nullable(),
       value: z.string().min(1),
       justification: z.string().min(1),
-    }),
+    }).strict(),
     z.object({
       kind: z.literal("binding"),
       secretId: z.string().guid().optional(),
@@ -3589,7 +3590,7 @@ const createAgentSecretProposalSchema = z
       targetAgentId: z.string().guid().optional(),
       configPath: z.string().min(1),
       justification: z.string().min(1),
-    }),
+    }).strict(),
   ])
   .superRefine((value, ctx) => {
     if (

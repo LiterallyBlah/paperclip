@@ -500,6 +500,10 @@ export function createSecretProposalsService(db: Db) {
     value: string;
     justification: string;
   }) {
+    // Callers outside the strict route schema must not reach a TypeError (500).
+    if (typeof input.name !== "string") throw unprocessable("Secret name is required");
+    if (typeof input.justification !== "string") throw unprocessable("Justification is required");
+    if (typeof input.value !== "string") throw unprocessable("Secret value is required");
     const name = input.name.trim();
     const justification = input.justification.trim();
     if (!SECRET_NAME_RE.test(name)) throw unprocessable("Secret name must be a slash-separated path without empty segments");
@@ -553,11 +557,15 @@ export function createSecretProposalsService(db: Db) {
         "Binding proposals require exactly one of secretId, sourceConfigPath, or secretProposalId",
       );
     }
-    if (!CONFIG_PATH_RE.test(input.configPath)) throw unprocessable("configPath must use env.<KEY> or access.<ALIAS>");
+    if (typeof input.configPath !== "string" || !CONFIG_PATH_RE.test(input.configPath)) {
+      throw unprocessable("configPath must use env.<KEY> or access.<ALIAS>");
+    }
     if (input.sourceConfigPath && !CONFIG_PATH_RE.test(input.sourceConfigPath)) {
       throw unprocessable("sourceConfigPath must use env.<KEY> or access.<ALIAS>");
     }
-    if (!input.justification.trim()) throw unprocessable("Justification is required");
+    if (typeof input.justification !== "string" || !input.justification.trim()) {
+      throw unprocessable("Justification is required");
+    }
     if (input.justification.trim().length > 20_000) throw unprocessable("Justification must be at most 20000 characters");
     const { run, originIssueId } = await loadRunContext(db, context);
     const targetAgentId = input.targetAgentId ?? run.agentId;

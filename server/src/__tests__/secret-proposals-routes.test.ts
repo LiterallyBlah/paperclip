@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Writable } from "node:stream";
 import express from "express";
+import pino from "pino";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -25,6 +27,8 @@ import {
 } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
+import { createHttpLogger } from "../middleware/logger.js";
 import { secretRoutes } from "../routes/secrets.js";
 import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provider.js";
 import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
@@ -863,6 +867,132 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     expect(missing.body.error).toBe("Source secret binding not found");
     expect(crossAgent.body.error).toBe("Source secret binding not found");
     expect(await db.select().from(companySecretProposals)).toHaveLength(0);
+  });
+
+  describe("strict create body validation (BLA-4296)", () => {
+    const VALUE_CANARY = "bla4296-fixture-value-canary";
+    const EXTRA_CANARY = "bla4296-fixture-extra-canary";
+    const JUSTIFICATION_CANARY = "bla4296-fixture-justification-canary";
+
+    async function postWithLogs(fixture: Awaited<ReturnType<typeof seedRun>>, body: Record<string, unknown>) {
+      const chunks: string[] = [];
+      const stream = new Writable({
+        write(chunk, _encoding, callback) {
+          chunks.push(chunk.toString());
+          callback();
+        },
+      });
+      const app = express();
+      app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = {
+          type: "agent",
+          agentId: fixture.agentId,
+          companyId: fixture.companyId,
+          runId: fixture.heartbeatRunId,
+          source: "agent_jwt",
+          keyScope: { kind: "standard" },
+        };
+        next();
+      });
+      app.use("/api", secretRoutes(db));
+      app.use(errorHandler);
+      const response = await request(app).post("/api/agents/me/secret-proposals").send(body);
+      await new Promise((resolve) => setImmediate(resolve));
+      return { response, logs: chunks.join("") };
+    }
+
+    function expectNoCanary(text: string) {
+      expect(text).not.toContain(VALUE_CANARY);
+      expect(text).not.toContain(EXTRA_CANARY);
+      expect(text).not.toContain(JUSTIFICATION_CANARY);
+    }
+
+    it.each([
+      ["secret", {
+        kind: "secret", name: "dev/strict/token", key: "STRICT_TOKEN", value: VALUE_CANARY,
+        justification: JUSTIFICATION_CANARY, extra: EXTRA_CANARY,
+      }],
+      ["binding", {
+        kind: "binding", sourceConfigPath: "access.strict_source", configPath: "access.strict_alias",
+        justification: JUSTIFICATION_CANARY, extra: EXTRA_CANARY,
+      }],
+    ])("rejects an unknown field on a %s proposal with 422 and echoes nothing", async (_kind, body) => {
+      const fixture = await seedRun();
+      const { response, logs } = await postWithLogs(fixture, body);
+
+      expect(response.status).toBe(422);
+      expect(response.body.error).toBe(
+        "Secret proposal body has unknown fields or missing or invalid required fields",
+      );
+      expect(response.body.details.issues).toEqual([{ code: "unrecognized_keys", path: [] }]);
+      expectNoCanary(JSON.stringify(response.body));
+      expect(JSON.stringify(response.body)).not.toContain("extra");
+      expectNoCanary(logs);
+      expect(await db.select().from(companySecretProposals)).toHaveLength(0);
+    });
+
+    it.each([
+      ["missing", { kind: "secret", name: "dev/strict/token", value: VALUE_CANARY }],
+      ["missing with an unknown field", { kind: "secret", name: "dev/strict/token", value: VALUE_CANARY, extra: EXTRA_CANARY }],
+      ["non-string", { kind: "secret", name: "dev/strict/token", value: VALUE_CANARY, justification: 42 }],
+      ["missing on a binding", { kind: "binding", sourceConfigPath: "access.strict_source", configPath: "access.strict_alias" }],
+    ])("returns 422, not 500, when justification is %s", async (_case, body) => {
+      const fixture = await seedRun();
+      const { response, logs } = await postWithLogs(fixture, body);
+
+      expect(response.status).toBe(422);
+      expect(response.body.details.issues).toEqual(
+        expect.arrayContaining([{ code: "invalid_type", path: ["justification"] }]),
+      );
+      expectNoCanary(JSON.stringify(response.body));
+      expectNoCanary(logs);
+      expect(logs).not.toContain("TypeError");
+      expect(await db.select().from(companySecretProposals)).toHaveLength(0);
+    });
+
+    it("keeps the kind error and the service's semantic 422 messages", async () => {
+      const fixture = await seedRun();
+      const noKind = await postWithLogs(fixture, { name: "dev/strict/token", value: VALUE_CANARY, justification: "x" });
+      expect(noKind.response.status).toBe(422);
+      expect(noKind.response.body.error).toBe("kind must be secret or binding");
+
+      const blank = await postWithLogs(fixture, {
+        kind: "secret", name: "dev/strict/token", value: VALUE_CANARY, justification: "   ",
+      });
+      expect(blank.response.status).toBe(422);
+      expect(blank.response.body.error).toBe("Justification is required");
+      expectNoCanary(JSON.stringify(blank.response.body));
+      expectNoCanary(blank.logs);
+    });
+
+    it("still accepts a valid secret proposal with optional key and null description", async () => {
+      const fixture = await seedRun();
+      const { response, logs } = await postWithLogs(fixture, {
+        kind: "secret", name: "dev/strict/valid-token", key: "VALID_TOKEN", description: null,
+        value: VALUE_CANARY, justification: "Needed for the fixture",
+      });
+
+      expect(response.status).toBe(201);
+      expect(response.body).toEqual(expect.objectContaining({ kind: "secret", status: "pending" }));
+      expectNoCanary(JSON.stringify(response.body));
+      expectNoCanary(logs);
+      expect(await db.select().from(companySecretProposals)).toEqual([
+        expect.objectContaining({ proposedName: "dev/strict/valid-token", proposedKey: "valid_token" }),
+      ]);
+    });
+  });
+
+  it("rejects non-string justification in the service without a TypeError", async () => {
+    const fixture = await seedRun();
+    const service = createSecretProposalsService(db);
+    await expect(service.createSecret({
+      companyId: fixture.companyId,
+      heartbeatRunId: fixture.heartbeatRunId,
+      registerForRedaction: async () => {},
+    }, { name: "dev/service/token", value: "service-value", justification: undefined as unknown as string }))
+      .rejects.toMatchObject({ status: 422, message: "Justification is required" });
   });
 
   it("serializes proposal quotas and exposes bounded list pagination", async () => {
