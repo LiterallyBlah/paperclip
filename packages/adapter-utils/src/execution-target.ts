@@ -3399,29 +3399,211 @@ async function reserveHostAssignedLoopbackPort(): Promise<number> {
 }
 
 /**
- * Build the argument vector that launches the duplex gateway in the sandbox. The
- * host passes the assigned port and the per-open nonce only through the launch
- * environment, so the argument vector sets them as environment assignments in
- * front of the node command. No addressing data comes from the channel.
+ * The line the duplex launch script prints when it is ready to read the gateway
+ * bootstrap from its standard input. The script builds the line from two
+ * pieces, so the contiguous text never appears in the launch command itself:
+ * a terminal that echoes the typed launch line back to the host cannot forge
+ * the request before the script actually runs.
+ */
+export const DUPLEX_GATEWAY_BOOTSTRAP_REQUEST_LINE = "PAPERCLIP_DUPLEX_BOOTSTRAP_REQUEST";
+const DUPLEX_GATEWAY_BOOTSTRAP_REQUEST_HEAD = "PAPERCLIP_DUPLEX_";
+const DUPLEX_GATEWAY_BOOTSTRAP_REQUEST_TAIL = "BOOTSTRAP_REQUEST";
+
+function isValidDuplexGatewayEnvKey(value: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
+}
+
+/**
+ * Build the argument vector that launches the duplex gateway in the sandbox.
  *
- * The script uses `exec env NAME=value ... command`. A POSIX shell accepts an
- * environment-assignment prefix only on a plain command, never on `exec`. The
- * form `exec NAME=value command` exits with status 127. The `env` utility carries
- * the assignments, and `exec` still replaces the shell with the gateway process,
- * so the gateway keeps the process slot and the assigned environment.
+ * The vector carries no environment value. The gateway environment (the bridge
+ * token, the assigned port, the per-open nonce and the other launch settings)
+ * travels in the bootstrap from {@link buildDuplexGatewayBootstrap}, which the
+ * host writes on the channel's standard input. So no value appears in the
+ * shell argument vector, in an `env` helper argument vector, or in the command
+ * text a provider receives, at any stage of startup.
+ *
+ * The script uses shell builtins only (`printf`, `read`, `eval`, `export`,
+ * `exec`), so no helper process ever carries a value. In order it:
+ *   1. prints the bootstrap request line, so the host writes the bootstrap only
+ *      after the script runs (on a terminal provider that is after the launch
+ *      wrapper set raw mode with echo off, so the bootstrap is never echoed);
+ *   2. reads one decimal line count N, then N lines of shell text;
+ *   3. evaluates that text, which exports each name with a single-quoted value
+ *      (a quoted value can span lines, so multiline values survive);
+ *   4. replaces the shell with the gateway through `exec`, so the gateway keeps
+ *      the process slot and inherits the exported environment.
+ * A shell reads a pipe or a terminal one byte at a time, so the reader stops
+ * exactly at the end of the bootstrap, and every later host byte reaches the
+ * gateway. A short or malformed bootstrap exits 125 before the gateway starts.
  */
 export function buildDuplexGatewayLaunchArgv(input: {
   shellCommand: "bash" | "sh";
   remoteEntrypoint: string;
   nodeCommand?: string | null;
-  env: Record<string, string>;
 }): string[] {
-  const assignments = Object.entries(input.env)
-    .map(([key, value]) => `${key}=${shellQuote(value)}`)
-    .join(" ");
   const nodeCommand = input.nodeCommand?.trim() || "node";
-  const script = `exec env ${assignments} ${shellQuote(nodeCommand)} ${shellQuote(input.remoteEntrypoint)}`;
+  const script = [
+    `printf '%s%s\\n' ${shellQuote(DUPLEX_GATEWAY_BOOTSTRAP_REQUEST_HEAD)} ${shellQuote(DUPLEX_GATEWAY_BOOTSTRAP_REQUEST_TAIL)} || exit 125`,
+    "__pc_nl=$(printf '\\n_')",
+    "__pc_nl=${__pc_nl%_}",
+    "__pc_env=",
+    "IFS= read -r __pc_n || exit 125",
+    "case \"$__pc_n\" in ''|*[!0-9]*) exit 125;; esac",
+    "__pc_i=0",
+    "while [ \"$__pc_i\" -lt \"$__pc_n\" ]; do IFS= read -r __pc_l || exit 125; __pc_env=\"$__pc_env$__pc_l$__pc_nl\"; __pc_i=$((__pc_i + 1)); done",
+    "unset __pc_l __pc_i __pc_n",
+    'eval "$__pc_env" || exit 125',
+    `exec ${shellQuote(nodeCommand)} ${shellQuote(input.remoteEntrypoint)}`,
+  ].join("; ");
   return [input.shellCommand, ...shellCommandArgs(script)];
+}
+
+/**
+ * Build the bootstrap the host writes on the duplex channel's standard input
+ * after the launch script asks for it (see {@link buildDuplexGatewayLaunchArgv}).
+ *
+ * Format: one decimal line count N, then N lines of POSIX shell. The first line
+ * drops the reader's own variables; `eval` already holds the expanded text, so a
+ * caller name that matches a reader name is exported after it and survives.
+ * Each later line exports one name with a single-quoted value.
+ */
+export function buildDuplexGatewayBootstrap(env: Record<string, string>): Buffer {
+  const entries = Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string");
+  for (const [key] of entries) {
+    if (!isValidDuplexGatewayEnvKey(key)) {
+      throw new Error(`Invalid duplex gateway environment variable key: ${key}`);
+    }
+  }
+  const script = [
+    "unset __pc_env __pc_nl",
+    ...entries.map(([key, value]) => `export ${key}=${shellQuote(value)}`),
+  ].join("\n");
+  const lineCount = script.split("\n").length;
+  return Buffer.from(`${lineCount}\n${script}\n`, "utf8");
+}
+
+/**
+ * Wrap a freshly opened duplex channel so the host writes `bootstrap` exactly
+ * when the launch script prints its request line, and not before.
+ *
+ * Bytes the channel sends before the request line (a terminal's echo of the
+ * typed launch line, a prompt) are not gateway output, so the wrapper drops
+ * them and they never reach the readiness gate. The bytes after the request
+ * line reach the wrapped channel's data listener unchanged. A host write made
+ * before the bootstrap is held and sent after it, so the bootstrap is always
+ * the first host input the script reads. The pre-request bytes are bounded:
+ * past `capBytes` with no request line the wrapper stops the channel, and the
+ * readiness gate reports the failure in its usual fail-closed way.
+ */
+export function attachDuplexGatewayBootstrap(
+  channel: CommandManagedDuplexChannel,
+  bootstrap: Uint8Array,
+  options?: { capBytes?: number },
+): CommandManagedDuplexChannel {
+  const capBytes = options?.capBytes ?? DUPLEX_READINESS_BUFFER_CAP_BYTES;
+  const requestBytes = Buffer.from(DUPLEX_GATEWAY_BOOTSTRAP_REQUEST_LINE, "utf8");
+  let delivered = false;
+  let abandoned = false;
+  let preRequestBytes = 0;
+  let partialLine: Buffer = Buffer.alloc(0);
+  let heldWrites: Uint8Array[] = [];
+  let dataListener: ((chunk: Uint8Array) => void) | null = null;
+  let pendingData: Buffer[] = [];
+  let exitListener: ((exit: { exitCode: number | null; transportClosed?: boolean }) => void) | null = null;
+  let pendingExit: { exitCode: number | null; transportClosed?: boolean } | null = null;
+
+  const forward = (chunk: Uint8Array): void => {
+    if (chunk.byteLength === 0) return;
+    if (dataListener) dataListener(chunk);
+    else pendingData.push(Buffer.from(chunk));
+  };
+
+  const isRequestLine = (line: Buffer): boolean => {
+    let end = line.length;
+    if (end > 0 && line[end - 1] === 0x0d) end -= 1;
+    if (end < requestBytes.length) return false;
+    // Match the line end, so a terminal control prefix on the same line (for
+    // example a bracketed-paste disable sequence) cannot hide the request.
+    return line.subarray(end - requestBytes.length, end).equals(requestBytes);
+  };
+
+  channel.onData((chunk) => {
+    if (delivered) {
+      forward(chunk);
+      return;
+    }
+    if (abandoned) return;
+    let data = Buffer.from(chunk);
+    for (;;) {
+      const newlineIndex = data.indexOf(0x0a);
+      if (newlineIndex === -1) {
+        preRequestBytes += data.length;
+        partialLine = partialLine.length === 0 ? data : Buffer.concat([partialLine, data]);
+        // Keep only the tail that can still complete a request line.
+        if (partialLine.length > requestBytes.length + 1) {
+          partialLine = Buffer.from(partialLine.subarray(partialLine.length - (requestBytes.length + 1)));
+        }
+        if (preRequestBytes > capBytes) {
+          abandoned = true;
+          partialLine = Buffer.alloc(0);
+          channel.stop();
+        }
+        return;
+      }
+      preRequestBytes += newlineIndex + 1;
+      const line = partialLine.length === 0
+        ? data.subarray(0, newlineIndex)
+        : Buffer.concat([partialLine, data.subarray(0, newlineIndex)]);
+      partialLine = Buffer.alloc(0);
+      data = data.subarray(newlineIndex + 1);
+      if (isRequestLine(line)) {
+        delivered = true;
+        channel.write(bootstrap);
+        const held = heldWrites;
+        heldWrites = [];
+        for (const write of held) channel.write(write);
+        forward(data);
+        return;
+      }
+      if (preRequestBytes > capBytes) {
+        abandoned = true;
+        channel.stop();
+        return;
+      }
+    }
+  });
+  channel.onExit((exit) => {
+    if (exitListener) exitListener(exit);
+    else pendingExit = exit;
+  });
+
+  return {
+    write(data: Uint8Array): void {
+      if (delivered) channel.write(data);
+      else heldWrites.push(Buffer.from(data));
+    },
+    onData(listener: (chunk: Uint8Array) => void): void {
+      dataListener = listener;
+      const pending = pendingData;
+      pendingData = [];
+      for (const chunk of pending) listener(chunk);
+    },
+    onExit(listener: (exit: { exitCode: number | null; transportClosed?: boolean }) => void): void {
+      exitListener = listener;
+      if (pendingExit) {
+        const exit = pendingExit;
+        pendingExit = null;
+        listener(exit);
+      }
+    },
+    stop(): void {
+      channel.stop();
+    },
+    close(): Promise<void> {
+      return channel.close();
+    },
+  };
 }
 
 /** The reason the duplex readiness handshake did not pass. */
@@ -4662,13 +4844,16 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         PAPERCLIP_BRIDGE_NONCE: nonce,
         PAPERCLIP_BRIDGE_MAX_BODY_BYTES: String(maxBodyBytes),
       };
+      // The launch command carries no environment value. The gateway environment,
+      // including the bridge token, rides the bootstrap the host writes on the
+      // channel once the launch script asks for it.
       const command = buildDuplexGatewayLaunchArgv({
         shellCommand,
         remoteEntrypoint: assetSync.remoteEntrypoint,
-        env: gatewayEnv,
       });
+      const bootstrap = buildDuplexGatewayBootstrap(gatewayEnv);
       openStage = "channel_open";
-      channel = await openDuplexChannel({ command });
+      channel = attachDuplexGatewayBootstrap(await openDuplexChannel({ command }), bootstrap);
     } catch (error) {
       // The channel never opened, so no request could carry the bridge token.
       // The open call is the last statement of the try, so `channel` is still
