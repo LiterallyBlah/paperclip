@@ -134,7 +134,7 @@ import type {
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { publishInteractionCreatedPluginEvent } from "./plugin-decision-events.js";
 import { secretService } from "./secrets.js";
-import { connectionGrantCredentialRef, resolveConnectionGrantSecret } from "./connection-credentials.js";
+import { connectionGrantCredentialRef, connectionHeaderCredentialPlan, resolveConnectionGrantSecret } from "./connection-credentials.js";
 import { railwayCommandBudgetMs, createRailwayClient, isRailwayConnection, isRailwayEndpoint, isRailwayToolBlocked, normalizeRailwayToolName, RAILWAY_API_URL, RAILWAY_TOOL_PREFIX, RailwayError } from "./railway.js";
 import { RAILWAY_SSH_SECRET_PATH, runRailwaySshCommand } from "./railway-ssh.js";
 import {
@@ -4454,10 +4454,8 @@ export function createToolGatewayService(
       }
     }
     const headers: Record<string, string> = {};
-    for (const ref of connection.credentialRefs ?? []) {
-      if (ref.placement !== "header") continue;
-      const grantRef = grantRefForCredential(grant, ref);
-      if (!grantRef) continue;
+    const headerPlan = connectionHeaderCredentialPlan(connection, grant);
+    for (const { ref, grantRef } of headerPlan.resolved) {
       try {
         const value = await resolveGrantSecretValue(
           session,
@@ -4510,6 +4508,32 @@ export function createToolGatewayService(
           },
         );
       }
+    }
+    // A declared header the selected grant cannot supply must never be dropped:
+    // the request would reach the remote unauthenticated and surface only as an
+    // opaque upstream 401. The OAuth access token above may legitimately fill
+    // an Authorization header, so only headers still unset fail here. We do not
+    // fall back to the connection's own refs: the grant is the identity
+    // boundary, and connection-level refs may point at another identity's secret.
+    const unresolvedHeader = headerPlan.missing.find(
+      (ref) => headers[ref.key] === undefined,
+    );
+    if (unresolvedHeader) {
+      await markRemoteConnectionHealth(
+        connection,
+        "missing_secret",
+        "A configured credential secret could not be resolved.",
+      );
+      throw new ToolGatewayHttpError(
+        422,
+        "A configured credential secret could not be resolved.",
+        "mcp_remote_missing_secret",
+        {
+          connectionId: connection.id,
+          grantId: grant.id,
+          credential: unresolvedHeader.name,
+        },
+      );
     }
     return headers;
   }

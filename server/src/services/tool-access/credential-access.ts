@@ -5,11 +5,11 @@ import { remoteEndpoint } from "./connection-methods.js";
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { connectionGrants, toolConnections } from "@paperclipai/db";
-import { badRequest, HttpError, unprocessable } from "../../errors.js";
+import { badRequest, conflict, HttpError, unprocessable } from "../../errors.js";
 import { parseRemoteHttpEndpoint } from "../remote-http-endpoint-guard.js";
 import { REMOTE_URL_SECRET_CONFIG_PATH, remoteUrlCredentialMatchesPublicUrl } from "../remote-url-credentials.js";
 import { secretService } from "../secrets.js";
-import { connectionCredentialConfigPath as credentialRefConfigPath, connectionGrantCredentialRef } from "../connection-credentials.js";
+import { connectionCredentialConfigPath as credentialRefConfigPath, connectionGrantCredentialRef, connectionHeaderCredentialPlan } from "../connection-credentials.js";
 
 import type { ToolAccessAudit } from "./audit.js";
 import type { VercelCredentialService } from "./vercel-credentials.js";
@@ -110,6 +110,30 @@ export function createConnectionCredentialAccess(db: Db, { secrets, audit, verce
     return null;
   }
 
+  async function defaultOrganizationGrant(
+    connection: typeof toolConnections.$inferSelect,
+  ): Promise<typeof connectionGrants.$inferSelect> {
+    const [organization] = await db
+      .select()
+      .from(connectionGrants)
+      .where(
+        and(
+          eq(connectionGrants.companyId, connection.companyId),
+          eq(connectionGrants.connectionId, connection.id),
+          eq(connectionGrants.kind, "organization"),
+          eq(connectionGrants.isDefault, true),
+          eq(connectionGrants.status, "active"),
+        ),
+      )
+      .limit(1);
+    if (!organization)
+      throw conflict("Organization authorization is required", {
+        code: "organization_authorization_required",
+        connectionId: connection.id,
+      });
+    return organization;
+  }
+
   async function resolveCredentialHeaders(
     connection: typeof toolConnections.$inferSelect,
     actor?: ActorInfo,
@@ -120,12 +144,21 @@ export function createConnectionCredentialAccess(db: Db, { secrets, audit, verce
       return resolveVercelCredentialHeaders(connection, grant, options);
     }
     let grant: typeof connectionGrants.$inferSelect | null = null;
+    // Shared non-OAuth invocations always use the default organization grant
+    // (tool-gateway resolveConnectionGrant). Check the same grant here, so a
+    // health/catalog probe cannot pass while every invocation would fail.
+    const sharedOrganizationGrant =
+      connection.authKind !== "oauth" &&
+      connection.credentialPolicy === "shared" &&
+      connection.credentialRefs.some((ref) => ref.placement === "header");
     try {
       if (
         connection.authKind === "oauth" ||
         connection.credentialPolicy !== "shared"
       ) {
         grant = await vaultGrantForConnection(connection, actor);
+      } else if (sharedOrganizationGrant) {
+        grant = await defaultOrganizationGrant(connection);
       }
       if (connection.authKind === "oauth" && grant) {
         grant = await refreshOAuthGrantCredentials({
@@ -162,15 +195,22 @@ export function createConnectionCredentialAccess(db: Db, { secrets, audit, verce
     }
     const headers: Record<string, string> = {};
     const scope = credentialScope(connection);
+    const headerPlan = grant ? connectionHeaderCredentialPlan(connection, grant) : null;
     for (const ref of connection.credentialRefs) {
       if (ref.placement !== "header") continue;
       let value: string;
       const configPath = credentialRefConfigPath(ref);
       try {
-        const grantRef = grant ? connectionGrantCredentialRef(grant, ref) : undefined;
-        if (grant && !grantRef) throw unprocessable("Your credential is missing. Reconnect this connection.", {
-          code: "grant_credential_invalid", connectionId: connection.id, grantId: grant.id, credential: configPath,
-        });
+        const grantRef = headerPlan?.resolved.find((entry) => entry.ref === ref)?.grantRef;
+        if (grant && !grantRef) throw unprocessable(
+          sharedOrganizationGrant
+            ? "A configured credential secret could not be resolved."
+            : "Your credential is missing. Reconnect this connection.",
+          {
+            code: sharedOrganizationGrant ? "mcp_remote_missing_secret" : "grant_credential_invalid",
+            connectionId: connection.id, grantId: grant.id, credential: configPath,
+          },
+        );
         value =
           grantRef && grant
             ? (

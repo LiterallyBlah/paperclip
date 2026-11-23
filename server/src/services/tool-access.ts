@@ -28,7 +28,7 @@ import { actorBinding } from "./tool-access/actor.js";
 import { toApplication } from "./tool-access/applications/projection.js";
 import { groupedActions } from "./tool-access/catalog/action-summary.js";
 import { createConnectionSetupPolicy, assertSupportedConnection } from "./tool-access/connections/setup-policy.js";
-import { createOrganizationGrantStore } from "./tool-access/connections/organization-grant.js";
+import { createOrganizationGrantCredentialSync, createOrganizationGrantStore } from "./tool-access/connections/organization-grant.js";
 import { createPersonalConnectionIdentity } from "./tool-access/connections/personal-identity.js";
 import { createOAuthStateStore } from "./tool-access/oauth/state.js";
 import { createOAuthCatalogCompletion } from "./tool-access/oauth/catalog-completion.js";
@@ -749,6 +749,7 @@ export function toolAccessService(
   const { resolveInstalledConnectionsForAgent, listConnectionInstalls } = connectionInstalls;
   const audit = createToolAccessAudit(db);
   const ensureDefaultOrganizationGrant = createOrganizationGrantStore(db);
+  const syncDefaultOrganizationGrantCredentials = createOrganizationGrantCredentialSync(db);
   const { mintConnectionTokenForAgent, loadBrokerRunContext } = createConnectionTokenBroker(db, { now, secrets, policySvc, audit, getConnectionRow, ensureDefaultOrganizationGrant });
   const profileService = createToolProfileService(db, now);
   const profileDetails = profileService.getProfile;
@@ -3766,6 +3767,11 @@ export function toolAccessService(
         })
         .where(eq(toolConnections.id, connection.id))
         .returning();
+      // Health and invocation read a shared connection's default organization
+      // grant, so the reconnected refs must reach it in this transaction. The
+      // sync skips non-shared policies and never creates or reactivates a grant.
+      if (!personalIdentity)
+        await syncDefaultOrganizationGrantCredentials(nextConnection!, tx as unknown as Db);
       await syncConnectionCredentialBindings(tx, nextConnection,
         personalIdentity ? credentialSecretRefs : []);
       return nextConnection;
@@ -4718,6 +4724,11 @@ export function toolAccessService(
         })
         .where(eq(toolConnections.id, connectionId))
         .returning();
+      const credentialRefsChanged =
+        input.credentialRefs !== undefined ||
+        input.credentialSecretRefs !== undefined ||
+        (input.credentialPolicy !== undefined &&
+          input.credentialPolicy !== existing.credentialPolicy);
       const [row] = existing.transport === "chat_sdk"
         ? await db.transaction(async tx => {
             await notifyChatEndpointWork(tx, existing.id, existing.companyId);
@@ -4725,6 +4736,9 @@ export function toolAccessService(
             // Credential resolution must never observe the binding rebuild's
             // delete/insert gap after a configuration wake.
             await syncCredentialBindings(rows[0]!, [], tx);
+            // Invocation reads the default organization grant, not the connection
+            // row, so an edited shared credential must reach the grant atomically.
+            if (credentialRefsChanged) await syncDefaultOrganizationGrantCredentials(rows[0]!, tx);
             return rows;
           })
         : await writeToolConnectionHealthChange(db, existing, async tx => {
@@ -4735,6 +4749,7 @@ export function toolAccessService(
             if (existing.transport === "voice") await notifyVoiceChange(tx, { kind: "connection", id: existing.id });
             const rows = await write(tx);
             await syncCredentialBindings(rows[0]!, [], tx);
+            if (credentialRefsChanged) await syncDefaultOrganizationGrantCredentials(rows[0]!, tx);
             await createToolRuntimeSlots(tx, runtimeSupervisor).ensureRuntimeSlot(rows[0]!);
             return rows;
           });
