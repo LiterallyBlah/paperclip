@@ -2000,6 +2000,55 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(missingCommentWakeups).toHaveLength(0);
   });
 
+  // BLA-4235: a Hermes gateway restart refuses create_run at TCP connect. The
+  // real gateway adapter must leave positive non-dispatch evidence so the
+  // first failed attempt is not held for manual reconciliation, while a
+  // post-connect reset stays held.
+  it.each([
+    ["refused at connect", "refused", true],
+    ["reset after connect", "reset", false],
+  ] as const)("hermes gateway create_run %s: receipt and hold follow the transport phase", async (_label, mode, receipted) => {
+    const { createServer } = await import("node:net");
+    const { execute: hermesGatewayExecute } = await import(
+      "../../../packages/adapters/hermes/src/gateway/server/execute.js"
+    );
+    const server = createServer((socket) => socket.destroy());
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    if (mode === "refused") await new Promise<void>((resolve) => server.close(() => resolve()));
+    try {
+      mockAdapterExecute.mockImplementationOnce((async (input: unknown) => hermesGatewayExecute({
+        ...(input as Parameters<typeof hermesGatewayExecute>[0]),
+        config: { apiBaseUrl: `http://127.0.0.1:${port}`, apiKey: "fixture-gateway-key", timeoutSec: 5 },
+      })) as never);
+      const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+      await db.update(agents).set({ adapterType: "hermes_gateway" }).where(eq(agents.id, agentId));
+      const heartbeat = heartbeatService(db);
+
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, runId);
+      await heartbeat.waitForRunExecutionDrain(runId);
+
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      expect(run).toMatchObject({ status: "failed", errorCode: "hermes_gateway_connect_failed" });
+      expect(run?.scheduledRetryAttempt ?? 0).toBe(0);
+      const holds = (await selectRecoveryActionsForIssue(issueId))
+        .filter((action) => action.cause === "legacy_execution_requires_reconciliation");
+      if (receipted) {
+        expect(run?.resultJson?.executionRecovery).toEqual({ kind: "bootstrap", providerWorkStarted: false });
+        expect(run?.usageJson).toMatchObject({ accountingProviderWorkStarted: false });
+        expect(holds).toEqual([]);
+      } else {
+        expect(run?.resultJson?.executionRecovery).toBeUndefined();
+        expect((run?.usageJson as Record<string, unknown> | null)?.accountingProviderWorkStarted).not.toBe(false);
+        expect(holds).toEqual([expect.objectContaining({ cause: "legacy_execution_requires_reconciliation" })]);
+      }
+    } finally {
+      if (mode !== "refused") await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it.each([
     "continuation_task_ownership_changed",
   ] as const)("cancels obsolete continuation setup: %s", async (code) => {
