@@ -5,6 +5,58 @@ import { connectionGrants, toolConnections } from "@paperclipai/db";
 import { RAILWAY_SSH_SECRET_PATH } from "../../railway-ssh.js";
 import { isRailwayConnection } from "../../railway.js";
 
+/**
+ * The default organization grant mirrors the connection's credential secret
+ * refs. Railway's grant-owned SSH key is the one ref the grant keeps on its own.
+ */
+function organizationGrantCredentialSecretRefs(
+  connection: typeof toolConnections.$inferSelect,
+  existing: typeof connectionGrants.$inferSelect,
+) {
+  return isRailwayConnection(connection)
+    ? [...connection.credentialSecretRefs, ...existing.credentialSecretRefs.filter((ref) => ref.configPath === RAILWAY_SSH_SECRET_PATH && !connection.credentialSecretRefs.some((candidate) => candidate.configPath === ref.configPath))]
+    : connection.credentialSecretRefs;
+}
+
+/**
+ * Re-project a shared connection's credential refs onto its existing default
+ * organization grant after the connection is edited. Unlike
+ * `ensureDefaultOrganizationGrant` this never creates or reactivates a grant:
+ * editing a connection is not consent to restore a revoked shared identity.
+ */
+export function createOrganizationGrantCredentialSync(db: Db) {
+  return async function syncDefaultOrganizationGrantCredentials(
+    connection: typeof toolConnections.$inferSelect,
+    dbClient: ToolAccessMutationDb = db,
+  ): Promise<typeof connectionGrants.$inferSelect | null> {
+    // Per-user and per-agent connections keep identity secrets on their own
+    // grants; only a shared connection's refs are the organization identity.
+    if (connection.credentialPolicy !== "shared") return null;
+    const [existing] = await dbClient
+      .select()
+      .from(connectionGrants)
+      .where(
+        and(
+          eq(connectionGrants.companyId, connection.companyId),
+          eq(connectionGrants.connectionId, connection.id),
+          eq(connectionGrants.kind, "organization"),
+          eq(connectionGrants.isDefault, true),
+        ),
+      )
+      .limit(1);
+    if (!existing) return null;
+    const [updated] = await dbClient
+      .update(connectionGrants)
+      .set({
+        credentialSecretRefs: organizationGrantCredentialSecretRefs(connection, existing),
+        updatedAt: new Date(),
+      })
+      .where(eq(connectionGrants.id, existing.id))
+      .returning();
+    return updated ?? null;
+  };
+}
+
 export function createOrganizationGrantStore(db: Db) {
   async function ensureDefaultOrganizationGrant(
     connection: typeof toolConnections.$inferSelect,
@@ -68,9 +120,7 @@ export function createOrganizationGrantStore(db: Db) {
       const [updated] = await dbClient
         .update(connectionGrants)
         .set({
-          credentialSecretRefs: isRailwayConnection(connection)
-            ? [...connection.credentialSecretRefs, ...existing.credentialSecretRefs.filter((ref) => ref.configPath === RAILWAY_SSH_SECRET_PATH && !connection.credentialSecretRefs.some((candidate) => candidate.configPath === ref.configPath))]
-            : connection.credentialSecretRefs,
+          credentialSecretRefs: organizationGrantCredentialSecretRefs(connection, existing),
           ...(oauthProvenance
             ? { providerTenant: providerTenantWithOauth(existing.providerTenant) }
             : {}),

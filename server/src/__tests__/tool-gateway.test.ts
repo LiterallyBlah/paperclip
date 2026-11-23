@@ -1820,6 +1820,56 @@ rl.on("line", (line) => {
     },
   );
 
+  it("refuses a shared header-bearer call when the organization grant lacks the header ref", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const secret = await secretService(db).create(company.id, {
+      name: `Shared remote token ${randomUUID()}`,
+      key: `shared_remote_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: "shared-remote-test-token",
+    });
+    // Created through the API with header refs only: the default organization
+    // grant copies the (empty) credentialSecretRefs list.
+    const remote = await createRemoteMcpTool(db, company.id, {
+      credentialRefs: [{
+        name: "authorization", secretId: secret.id, version: "latest",
+        placement: "header", key: "Authorization", prefix: "Bearer ",
+      }],
+    });
+    await allowAllToolsForAgent(db, company.id, agent.id);
+    const upstreamHeaders: Array<string | null> = [];
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async (_url, init) => {
+      upstreamHeaders.push(new Headers(init.headers).get("authorization"));
+      const body = JSON.parse(String(init.body)) as { id: string };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id,
+        result: { content: [{ type: "text", text: "ok" }] } }),
+      { headers: { "content-type": "application/json" } });
+    } });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.connectionId === remote.connection.id)!;
+
+    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name,
+      parameters: { key: "test", value: "synthetic" } })).rejects.toMatchObject({
+      status: 422,
+      reasonCode: "mcp_remote_missing_secret",
+    });
+    // Never an unauthenticated upstream request.
+    expect(upstreamHeaders).toEqual([]);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, remote.connection.id));
+    expect(connection?.healthStatus).toBe("missing_secret");
+
+    // Once the grant carries the matching ref, the header is sent.
+    await db.update(connectionGrants).set({
+      credentialSecretRefs: [{ secretId: secret.id, versionSelector: "latest", configPath: "credentials.authorization" }],
+    }).where(eq(connectionGrants.connectionId, remote.connection.id));
+    await db.update(toolConnections).set({ healthStatus: "ok" }).where(eq(toolConnections.id, remote.connection.id));
+    expect((await gateway.executeTool({ sessionToken: session.token, tool: tool.name,
+      parameters: { key: "test", value: "synthetic-after-repair" } })).status).toBe("completed");
+    expect(upstreamHeaders).toEqual(["Bearer shared-remote-test-token"]);
+  });
+
   it("passes only the selected grant identity to local stdio MCP processes", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
