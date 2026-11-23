@@ -1,7 +1,10 @@
 import { Router, type Response } from "express";
-import type { Db } from "@paperclipai/db";
+import { companySecretBindings, heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import {
+  agentRotateBoundSecretSchema,
   createSecretProviderConfigSchema,
+  isUuidLike,
   createSecretSchema,
   createUserSecretDefinitionSchema,
   createUserSecretValueSchema,
@@ -21,7 +24,7 @@ import { logActivity, secretService } from "../services/index.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
+import { authorizationDeniedDetails, authorizationService } from "../services/authorization.js";
 import { accessService } from "../services/access.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
@@ -114,6 +117,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   const issues = deps.issues ?? issueService(db);
   const heartbeat = deps.heartbeat ?? heartbeatService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
+  const authorization = authorizationService(db);
   const defaultProvider = getConfiguredSecretProvider();
 
   async function assertSecretCatalogReadAllowed(req: Parameters<typeof assertBoard>[0], companyId: string) {
@@ -356,6 +360,149 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       value: resolution.value,
       version: resolution.version,
     });
+  });
+
+  // Fork feature: run-bound rotation of one granted, bound secret record.
+  //
+  // The caller must be a run-bound agent JWT (no task-bridge or skill-test
+  // key). The target resolves only through `listAgentSecretAccess`, so it is
+  // an active, company-scoped secret the calling agent is bound to. The agent
+  // also needs an explicit `secrets:rotate_bound` grant whose scope names
+  // exactly this secret and binding. The value is registered for run
+  // redaction before any processing, and it never appears in the response,
+  // the audit rows or the logs.
+  router.post("/agents/me/secrets/:key/rotate", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    const context = agentSecretContext(req);
+    if (req.actor.source !== "agent_jwt" || req.actor.keyScope?.kind === "task_bridge" || req.actor.keyScope?.kind === "skill_test") {
+      throw forbidden("Secret rotation requires a verified run-bound agent token");
+    }
+    // Confirm the token's run is this agent's live run before the value is
+    // registered against it. The check reads no part of the body.
+    if (!isUuidLike(context.heartbeatRunId)) {
+      throw forbidden("Agent secret access requires a verified heartbeat run");
+    }
+    const liveRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, context.heartbeatRunId),
+        eq(heartbeatRuns.companyId, context.companyId),
+        eq(heartbeatRuns.agentId, context.agentId),
+        eq(heartbeatRuns.status, "running"),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!liveRun) throw forbidden("Agent secret access requires a verified heartbeat run");
+    const parsed = agentRotateBoundSecretSchema.safeParse(req.body);
+    const rawValue = (req.body as { value?: unknown } | undefined)?.value;
+    if (typeof rawValue === "string" && rawValue.length > 0 && parsed.success) {
+      // Register before any further processing that could echo the value.
+      await runRedactions.register(context.companyId, context.heartbeatRunId, rawValue);
+    }
+    if (!parsed.success) {
+      // Never echo the validation issues: they can quote the input.
+      throw unprocessable("Rotation body must contain only a non-empty value within the size limit");
+    }
+    const value = parsed.data.value;
+    const key = req.params.key as string;
+
+    async function deny(input: {
+      explanation: string;
+      details: Record<string, unknown>;
+      secretId?: string | null;
+      bindingId?: string | null;
+      grantId?: string | null;
+    }): Promise<never> {
+      await logActivity(db, {
+        companyId: context.companyId,
+        actorType: "agent",
+        actorId: context.agentId,
+        action: "secret.rotate_denied",
+        entityType: input.secretId ? "secret" : "agent",
+        entityId: input.secretId ?? context.agentId,
+        agentId: context.agentId,
+        runId: context.heartbeatRunId,
+        details: {
+          ...input.details,
+          secretId: input.secretId ?? null,
+          bindingId: input.bindingId ?? null,
+          grantId: input.grantId ?? null,
+        },
+      });
+      throw forbidden(input.explanation, input.details);
+    }
+
+    const available = await svc.listAgentSecretAccess(context.companyId, context);
+    const secret = available.find((entry) => entry.key === key);
+    if (!secret) {
+      return deny({ explanation: "Secret access is not granted for this agent", details: { reason: "deny_no_binding" } });
+    }
+    // The selected binding must belong to this agent directly. A binding
+    // reached only through the run manifest (for example a project binding)
+    // is never rotatable by the agent.
+    const binding = await db
+      .select({ id: companySecretBindings.id })
+      .from(companySecretBindings)
+      .where(and(
+        eq(companySecretBindings.id, secret.bindingId),
+        eq(companySecretBindings.companyId, context.companyId),
+        eq(companySecretBindings.secretId, secret.secretId),
+        eq(companySecretBindings.targetType, "agent"),
+        eq(companySecretBindings.targetId, context.agentId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!binding) {
+      return deny({
+        explanation: "Secret binding is not owned by this agent",
+        details: { reason: "deny_no_binding" },
+        secretId: secret.secretId,
+        bindingId: secret.bindingId,
+      });
+    }
+
+    const decision = await authorization.decideBoundSecretRotation({
+      companyId: context.companyId,
+      agentId: context.agentId,
+      secretId: secret.secretId,
+      bindingId: secret.bindingId,
+    });
+    if (!decision.allowed) {
+      return deny({
+        explanation: decision.explanation,
+        details: authorizationDeniedDetails(decision),
+        secretId: secret.secretId,
+        bindingId: secret.bindingId,
+        grantId: decision.grantId,
+      });
+    }
+
+    // Compare-and-set against the version the access list just read, so a
+    // concurrent rotation fails closed with the existing stale conflict.
+    const rotated = await svc.rotate(
+      secret.secretId,
+      { value, expectedLatestVersion: secret.latestVersion },
+      { userId: null, agentId: context.agentId },
+    );
+
+    await logActivity(db, {
+      companyId: context.companyId,
+      actorType: "agent",
+      actorId: context.agentId,
+      action: "secret.rotated",
+      entityType: "secret",
+      entityId: rotated.id,
+      agentId: context.agentId,
+      runId: context.heartbeatRunId,
+      details: {
+        secretId: rotated.id,
+        bindingId: secret.bindingId,
+        version: rotated.latestVersion,
+        grantId: decision.grantId,
+        reason: decision.reason,
+      },
+    });
+
+    res.json({ id: rotated.id, key: secret.key, version: rotated.latestVersion });
   });
 
   router.get("/companies/:companyId/secret-providers", (req, res) => {

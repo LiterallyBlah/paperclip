@@ -129,6 +129,7 @@ import {
   createSecretSchema,
   updateSecretSchema,
   rotateSecretSchema,
+  agentRotateBoundSecretSchema,
   rotateUserSecretValueSchema,
   createUserSecretDefinitionSchema,
   updateUserSecretDefinitionSchema,
@@ -3694,6 +3695,34 @@ registry.registerPath({
     },
     401: r.unauthorized,
     403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/me/secrets/{key}/rotate",
+  tags: ["secrets"],
+  summary: "Rotate the value of one granted, bound secret for the current agent run",
+  description:
+    "Requires a run-bound agent token and a secrets:rotate_bound grant whose scope names exactly this secret and binding. The value is never returned.",
+  request: { params: z.object({ key: z.string() }), body: jsonBody(agentRotateBoundSecretSchema) },
+  responses: {
+    200: {
+      description: "Rotated secret identity and new version",
+      content: {
+        "application/json": {
+          schema: z.object({
+            id: z.string().uuid(),
+            key: z.string(),
+            version: z.number().int().positive(),
+          }),
+        },
+      },
+    },
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 

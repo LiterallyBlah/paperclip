@@ -175,6 +175,23 @@ type PrincipalGrantDecision = AuthorizationDecision & {
   grant?: NonNullable<AuthorizationDecision["grant"]>;
 };
 
+export type BoundSecretRotationDecision = AuthorizationDecision & { grantId: string | null };
+
+const BOUND_SECRET_ROTATION_SCOPE_KEYS = ["bindingId", "secretId"] as const;
+
+/** Strict parser for a `secrets:rotate_bound` grant scope. Returns null when unparsable. */
+export function parseBoundSecretRotationScope(scope: unknown): { secretId: string; bindingId: string } | null {
+  if (!scope || typeof scope !== "object" || Array.isArray(scope)) return null;
+  const record = scope as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (keys.length !== BOUND_SECRET_ROTATION_SCOPE_KEYS.length) return null;
+  if (keys.some((key, index) => key !== BOUND_SECRET_ROTATION_SCOPE_KEYS[index])) return null;
+  const { secretId, bindingId } = record;
+  if (typeof secretId !== "string" || typeof bindingId !== "string") return null;
+  if (secretId.trim() === "" || bindingId.trim() === "") return null;
+  return { secretId, bindingId };
+}
+
 function companyIdForResource(resource: AuthorizationResource) {
   return resource.companyId;
 }
@@ -1017,6 +1034,70 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
         scope: grant.scope ?? null,
       },
     });
+  }
+
+  // Fork feature (bound-secret rotation). The generic `scopeAllows` ignores
+  // unknown scope keys, so it would treat `{ secretId }` as unconstrained. This
+  // decision parses the `secrets:rotate_bound` scope strictly instead: the
+  // grant must name exactly one `secretId` and one `bindingId`, both as plain
+  // strings, with no other keys. Any other shape fails closed.
+  async function decideBoundSecretRotation(input: {
+    companyId: string;
+    agentId: string;
+    secretId: string;
+    bindingId: string;
+  }): Promise<BoundSecretRotationDecision> {
+    const action = "secrets:rotate_bound" as const;
+    const membership = await getActiveMembership(input.companyId, "agent", input.agentId);
+    if (!membership) {
+      return {
+        ...deny({
+          action,
+          reason: "deny_missing_membership",
+          explanation: "The agent is not an active member of this company.",
+        }),
+        grantId: null,
+      };
+    }
+    const grant = await findGrant(input.companyId, "agent", input.agentId, "secrets:rotate_bound");
+    if (!grant) {
+      return {
+        ...deny({ action, reason: "deny_missing_grant", explanation: "Missing permission: secrets:rotate_bound." }),
+        grantId: null,
+      };
+    }
+    // Only a grant a board user recorded counts. An agent-written grant (for
+    // example through a delegated member-permissions path, which stores no
+    // user) never authorises this operation.
+    if (!grant.grantedByUserId) {
+      return {
+        ...deny({
+          action,
+          reason: "deny_missing_grant",
+          explanation: "Permission secrets:rotate_bound was not granted by a board user.",
+        }),
+        grantId: grant.id,
+      };
+    }
+    const scope = parseBoundSecretRotationScope(grant.scope);
+    if (!scope || scope.secretId !== input.secretId || scope.bindingId !== input.bindingId) {
+      return {
+        ...deny({
+          action,
+          reason: "deny_scope",
+          explanation: "Permission secrets:rotate_bound does not cover the requested secret binding.",
+        }),
+        grantId: grant.id,
+      };
+    }
+    return {
+      ...allow({
+        action,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by explicit grant secrets:rotate_bound.",
+      }),
+      grantId: grant.id,
+    };
   }
 
   async function loadAgent(agentId: string): Promise<AgentAuthorizationRow | null> {
@@ -2795,6 +2876,15 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
     resource: AuthorizationResource;
     scope?: Record<string, unknown> | null;
   }): Promise<AuthorizationDecision> {
+    // `secrets:rotate_bound` has a strict, record-level scope. The generic
+    // grant path below would ignore its `secretId`, so it must never decide it.
+    if (input.action === "secrets:rotate_bound") {
+      return deny({
+        action: input.action,
+        reason: "deny_unsupported_action",
+        explanation: "secrets:rotate_bound is decided only by decideBoundSecretRotation.",
+      });
+    }
     const agentDecision = await measureWorkspaceAuthorization("authorization.base", () => decideBase(input));
     const responsibleDecision = await measureWorkspaceAuthorization("authorization.responsible_user", () => applyResponsibleUserIntersection(input, agentDecision));
     const intersectedDecision = await measureWorkspaceAuthorization("authorization.authorizing_user", () => applyAuthorizingUserIntersection(input, responsibleDecision));
@@ -2914,6 +3004,7 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
     decideReadsForActors,
     projectDiscoveryCandidateIds,
     decidePrincipalGrant,
+    decideBoundSecretRotation,
   };
 }
 

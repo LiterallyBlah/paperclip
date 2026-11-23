@@ -115,6 +115,22 @@ export const rotateSecretSchema = z.object({
 
 export type RotateSecret = z.infer<typeof rotateSecretSchema>;
 
+// The largest value an agent may write through the bound-secret rotate route.
+export const AGENT_BOUND_SECRET_ROTATE_MAX_VALUE_BYTES = 64 * 1024;
+
+// Body for `POST /agents/me/secrets/:key/rotate`. Only a new value is
+// accepted: the agent cannot change the provider, provider config, external
+// reference or any record metadata.
+export const agentRotateBoundSecretSchema = z.object({
+  value: z.string().min(1).max(AGENT_BOUND_SECRET_ROTATE_MAX_VALUE_BYTES)
+    .refine((value) => value.trim().length > 0, { message: "Value must not be blank" })
+    .refine((value) => new TextEncoder().encode(value).length <= AGENT_BOUND_SECRET_ROTATE_MAX_VALUE_BYTES, {
+      message: "Value is too large",
+    }),
+}).strict();
+
+export type AgentRotateBoundSecret = z.infer<typeof agentRotateBoundSecretSchema>;
+
 export const updateSecretSchema = z.object({
   name: z.string().min(1).optional(),
   key: secretKeySchema.optional(),
