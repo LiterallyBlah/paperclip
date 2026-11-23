@@ -91,7 +91,8 @@ export function isAgentSecretProposalHttpRequest(url: string | undefined): boole
 /**
  * Agent-callable routes that accept secret values in the request body. Named-
  * field redaction cannot find a value an agent places in an unknown field, so
- * the HTTP logger omits the whole body for these routes.
+ * the HTTP logger omits the whole body for these routes. This is a logging
+ * rule only; it does not change error-response sanitisation.
  */
 export function isAgentSecretValueBodyHttpRequest(url: string | undefined): boolean {
   return isAgentBoundSecretRotateHttpRequest(url) || isAgentSecretProposalHttpRequest(url);
@@ -160,7 +161,9 @@ export function isSecretSensitiveHttpRequest(
   if (isPrivateWebhookHttpRequest(method, url) || isPrivateMuseHttpRequest(url)) return true;
   if (url && normalizePath(url).startsWith("/mcp/files/")) return true;
   if (isPrivateAgentCommentaryHttpRequest(url)) return true;
-  if (isAgentSecretValueBodyHttpRequest(url)) return true;
+  // Only rotation is response-sensitive. Proposal bodies are dropped from the
+  // HTTP log (isAgentSecretValueBodyHttpRequest) without changing responses.
+  if (isAgentBoundSecretRotateHttpRequest(url)) return true;
   // Custom OTLP header values are arbitrary credentials, including on rejected
   // methods or malformed subpaths. Named-field redaction cannot identify them.
   if (isPrivateAgentObservabilityHttpRequest(url)) return true;

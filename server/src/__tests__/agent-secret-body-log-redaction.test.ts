@@ -18,9 +18,45 @@ import { createHttpLogger } from "../middleware/logger.js";
 const VALUE_CANARY = "fixture-secret-value-canary";
 const EXTRA_CANARY = "fixture-unknown-field-canary";
 
-type Outcome = "accepted" | "rejected-with-error-context" | "rejected-direct";
+type Outcome =
+  | "accepted"
+  | "rejected-http-error"
+  | "failed-with-error-context"
+  | "rejected-direct";
 
-function buildApp(outcome: Outcome, chunks: string[]) {
+const EXPECTED_STATUS: Record<Outcome, number> = {
+  accepted: 200,
+  "rejected-http-error": 422,
+  "failed-with-error-context": 500,
+  "rejected-direct": 422,
+};
+
+type Handler = express.RequestHandler;
+
+function outcomeHandler(outcome: Outcome): Handler {
+  return (_req, res, next) => {
+    if (outcome === "accepted") {
+      res.status(200).json({ ok: true });
+      return;
+    }
+    if (outcome === "rejected-http-error") {
+      // A 4xx HttpError passes through the shared error handler but attaches
+      // no error context, so the logger falls back to the parsed body.
+      next(new HttpError(422, "Unexpected field"));
+      return;
+    }
+    if (outcome === "failed-with-error-context") {
+      // An unexpected error makes the shared error handler attach error
+      // context, which carries its own copy of the request body.
+      next(new Error("Unexpected failure"));
+      return;
+    }
+    // A handler that rejects without the shared error handler.
+    res.status(422).json({ error: "Unexpected field" });
+  };
+}
+
+function buildApp(handler: Handler, chunks: string[]) {
   const stream = new Writable({
     write(chunk, _encoding, callback) {
       chunks.push(chunk.toString());
@@ -30,19 +66,6 @@ function buildApp(outcome: Outcome, chunks: string[]) {
   const app = express();
   app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
   app.use(express.json());
-  const handler: express.RequestHandler = (_req, res, next) => {
-    if (outcome === "accepted") {
-      res.status(200).json({ ok: true });
-      return;
-    }
-    if (outcome === "rejected-with-error-context") {
-      next(new HttpError(422, "Unexpected field"));
-      return;
-    }
-    // A handler that rejects without the shared error handler leaves no error
-    // context, so the logger falls back to the parsed request body.
-    res.status(422).json({ error: "Unexpected field" });
-  };
   app.post("/api/agents/me/secrets/:key/rotate", handler);
   app.post("/api/agents/me/secret-proposals", handler);
   app.use(errorHandler);
@@ -70,13 +93,13 @@ describe("agent secret-value routes drop the whole request body from HTTP logs",
     ],
     ["secret proposal upper case", "/API/AGENTS/ME/SECRET-PROPOSALS", { kind: "secret", value: VALUE_CANARY, extra: EXTRA_CANARY }],
   ] as const;
-  const outcomes: Outcome[] = ["accepted", "rejected-with-error-context", "rejected-direct"];
+  const outcomes = Object.keys(EXPECTED_STATUS) as Outcome[];
 
   for (const [name, path, body] of routes) {
     it.each(outcomes)(`${name}: %s request logs neither field value`, async (outcome) => {
       const chunks: string[] = [];
-      const response = await request(buildApp(outcome, chunks)).post(path).send(body);
-      expect(response.status).toBe(outcome === "accepted" ? 200 : 422);
+      const response = await request(buildApp(outcomeHandler(outcome), chunks)).post(path).send(body);
+      expect(response.status).toBe(EXPECTED_STATUS[outcome]);
       await new Promise((resolve) => setImmediate(resolve));
 
       const output = chunks.join("");
@@ -90,6 +113,10 @@ describe("agent secret-value routes drop the whole request body from HTTP logs",
         expect(line).not.toHaveProperty("reqBody");
       } else {
         expect(line.reqBody).toBe("[REDACTED]");
+      }
+      if (outcome === "failed-with-error-context") {
+        // Proves the error-context path ran and was reduced to a type marker.
+        expect(line.errorContext).toEqual({ name: "Error" });
       }
     });
   }
@@ -106,8 +133,10 @@ describe("agent secret-value routes drop the whole request body from HTTP logs",
       "/api/agents/me/%73ecret-proposals",
     ]) {
       expect(isAgentSecretValueBodyHttpRequest(url), url).toBe(true);
-      expect(isSecretSensitiveHttpRequest("POST", url), url).toBe(true);
     }
+    // Rotation was already response-sensitive; proposals must stay as before.
+    expect(isSecretSensitiveHttpRequest("POST", "/api/agents/me/secrets/dummy_key/rotate")).toBe(true);
+    expect(isSecretSensitiveHttpRequest("POST", "/api/agents/me/secret-proposals")).toBe(false);
     for (const url of [
       "/api/agents/me/inbox-lite",
       "/api/agents/me/secrets",
@@ -117,5 +146,39 @@ describe("agent secret-value routes drop the whole request body from HTTP logs",
       expect(isAgentSecretValueBodyHttpRequest(url), url).toBe(false);
     }
     expect(isAgentSecretValueBodyHttpRequest(undefined)).toBe(false);
+  });
+
+  describe("secret-proposal error responses are unchanged", () => {
+    const path = "/api/agents/me/secret-proposals";
+
+    async function send(handler: Handler, body: Record<string, unknown>) {
+      const chunks: string[] = [];
+      const response = await request(buildApp(handler, chunks)).post(path).send(body);
+      await new Promise((resolve) => setImmediate(resolve));
+      const output = chunks.join("");
+      expect(output).not.toContain(EXTRA_CANARY);
+      const logs = parseLogs(chunks);
+      expect(logs).toHaveLength(1);
+      expect(logs[0]!.reqBody).toBe("[REDACTED]");
+      return response;
+    }
+
+    it("keeps a 4xx message that shares a word with a submitted value", async () => {
+      const response = await send(
+        (_req, _res, next) => next(new HttpError(422, "Justification is required")),
+        { kind: "secret", name: "fixture", key: "fixture", value: "required", justification: "", extra: EXTRA_CANARY },
+      );
+      expect(response.status).toBe(422);
+      expect(response.body).toEqual({ error: "Justification is required" });
+    });
+
+    it("keeps a 5xx HttpError message and details", async () => {
+      const response = await send(
+        (_req, _res, next) => next(new HttpError(503, "Proposal store unavailable", { reason: "retry" })),
+        { kind: "secret", value: VALUE_CANARY, extra: EXTRA_CANARY },
+      );
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({ error: "Proposal store unavailable", details: { reason: "retry" } });
+    });
   });
 });
