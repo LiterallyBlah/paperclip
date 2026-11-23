@@ -21,6 +21,7 @@ import {
   secretAccessEvents,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/error-handler.js";
+import { accessRoutes } from "../routes/access.js";
 import { agentSecretRotationGrantRoutes } from "../routes/agent-secret-rotation-grant.js";
 import { accessService } from "../services/access.js";
 import { authorizationService } from "../services/authorization.js";
@@ -507,5 +508,58 @@ describeEmbeddedPostgres("agent secret-rotation grant administration routes", ()
     await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agent.agentId));
     expect((await request(app).put(GRANT_PATH(agent.agentId)).send(target)).status).toBe(409);
     expect(await rotateGrant(agent)).toBeNull();
+  });
+  it("leaves the generic member routes rejecting an agent member: 403 before any grant row changes", async () => {
+    const companyId = await seedCompany();
+    const agent = await seedAgent(companyId, "Member-route agent");
+    const target = await createBoundSecret(agent, "MEMBER_ROUTE_TARGET");
+    const access = accessService(db);
+    // The board user holds users:manage_permissions explicitly (session actor, not local implicit).
+    await access.ensureMembership(companyId, "user", BOARD_USER_ID, "owner", "active");
+    await access.setPrincipalPermission(
+      companyId, "user", BOARD_USER_ID, "users:manage_permissions", true, BOARD_USER_ID,
+    );
+    expect(await access.canUser(companyId, BOARD_USER_ID, "users:manage_permissions")).toBe(true);
+    expect((await request(boardApp([companyId])).put(GRANT_PATH(agent.agentId)).send(target)).status).toBe(201);
+    await access.setPrincipalPermission(companyId, "agent", agent.agentId, "tasks:assign", true, BOARD_USER_ID);
+    const before = await grantRows(agent.agentId);
+    expect(before.map((row) => row.permissionKey).sort()).toEqual(["secrets:rotate_bound", "tasks:assign"]);
+    const membership = await access.getMembership(companyId, "agent", agent.agentId);
+
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: BOARD_USER_ID,
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        isInstanceAdmin: false,
+        source: "session",
+      } as Express.Request["actor"];
+      next();
+    });
+    app.use("/api", accessRoutes(db, {
+      deploymentMode: "authenticated",
+      deploymentExposure: "private",
+      bindHost: "127.0.0.1",
+      allowedHostnames: [],
+    }));
+    app.use(errorHandler);
+
+    const patched = await request(app)
+      .patch(`/api/companies/${companyId}/members/${membership!.id}/permissions`)
+      .send({ grants: [] });
+    expect(patched.status).toBe(403);
+    expect(patched.body.error).toBe("Only human company members can be removed.");
+    expect(await grantRows(agent.agentId)).toEqual(before);
+
+    const roleAndGrants = await request(app)
+      .patch(`/api/companies/${companyId}/members/${membership!.id}/role-and-grants`)
+      .send({ status: "active", grants: [] });
+    expect(roleAndGrants.status).toBe(403);
+    expect(await grantRows(agent.agentId)).toEqual(before);
+    expect(await access.getMembership(companyId, "agent", agent.agentId)).toEqual(membership);
+    expectNoValue(patched.body, roleAndGrants.body);
   });
 });
