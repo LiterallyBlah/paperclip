@@ -4,7 +4,7 @@ vi.mock("@cloudflare/sandbox", () => ({
   getSandbox: vi.fn(),
 }));
 
-import { buildLoginShellScript, executeInSandbox } from "./exec.js";
+import { buildBridgeCallerEnvScript, executeInSandbox } from "./exec.js";
 
 describe("bridge exec", () => {
   it("invokes target.exec with a single shell command string and no args option", async () => {
@@ -43,7 +43,15 @@ describe("bridge exec", () => {
     expect(commandArg).not.toContain("NVM_DIR");
     expect(commandArg).toContain("cd ");
     expect(commandArg).toContain("/workspace/paperclip");
-    expect(commandArg).toContain("PAPERCLIP_TEST_FLAG");
+    // Caller env is staged to a sandbox file (BLA-4139); only its path is in
+    // the command text.
+    expect(commandArg).not.toContain("PAPERCLIP_TEST_FLAG");
+    expect(sandbox.writeFile).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/tmp\/\.paperclip-bridge-env-/),
+      expect.stringContaining("PAPERCLIP_TEST_FLAG"),
+      { encoding: "utf8" },
+    );
+    expect(commandArg).toContain((sandbox.writeFile.mock.calls[0] as unknown[])[0] as string);
     expect(commandArg).toContain("claude");
     expect(commandArg).toContain("--version");
   });
@@ -145,10 +153,6 @@ describe("bridge exec", () => {
   });
 
   it("rejects invalid environment variable keys in the login-shell wrapper", () => {
-    expect(() => buildLoginShellScript({
-      command: "pwd",
-      args: [],
-      env: { "bad-key": "1" },
-    })).toThrow("Invalid sandbox environment variable key: bad-key");
+    expect(() => buildBridgeCallerEnvScript({ "bad-key": "1" })).toThrow("Invalid sandbox environment variable key: bad-key");
   });
 });
