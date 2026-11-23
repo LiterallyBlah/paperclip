@@ -452,3 +452,130 @@ describe("SSH env values stay out of process arguments", () => {
     expectBothEndsObservedAndClean(scan);
   }, TEST_TIMEOUT_MS);
 });
+
+// A login profile that turns on shell tracing must not make the remote shell
+// echo the header, or the exports it applies, into stderr, error messages or
+// adapter run logs. The profile is controlled, so this needs the loopback
+// stand-in. Each test proves tracing really was on by finding the traced
+// `set +xv` line in stderr.
+describe("SSH env values stay out of stderr when a profile enables tracing", () => {
+  async function withTracingProfile<T>(label: string, run: (remote: SshRemoteExecutionSpec) => Promise<T>) {
+    const remote = requireSpec(label);
+    if (!remote) return null;
+    if (fixtureState) {
+      console.warn(`Skipping ${label}: needs the loopback stand-in for a controlled profile`);
+      return null;
+    }
+    const fakeHome = await mkdtemp(path.join(scratchDir, "trace-home-"));
+    await writeFile(path.join(fakeHome, ".profile"), "set -xv\n", { mode: 0o600 });
+    const originalHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      return { value: await run(remote) };
+    } finally {
+      process.env.HOME = originalHome;
+      await rm(fakeHome, { recursive: true, force: true });
+    }
+  }
+
+  function expectTracedButClean(text: string, markers: string[]) {
+    for (const marker of markers) expect(text).not.toContain(marker);
+    // Proves tracing was on after the profiles ran, so the clean check is real.
+    expect(text).toContain("set +xv");
+  }
+
+  it("runSshCommand success: value reaches the command, not stderr", async () => {
+    const { value, markers } = dummySecret();
+    const out = await withTracingProfile("trace runSshCommand", (remote) =>
+      runSshCommand(remote, 'printf "%s" "$PC_DUMMY_SECRET"', {
+        env: { PC_DUMMY_SECRET: value },
+        timeoutMs: 30_000,
+      }),
+    );
+    if (!out) return;
+    expect(out.value.stdout).toBe(value);
+    expectTracedButClean(out.value.stderr, markers);
+  }, TEST_TIMEOUT_MS);
+
+  it("runSshCommand failure: value stays out of stderr and the error message", async () => {
+    const { value, markers } = dummySecret();
+    const out = await withTracingProfile("trace runSshCommand failure", async (remote) => {
+      try {
+        await runSshCommand(remote, 'test -n "$PC_DUMMY_SECRET" && exit 3', {
+          env: { PC_DUMMY_SECRET: value },
+          timeoutMs: 30_000,
+        });
+        return null;
+      } catch (error) {
+        return error as Error & { code?: number; stderr?: string };
+      }
+    });
+    if (!out) return;
+    expect(out.value).not.toBeNull();
+    // Exit 3 (not 1) shows the value reached the command.
+    expect(out.value?.code).toBe(3);
+    expectTracedButClean(String(out.value?.stderr), markers);
+    for (const marker of markers) expect(String(out.value?.message)).not.toContain(marker);
+  }, TEST_TIMEOUT_MS);
+
+  it("createSshCommandManagedRuntimeRunner: value reaches the command, not stderr", async () => {
+    const { value, markers } = dummySecret();
+    const out = await withTracingProfile("trace command runner", (remote) =>
+      createSshCommandManagedRuntimeRunner({ spec: remote }).execute({
+        command: "sh",
+        args: ["-c", 'printf "%s" "$PC_DUMMY_SECRET"'],
+        env: { PC_DUMMY_SECRET: value },
+        timeoutMs: 30_000,
+      }),
+    );
+    if (!out) return;
+    expect(out.value.exitCode).toBe(0);
+    expect(out.value.stdout).toBe(value);
+    expectTracedButClean(out.value.stderr, markers);
+  }, TEST_TIMEOUT_MS);
+
+  for (const exitCode of [0, 4]) {
+    it(`buildSshSpawnTarget via runChildProcess (exit ${exitCode}): value stays out of stderr and onLog`, async () => {
+      const { value, markers } = dummySecret();
+      const logged: string[] = [];
+      const out = await withTracingProfile("trace spawn target", (remote) =>
+        runChildProcess(
+          `ssh-trace-${randomUUID()}`,
+          "sh",
+          ["-c", `printf "%s" "$PC_DUMMY_SECRET"; exit ${exitCode}`],
+          {
+            cwd: process.cwd(),
+            env: { PC_DUMMY_SECRET: value },
+            timeoutSec: 30,
+            graceSec: 2,
+            onLog: async (stream, chunk) => {
+              if (stream === "stderr") logged.push(chunk);
+            },
+            remoteExecution: remote,
+          },
+        ),
+      );
+      if (!out) return;
+      expect(out.value.exitCode).toBe(exitCode);
+      expect(out.value.stdout).toBe(value);
+      expectTracedButClean(out.value.stderr, markers);
+      expectTracedButClean(logged.join(""), markers);
+    }, TEST_TIMEOUT_MS);
+  }
+
+  it("adapter SSH shell command: value stays out of stderr", async () => {
+    const { value, markers } = dummySecret();
+    const out = await withTracingProfile("trace adapter shell", (remote) =>
+      runAdapterExecutionTargetShellCommand(
+        `ssh-trace-${randomUUID()}`,
+        { kind: "remote", transport: "ssh", remoteCwd: remote.remoteCwd, spec: remote },
+        'printf "%s" "$PC_DUMMY_SECRET"',
+        { cwd: remote.remoteCwd, env: { PC_DUMMY_SECRET: value }, timeoutSec: 30 },
+      ),
+    );
+    if (!out) return;
+    expect(out.value.exitCode).toBe(0);
+    expect(out.value.stdout).toBe(value);
+    expectTracedButClean(out.value.stderr, markers);
+  }, TEST_TIMEOUT_MS);
+});

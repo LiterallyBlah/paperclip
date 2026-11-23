@@ -196,8 +196,12 @@ export function buildSshEnvStdinHeader(env: Record<string, string>): string | nu
 // separated, so a login shell of any family passes it through intact. The
 // newline comes from the `printf` builtin because a literal newline inside the
 // quoted script would break csh-family login shells. A short or malformed
-// header exits 125 before any profile or target command runs.
+// header exits 125 before any profile or target command runs. Tracing
+// (`set -x`) and verbose mode (`set -v`) are switched off first: an inherited
+// `SHELLOPTS` or `BASH_ENV` could enable them, and a trace of the loop would
+// print the expanded header text, values included, to stderr.
 const SSH_ENV_HEADER_READER = [
+  "set +xv",
   "__pc_nl=$(printf '\\n_')",
   "__pc_nl=${__pc_nl%_}",
   "__pc_env=",
@@ -209,8 +213,12 @@ const SSH_ENV_HEADER_READER = [
 ].join("; ");
 
 // Apply the header after the login profiles, so caller overrides still win
-// over anything a profile re-exports.
-const SSH_ENV_HEADER_APPLY = 'eval "$__pc_env" || exit 125';
+// over anything a profile re-exports. A profile may turn on `set -x` or
+// `set -v`, and either would echo the eval'd exports, values included, to
+// stderr and so into run logs and error messages. Switch both off again right
+// before the eval. They are not restored: `exec` replaces this shell, so the
+// target never inherited them anyway.
+const SSH_ENV_HEADER_APPLY = 'set +xv; eval "$__pc_env" || exit 125';
 
 const SSH_LOGIN_PROFILE_STEPS = [
   'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
