@@ -1738,12 +1738,18 @@ export function environmentService(db: Db) {
         failureReason?: string;
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
         remoteExecutionTermination?: Record<string, unknown>;
+        /** Additive driver evidence (for example SSH exit evidence); never a receipt. */
+        metadataPatch?: Record<string, unknown>;
       },
     ) => {
       const now = new Date();
-      const releaseMetadata = options?.remoteExecutionTermination
+      const { remoteExecutionTermination: _ignoredReceipt, ...metadataPatch } = options?.metadataPatch ?? {};
+      const baseReleaseMetadata = options?.remoteExecutionTermination
         ? sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`
         : sql`${environmentLeases.metadata} - 'remoteExecutionTermination'`;
+      const releaseMetadata = Object.keys(metadataPatch).length > 0
+        ? sql`coalesce(${baseReleaseMetadata}, '{}'::jsonb) || ${JSON.stringify(metadataPatch)}::jsonb`
+        : baseReleaseMetadata;
       const cleanupSettled = options?.expectedPendingCleanupAttemptId && options.cleanupStatus === "success"
         && status !== "pending_cleanup";
       const row = await db.transaction(async tx => {

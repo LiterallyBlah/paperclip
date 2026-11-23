@@ -46,6 +46,7 @@ import {
 } from "../legacy-controller-lease.js";
 import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { readEnvironmentStopFailure, type PluginEnvironmentStopFailure } from "@paperclipai/plugin-sdk";
+import { isSshPendingCleanupLease, reconcileSshPendingCleanup, SSH_UNSUPPORTED_CLEANUP_OPERATION } from "../ssh-pending-cleanup-reconciliation.js";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
 import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
 import { reconcileRetainedWorkspaces } from "../workspace-recovery.js";
@@ -1777,7 +1778,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // path uses the provider and configuration recorded on the lease first;
       // the environment is lifecycle context and only a legacy fallback.
       const isOrphanEphemeralLease = lease.leasePolicy === "ephemeral";
-      const useRecordedTeardown = isOrphanEphemeralLease || !environment || hasStopOnlyCleanup(lease);
+      // An SSH lease names a shared host/account/workspace, not a sandbox, so it
+      // has no provider teardown. It settles only from exact run stop evidence
+      // (see ssh-pending-cleanup-reconciliation.ts) and never through the
+      // generic teardown or its unfenced revert, which would drop receipts.
+      const sshReconciliation = !hasStopOnlyCleanup(lease) && isSshPendingCleanupLease(lease, environment);
+      const useRecordedTeardown = !sshReconciliation &&
+        (isOrphanEphemeralLease || !environment || hasStopOnlyCleanup(lease));
 
       // Do not consume a finite cleanup attempt while the provider plugin is
       // briefly unavailable. A plugin worker restart, a plugin reload, or a
@@ -1844,7 +1851,24 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           action: "environment_lease.cleanup_retried", entityType: "environment_lease", entityId: row.id,
           runId: row.heartbeatRunId ?? undefined, details: { attempt: attempts + 1, reason: "environment_deleted" },
         });
-        if (useRecordedTeardown) {
+        if (sshReconciliation) {
+          const outcome = await reconcileSshPendingCleanup(db, lease, { attemptId: claimed });
+          if (outcome.outcome === "settled") {
+            destroyed += 1;
+            await logActivity(db, {
+              companyId: lease.companyId, actorType: "system", actorId: "pending_cleanup_sweep",
+              action: "environment_lease.cleanup_reconciled", entityType: "environment_lease", entityId: lease.id,
+              runId: lease.heartbeatRunId, details: { provider: "ssh", source: outcome.source,
+                priorCleanupStatus: lease.cleanupStatus, priorFailureReason: lease.failureReason },
+            }).catch(() => logger.warn({ leaseId: lease.id }, "could not record SSH cleanup reconciliation activity"));
+          } else if (outcome.outcome === "unresolved") {
+            logger.warn(
+              { leaseId: row.id, environmentId: row.environmentId, attempts: attempts + 1,
+                reason: outcome.reason, unsupportedOperation: SSH_UNSUPPORTED_CLEANUP_OPERATION },
+              "SSH pending_cleanup lease has no exact stop evidence; it stays unresolved",
+            );
+          }
+        } else if (useRecordedTeardown) {
           // Tear the sandbox down from the recorded provider config and the
           // cleanup-authorized secret versions. Preserve any provider receipt;
           // a completed retry must grant the same evidence as initial cleanup.
