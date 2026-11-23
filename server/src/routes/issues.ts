@@ -50,6 +50,7 @@ import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
+  isApprovedStageAdvanceSource,
   pendingStageRecoveryWakeKey,
   type PendingStageParticipantDeliveryOwner,
 } from "../services/execution-recovery-resolution.js";
@@ -410,6 +411,12 @@ import {
 } from "../services/issue-queued-comment-queue.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+/**
+ * Task statuses a stopped pending-stage recovery may keep: the stage's own
+ * `in_review`, or `blocked` when the source run's automatic no-replay
+ * settlement projected it (BLA-4186; proven inside the recovery).
+ */
+const STOPPED_STAGE_RECOVERY_STATUSES = new Set<string>(["in_review", "blocked"]);
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -7597,6 +7604,10 @@ export function issueRoutes(
    * source run are cleared, and the participant gets one stage wake (post
    * commit) keyed by issue, stage and review round. Every refusal throws
    * before any write, so the transaction leaves no state change.
+   *
+   * BLA-4186: the task may also be `blocked`, but only by this source run's
+   * own automatic no-replay settlement (outcome `blocked`, replay `blocked`,
+   * same run) with no unblock descriptor. The status stays `blocked`.
    */
   async function reconcileStoppedPendingStage(input: {
     req: Request;
@@ -7626,7 +7637,7 @@ export function issueRoutes(
     const stage = state?.currentStageId
       ? policy?.stages.find((candidate) => candidate.id === state.currentStageId) ?? null
       : null;
-    if (issue.status !== "in_review" || state?.status !== "pending" || !participant || !stage ||
+    if (!STOPPED_STAGE_RECOVERY_STATUSES.has(issue.status) || state?.status !== "pending" || !participant || !stage ||
         stage.type !== state.currentStageType) {
       throw refuse("The task has no pending execution stage to resume.", "stage_recovery_stage_not_pending");
     }
@@ -7635,7 +7646,7 @@ export function issueRoutes(
       throw refuse("A human stage participant cannot be resumed by recovery.", "stage_recovery_human_participant");
     }
     const participantAgentId = participant.agentId;
-    if (issue.assigneeAgentId !== participantAgentId || action.returnOwnerAgentId !== participantAgentId) {
+    if (issue.assigneeAgentId !== participantAgentId) {
       throw refuse("The stage participant, task owner or recovery owner changed. Refresh the task.",
         "stage_recovery_owner_changed", {
           participantAgentId, assigneeAgentId: issue.assigneeAgentId, returnOwnerAgentId: action.returnOwnerAgentId,
@@ -7646,12 +7657,45 @@ export function issueRoutes(
       throw refuse("The reconciliation does not name this recovery action's source run.",
         "stage_recovery_source_mismatch");
     }
+    if (issue.status === "blocked") {
+      const automatic = action.evidence.automaticRecovery as { replay?: unknown; runId?: unknown } | undefined;
+      if (action.outcome !== "blocked" || automatic?.replay !== "blocked" || automatic.runId !== sourceRunId ||
+          issue.unblockDescriptor != null) {
+        throw refuse("The task is blocked by something other than this source run's automatic recovery stop.",
+          "stage_recovery_block_unverified", { sourceRunId });
+      }
+    }
     const [sourceRun] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sourceRunId),
     ));
-    if (!sourceRun || sourceRun.agentId !== participantAgentId) {
+    if (!sourceRun) {
       throw refuse("The source run does not belong to the current stage participant.",
         "stage_recovery_owner_changed", { sourceRunId });
+    }
+    // BLA-2425 approved advance: the source run is the approving reviewer's
+    // (agent A) on the completed stage before this one, and the continuation
+    // goes to the current participant (agent B, the assignee). Otherwise the
+    // BLA-1787 same-agent tuple applies unchanged.
+    const approvingReviewerAgentId = sourceRun.agentId !== participantAgentId ? sourceRun.agentId : null;
+    if (approvingReviewerAgentId) {
+      if (!await isApprovedStageAdvanceSource(tx, {
+        companyId: issue.companyId, task: issue, run: sourceRun, agentId: participantAgentId, recoveryAction: action,
+      })) {
+        throw refuse("The source run is not the approving reviewer of the stage before the current one.",
+          "stage_recovery_approval_unverified", { sourceRunId, sourceAgentId: sourceRun.agentId, participantAgentId });
+      }
+    }
+    // The hold's recorded return owner is the assignee when it was raised:
+    // the same participant, or for an approved advance either reviewer.
+    const returnOwnerAdmitted = (returnOwnerAgentId: string | null) => approvingReviewerAgentId
+      ? returnOwnerAgentId == null || returnOwnerAgentId === participantAgentId ||
+        returnOwnerAgentId === approvingReviewerAgentId
+      : returnOwnerAgentId === participantAgentId;
+    if (!returnOwnerAdmitted(action.returnOwnerAgentId)) {
+      throw refuse("The stage participant, task owner or recovery owner changed. Refresh the task.",
+        "stage_recovery_owner_changed", {
+          participantAgentId, assigneeAgentId: issue.assigneeAgentId, returnOwnerAgentId: action.returnOwnerAgentId,
+        });
     }
     if (issue.checkoutRunId || issue.executionRunId) {
       throw refuse("The task still has a live checkout or execution run.", "stage_recovery_run_live", {
@@ -7662,7 +7706,7 @@ export function issueRoutes(
     try {
       await validateExecutionReconciliation({
         db: tx, companyId: issue.companyId, issueId: issue.id, agentId: participantAgentId,
-        sourceRunId, decision, recoveryAction: action,
+        sourceRunId, decision, recoveryAction: action, admitApprovedAdvance: approvingReviewerAgentId !== null,
       });
     } catch (error) {
       if (error instanceof HttpError) {
@@ -7690,9 +7734,10 @@ export function issueRoutes(
         hold.evidence.executionReconciliation === undefined &&
         !hasRequiredWorkspaceRecovery(hold.evidence) &&
         hold.evidence.workspaceRestoreFailure === undefined &&
-        (hold.returnOwnerAgentId == null || hold.returnOwnerAgentId === participantAgentId) &&
+        (approvingReviewerAgentId ? returnOwnerAdmitted(hold.returnOwnerAgentId)
+          : hold.returnOwnerAgentId == null || hold.returnOwnerAgentId === participantAgentId) &&
         (hold.evidence.reviewParticipantAgentId === undefined ||
-          hold.evidence.reviewParticipantAgentId === participantAgentId)
+          hold.evidence.reviewParticipantAgentId === (approvingReviewerAgentId ?? participantAgentId))
       );
     });
     if (unverified.length || !holds.some((hold) => hold.id === action.id)) {
@@ -7719,8 +7764,10 @@ export function issueRoutes(
       throw refuse("Respond to the pending question or confirmation first.", "stage_recovery_interaction_pending");
     }
     // Owner, live-lock, pause, project, governed approval and budget gates.
+    // An approved advance's continuation owner is the verified participant.
     await assertSafeRecoveryHandBackGates({
-      req: input.req, issue, recoveryAction: action, preservePendingAgentStage: true,
+      req: input.req, issue, preservePendingAgentStage: true,
+      recoveryAction: approvingReviewerAgentId ? { returnOwnerAgentId: participantAgentId } : action,
     });
 
     const changesRequestedCount = state.changesRequestedCount ?? 0;
@@ -7760,6 +7807,23 @@ export function issueRoutes(
   }
 
   /**
+   * The recorded delivery owner may still receive a redelivery: it is the
+   * hold's return owner (BLA-1787), or the hold names another approving
+   * reviewer and the stage still follows an approval (BLA-2425).
+   */
+  function redeliveryOwnerAdmitted(
+    action: typeof issueRecoveryActions.$inferSelect,
+    ownerAgentId: string,
+    state: ReturnType<typeof parseIssueExecutionState>,
+  ) {
+    if (action.returnOwnerAgentId === ownerAgentId) return true;
+    const reviewer = action.evidence.reviewParticipantAgentId;
+    return typeof reviewer === "string" && reviewer !== ownerAgentId &&
+      state?.lastDecisionOutcome === "approved" &&
+      (action.returnOwnerAgentId == null || action.returnOwnerAgentId === reviewer);
+  }
+
+  /**
    * A replay of a stopped pending-stage recovery whose post-commit wake never
    * created a request. Redelivers the same keyed wake while the stage, round,
    * participant and owner are unchanged and nothing holds the participant.
@@ -7780,9 +7844,10 @@ export function issueRoutes(
         recorded?.runId !== input.decision.runId || state?.status !== "pending" ||
         state.currentStageId !== owner.stageId || (state.changesRequestedCount ?? 0) !== owner.changesRequestedCount ||
         state.currentParticipant?.type !== "agent" || state.currentParticipant.agentId !== owner.agentId ||
-        issue.assigneeAgentId !== owner.agentId || action.returnOwnerAgentId !== owner.agentId ||
+        issue.assigneeAgentId !== owner.agentId || !redeliveryOwnerAdmitted(action, owner.agentId, state) ||
         owner.idempotencyKey !== pendingStageRecoveryWakeKey(issue.id, owner) ||
-        issue.checkoutRunId || issue.executionRunId) return null;
+        issue.checkoutRunId || issue.executionRunId ||
+        (issue.status === "blocked" && issue.unblockDescriptor != null)) return null;
     const [delivered] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId),
       eq(agentWakeupRequests.agentId, owner.agentId),
@@ -7791,7 +7856,7 @@ export function issueRoutes(
     if (delivered) return null;
     if (await getExecutionBlocker(tx, issue.companyId, issue.id, { admittingAgentId: owner.agentId })) return null;
     await assertSafeRecoveryHandBackGates({
-      req: input.req, issue, recoveryAction: action, preservePendingAgentStage: true,
+      req: input.req, issue, recoveryAction: { returnOwnerAgentId: owner.agentId }, preservePendingAgentStage: true,
     });
     const holds = await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, issue.companyId),
@@ -10275,7 +10340,17 @@ export function issueRoutes(
           eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
           actionId ? eq(issueRecoveryActions.id, actionId) : inArray(issueRecoveryActions.status, ["active", "escalated"]),
         )).limit(1).for("update");
+        // BLA-4186: `restored` at an unchanged `blocked` status, without
+        // workspace repair evidence, is admitted only by the settled
+        // stopped-pending-stage recovery below.
+        const blockedStageRecoveryOnly = outcome === "restored" && sourceIssueStatus === "blocked" &&
+          !executionReconciliation?.workspaceRepairEvidence;
+        const refuseBlockedRestore = () => unprocessable(
+          "Restored recovery actions must move the source issue to todo, done, or in_review",
+          { code: "recovery_restore_status_invalid" },
+        );
         if (workspaceRepairAction && hasRequiredWorkspaceRecovery(workspaceRepairAction.evidence)) {
+          if (blockedStageRecoveryOnly) throw refuseBlockedRestore();
           assertBoard(req);
           await requireRecoveryActionAuthority(req, lockedIssue, issueRecoveryActionReadModel(workspaceRepairAction),
             { source: "recovery_action_resolution" });
@@ -10331,7 +10406,7 @@ export function issueRoutes(
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
               assertBoard(req);
-              if (sourceIssueStatus === "in_review" && lockedIssue.status === "in_review") {
+              if (sourceIssueStatus === lockedIssue.status && STOPPED_STAGE_RECOVERY_STATUSES.has(lockedIssue.status)) {
                 const stageRecovery = await reconcileStoppedPendingStage({
                   req, tx: tx as unknown as Db, issue: lockedIssue, action: settled,
                   decision: executionReconciliation, outcome, resolutionNote: resolutionNote ?? null,
@@ -10356,11 +10431,14 @@ export function issueRoutes(
               activeRecoveryAction = issueRecoveryActionReadModel(reopened!);
             } else {
               const redelivery = executionReconciliation && outcome === "restored" &&
-                sourceIssueStatus === "in_review" && lockedIssue.status === "in_review"
+                sourceIssueStatus === lockedIssue.status && STOPPED_STAGE_RECOVERY_STATUSES.has(lockedIssue.status)
                 ? await redeliverStoppedPendingStage({ req, tx: tx as unknown as Db, issue: lockedIssue,
                   action: settled, decision: executionReconciliation })
                 : null;
               if (redelivery) return { issue: lockedIssue, ...redelivery, stageRecovery: true as const };
+              const stageRecovered = (settled.evidence.continuationDeliveryOwner as
+                PendingStageParticipantDeliveryOwner | undefined)?.kind === "pending_stage_participant";
+              if (blockedStageRecoveryOnly && !stageRecovered) throw refuseBlockedRestore();
               return {
                 issue: lockedIssue,
                 recoveryAction: settled,
@@ -10369,6 +10447,7 @@ export function issueRoutes(
             }
           }
         }
+        if (blockedStageRecoveryOnly) throw refuseBlockedRestore();
         if (
           !activeRecoveryAction ||
           (actionId && activeRecoveryAction.id !== actionId)
