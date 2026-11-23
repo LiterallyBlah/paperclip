@@ -114,6 +114,7 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
     budgetMonthlyCents: companies.budgetMonthlyCents,
     spentMonthlyCents: companies.spentMonthlyCents,
     defaultResponsibleUserId: companies.defaultResponsibleUserId,
+    recoveryCoordinatorAgentId: companies.recoveryCoordinatorAgentId,
     requireBoardApprovalForNewAgents: companies.requireBoardApprovalForNewAgents,
     interactionResolverGovernance: companies.interactionResolverGovernance,
     feedbackDataSharingEnabled: companies.feedbackDataSharingEnabled,
@@ -324,6 +325,15 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
           if (nextLogoAsset.companyId !== existing.id) {
             throw unprocessable("Logo asset must belong to the same company");
           }
+        }
+
+        if (companyPatch.recoveryCoordinatorAgentId) {
+          const coordinator = await tx
+            .select({ id: agents.id })
+            .from(agents)
+            .where(and(eq(agents.id, companyPatch.recoveryCoordinatorAgentId), eq(agents.companyId, existing.id)))
+            .then((rows) => rows[0] ?? null);
+          if (!coordinator) throw unprocessable("Recovery coordinator must be an agent in the same company");
         }
 
         const renamedPrefix = await resolveRenamedIssuePrefix(tx, id, companyPatch);

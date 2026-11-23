@@ -160,6 +160,12 @@ import {
 import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  isCoordinatorRoutedRecoveryAction,
+  RECOVERY_COORDINATOR_WAKE_REASON,
+  RECOVERY_OWNER_ROUTING_EVIDENCE_KEY,
+  resolveRecoveryOwner,
+} from "./recovery-owner-routing.js";
+import {
   collectDispositionRepairSourceState,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
@@ -3557,12 +3563,17 @@ export function recoveryService(
       }
       const wakePolicy = parseObject(action.wakePolicy);
       const wakePolicyType = readNonEmptyString(wakePolicy.type);
+      const coordinatorRouted = isCoordinatorRoutedRecoveryAction(action);
       if (
         wakePolicyType !== "bounded_recovery_owner" &&
         wakePolicyType !== "bounded_owner_disposition_repair" &&
-        action.ownerType !== "board"
+        action.ownerType !== "board" &&
+        !coordinatorRouted
       ) {
         continue;
+      }
+      if (coordinatorRouted && issue.status !== "done" && issue.status !== "cancelled") {
+        await ensureRecoveryCoordinatorWake(action);
       }
 
       if (issue.status === "done" || issue.status === "cancelled") {
@@ -3599,8 +3610,10 @@ export function recoveryService(
           healthyOpenChildIssues(issue),
           sourceHasNewPathOutsideRecoveryAction(action),
         ]);
+      // A coordinator-routed hold keeps board-hold semantics: a durable waiting
+      // path alone does not settle it.
       const durablePathRestored =
-        action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
+        action.ownerType !== "board" && !coordinatorRouted && sourceState.hasDurableWaitingPath;
       if (
         durablePathRestored ||
         healthyChildren.length > 0 ||
@@ -3676,7 +3689,7 @@ export function recoveryService(
         continue;
       }
 
-      if (action.ownerType === "board") continue;
+      if (action.ownerType === "board" || coordinatorRouted) continue;
 
       // Legacy takeover actions remain readable and resolvable, but recovery no
       // longer schedules another agent-owned wake for them.
@@ -3701,16 +3714,26 @@ export function recoveryService(
       legacyEpisode: input.legacyEpisode,
     });
     const now = new Date();
+    const escalationOwner = await resolveRecoveryOwner(db, {
+      companyId: input.issue.companyId,
+      kind: action.kind,
+      cause: action.cause,
+      requestedOwnerType: "board",
+      now,
+    });
     await db
       .update(issueRecoveryActions)
       .set({
         status: "active",
-        ownerType: "board",
-        ownerAgentId: null,
-        ownerUserId: null,
+        ownerType: escalationOwner.ownerType,
+        ownerAgentId: escalationOwner.ownerAgentId,
+        ownerUserId: escalationOwner.ownerUserId,
         maxAttempts: null,
         evidence: {
           ...action.evidence,
+          ...(escalationOwner.routing
+            ? { [RECOVERY_OWNER_ROUTING_EVIDENCE_KEY]: escalationOwner.routing }
+            : {}),
           latestRunId: input.latestRun?.id ?? null,
           latestRunStatus: input.latestRun?.status ?? null,
           latestRunErrorCode: input.latestRun?.errorCode ?? null,
@@ -3752,7 +3775,7 @@ export function recoveryService(
         "",
         `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
         `- Terminal reason: \`${input.terminalReason}\``,
-        "- Recovery owner: board",
+        `- Recovery owner: ${escalationOwner.ownerType === "agent" ? "recovery coordinator agent" : "board"}`,
         "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
         "",
         "Next action: repair the liveness disposition or request an explicit source-owner decision.",
