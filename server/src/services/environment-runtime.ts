@@ -11,6 +11,7 @@ import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironment
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
 import { captureEnvironmentAcquisitionDiagnostic } from "./environment-acquisition-diagnostics.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { SSH_EXECUTION_EXIT_KEY, sshExecutionExitEvidence } from "./ssh-pending-cleanup-reconciliation.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
@@ -1236,7 +1237,12 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     async releaseRunLease(input) {
-      return await environmentsSvc.releaseLease(input.lease.id, input.status);
+      // Releasing SSH bookkeeping never stops a remote process. Keep the exact
+      // exit the adapter observed for this lease's execution, when there is
+      // one, so later cleanup settlement does not depend on run process fields.
+      const exit = await sshExecutionExitEvidence(db, input.lease);
+      return await environmentsSvc.releaseLease(input.lease.id, input.status,
+        exit ? { metadataPatch: { [SSH_EXECUTION_EXIT_KEY]: exit } } : undefined);
     },
 
     async realizeWorkspace(input) {
