@@ -3902,8 +3902,8 @@ export function recoveryService(
         maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
         terminalReason: input.terminalReason,
         recoveryActionId: action.id,
-        recoveryOwnerAgentId: null,
-        recoveryOwnerType: "board",
+        recoveryOwnerAgentId: escalationOwner.ownerAgentId,
+        recoveryOwnerType: escalationOwner.ownerType,
         routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
         sourceAssigneeBefore: {
           agentId: input.issue.assigneeAgentId,
