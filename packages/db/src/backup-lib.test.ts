@@ -947,31 +947,47 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         await sourceSql.unsafe(`
           CREATE TABLE public.stream_rows (id integer PRIMARY KEY, payload text NOT NULL);
           INSERT INTO public.stream_rows
-          SELECT g, repeat(md5(g::text), 8) FROM generate_series(1, 200000) AS g;
+          SELECT g, repeat(md5(g::text), 8) FROM generate_series(1, 20000) AS g;
+          CREATE TABLE public.stream_tail (id integer PRIMARY KEY);
+          INSERT INTO public.stream_tail VALUES (1);
         `);
+        // Tables dump in name order, so stream_rows is already streamed into the
+        // .partial archive when the backup blocks on the locked stream_tail.
+        // Terminating that blocked backend fails the backup mid-stream at a fixed
+        // point, instead of racing the dump to completion on a fast runner.
         let terminated = false;
-        const killer = (async () => {
-          const deadline = Date.now() + 60_000;
-          while (Date.now() < deadline) {
-            const archive = fs.readdirSync(backupDir).find((name) => name.endsWith(".sql.gz.partial"));
-            if (archive && fs.statSync(path.join(backupDir, archive)).size > 0) {
-              const rows = await sourceSql<{ pid: number }[]>`
-                SELECT pg_terminate_backend(pid) AS ok, pid FROM pg_stat_activity
-                WHERE datname = current_database() AND pid <> pg_backend_pid()
-              `;
-              terminated = rows.length > 0;
-              return;
-            }
-            await new Promise((resolveDelay) => setTimeout(resolveDelay, 2));
-          }
-        })();
-        const failure = await runDatabaseBackup({
-          connectionString: source,
-          backupDir,
-          backupEngine: "javascript",
-          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
-        }).then(() => null, (error: unknown) => error);
-        await killer;
+        let failure: unknown = null;
+        const locker = await sourceSql.reserve();
+        // pg_stat_activity is snapshotted per transaction, so poll it from a
+        // separate connection rather than from inside the lock holder's.
+        const monitorSql = postgres(source, { max: 1, onnotice: () => {} });
+        try {
+          await locker`BEGIN`;
+          await locker`LOCK TABLE public.stream_tail IN ACCESS EXCLUSIVE MODE`;
+          const pending = runDatabaseBackup({
+            connectionString: source,
+            backupDir,
+            backupEngine: "javascript",
+            retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          }).then(() => null, (error: unknown) => error);
+          const blockedBackend = async () => {
+            const rows = await monitorSql<{ pid: number }[]>`
+              SELECT pid FROM pg_stat_activity
+              WHERE wait_event_type = 'Lock' AND query ILIKE '%stream_tail%' AND pid <> pg_backend_pid()
+            `;
+            return rows[0]?.pid ?? null;
+          };
+          await waitFor(async () => (await blockedBackend()) !== null, "backup to block on stream_tail", 60_000);
+          expect(partials(backupDir)).toHaveLength(1);
+          const pid = await blockedBackend();
+          const rows = await locker<{ ok: boolean }[]>`SELECT pg_terminate_backend(${pid}) AS ok`;
+          terminated = rows[0]?.ok === true;
+          failure = await pending;
+        } finally {
+          await locker`ROLLBACK`.catch(() => {});
+          locker.release();
+          await monitorSql.end();
+        }
 
         expect(terminated).toBe(true);
         expect(failure).toBeInstanceOf(Error);
