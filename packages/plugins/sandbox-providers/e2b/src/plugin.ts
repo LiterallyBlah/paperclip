@@ -152,6 +152,24 @@ function isValidShellEnvKey(value: string) {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
+// Render caller env as a POSIX `export` script. The script is staged into the
+// sandbox through the provider file API and sourced by the wrapper, so no env
+// value ever appears in the command text handed to the SDK, in the remote
+// shell's argv, or in an `env` helper's argv (BLA-3978). Values keep their
+// exact bytes: single-quoting preserves quotes, newlines and `$`.
+function buildEnvExportScript(env: Record<string, string> | undefined): string | null {
+  const entries = Object.entries(env ?? {});
+  for (const [key] of entries) {
+    if (!isValidShellEnvKey(key)) {
+      throw new Error(`Invalid sandbox environment variable key: ${key}`);
+    }
+  }
+  const lines = entries
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+    .map(([key, value]) => `export ${key}=${shellQuote(value)}`);
+  return lines.length > 0 ? `${lines.join("\n")}\n` : null;
+}
+
 // Source the user's login profiles before exec so commands run with the same
 // PATH the user sees in an interactive shell. e2b's `sandbox.commands.run`
 // otherwise spawns a non-login, non-interactive shell whose PATH does not
@@ -159,25 +177,16 @@ function isValidShellEnvKey(value: string) {
 // .profile/.bashrc — which makes the hello probe fail with
 // `exec: <cli>: not found` even when the binary is on disk. The wrapper no
 // longer sources `nvm.sh`; the sandbox image supplies `node` on the PATH.
+// Caller env is sourced from the staged env file after the profiles, so it
+// still wins over anything the profiles export; the file is removed before
+// exec. Only the file path is in the command text.
 function buildLoginShellScript(input: {
   command: string;
   args: string[];
-  env?: Record<string, string>;
+  envPath?: string;
 }): string {
-  const env = input.env ?? {};
-  for (const key of Object.keys(env)) {
-    if (!isValidShellEnvKey(key)) {
-      throw new Error(`Invalid sandbox environment variable key: ${key}`);
-    }
-  }
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
-  const execLine = envArgs.length > 0
-    ? `exec env ${envArgs.join(" ")} ${commandParts}`
-    : `exec ${commandParts}`;
-  return [
+  const steps = [
     'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
     // .bash_profile typically sources .bashrc itself; only source .bashrc
@@ -186,8 +195,13 @@ function buildLoginShellScript(input: {
     // .bash_profile -> .bashrc.
     'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-    execLine,
-  ].join(" && ");
+  ];
+  if (input.envPath) {
+    const quoted = shellQuote(input.envPath);
+    steps.push(`. ${quoted}`, `{ rm -f ${quoted} || true; }`);
+  }
+  steps.push(`exec ${commandParts}`);
+  return steps.join(" && ");
 }
 
 async function killSandboxBestEffort(sandbox: Sandbox, reason: string): Promise<void> {
@@ -401,13 +415,12 @@ const plugin = definePlugin({
     } catch {
       // ignore — keep going with the existing sandbox lifetime
     }
-    const baseCommand = buildLoginShellScript({
-      command: params.command,
-      args: params.args ?? [],
-      env: params.env,
-    });
+    const envScript = buildEnvExportScript(params.env);
     const timeoutMs = params.timeoutMs ?? config.timeoutMs;
 
+    // Caller env (which carries the agent's PAPERCLIP_API_KEY) is staged to a
+    // private file through the files API, never interpolated into the command.
+    let stagedEnvPath: string | null = null;
     // For commands with stdin, stage the payload to a temp file inside the
     // sandbox and shell-redirect it. Streaming stdin via `sendStdin` raced
     // with fast-failing commands (the process exits before the RPC lands),
@@ -416,26 +429,40 @@ const plugin = definePlugin({
     // keeps execution synchronous, avoids the race, and is unaffected by
     // whether the command exits in microseconds or minutes.
     let stagedStdinPath: string | null = null;
-    if (params.stdin != null) {
-      stagedStdinPath = `/tmp/paperclip-stdin-${randomUUID()}`;
-      try {
-        await sandbox.files.write(stagedStdinPath, params.stdin);
-      } catch (error) {
-        // Best-effort cleanup in case the write partially succeeded; ignore
-        // remove failures so the original error is what propagates.
-        await sandbox.files.remove(stagedStdinPath).catch(() => undefined);
-        throw error;
+    const removeStaged = async () => {
+      for (const stagedPath of [stagedEnvPath, stagedStdinPath]) {
+        if (stagedPath) await sandbox.files.remove(stagedPath).catch(() => undefined);
       }
+    };
+    try {
+      if (envScript != null) {
+        stagedEnvPath = `/tmp/paperclip-env-${randomUUID()}`;
+        await sandbox.files.write(stagedEnvPath, envScript);
+      }
+      if (params.stdin != null) {
+        stagedStdinPath = `/tmp/paperclip-stdin-${randomUUID()}`;
+        await sandbox.files.write(stagedStdinPath, params.stdin);
+      }
+    } catch (error) {
+      // Best-effort cleanup in case a write partially succeeded; ignore
+      // remove failures so the original error is what propagates.
+      await removeStaged();
+      throw error;
     }
 
+    const baseCommand = buildLoginShellScript({
+      command: params.command,
+      args: params.args ?? [],
+      envPath: stagedEnvPath ?? undefined,
+    });
     const command = stagedStdinPath
       ? `${baseCommand} < ${shellQuote(stagedStdinPath)}`
       : baseCommand;
 
     try {
-      // Env is interpolated into the script via `exec env KEY=val …` after
-      // profile sourcing so user-configured env wins over anything profiles
-      // export. No need to pass `envs:` separately.
+      // Env is sourced from the staged file after profile sourcing so
+      // user-configured env wins over anything profiles export. `envs:` is
+      // not used because profiles would override it.
       const result = await sandbox.commands.run(command, {
         cwd: params.cwd,
         timeoutMs,
@@ -464,9 +491,7 @@ const plugin = definePlugin({
       }
       throw error;
     } finally {
-      if (stagedStdinPath) {
-        await sandbox.files.remove(stagedStdinPath).catch(() => undefined);
-      }
+      await removeStaged();
     }
   },
 });

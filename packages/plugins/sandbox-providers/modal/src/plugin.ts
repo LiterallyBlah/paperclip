@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   ModalClient,
   NotFoundError,
@@ -203,6 +204,10 @@ function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function randomStagingSuffix(): string {
+  return `${Date.now()}-${randomUUID()}`;
+}
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
@@ -211,36 +216,45 @@ function isValidShellEnvKey(value: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
+// Render caller env as a POSIX `export` script. It is staged into the sandbox
+// through `sandbox.open` and sourced by the wrapper, so no env value appears in
+// the `sh -c` script handed to `sandbox.exec`, in the remote argv, or in an
+// `env` helper's argv (BLA-3978). Single-quoting keeps the exact bytes,
+// including quotes, newlines and `$`.
+function buildEnvExportScript(env: Record<string, string> | undefined): string | null {
+  const entries = Object.entries(env ?? {});
+  for (const [key] of entries) {
+    if (!isValidShellEnvKey(key)) {
+      throw new Error(`Invalid sandbox environment variable key: ${key}`);
+    }
+  }
+  const lines = entries
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+    .map(([key, value]) => `export ${key}=${shellQuote(value)}`);
+  return lines.length > 0 ? `${lines.join("\n")}\n` : null;
+}
+
 // Modal's `sandbox.exec` takes an argv array and bypasses the shell entirely,
 // so adapter probes that rely on PATH mutations from /etc/profile or ~/.bashrc
 // do not work without an explicit profile source. Wrap the user command in a
 // `sh -c` script that sources the common login profiles before it runs. The
 // script sources no `nvm.sh`; the sandbox image supplies node on the PATH. The
 // script sources the profiles itself, so a non-login shell (`sh -c`) is enough.
-// Env is set after profile sourcing so caller env wins; stdin is staged to a
-// temp file and shell-redirected so fast-failing commands do not race a
-// streaming stdin writer.
+// Caller env is sourced from the staged env file after profile sourcing so
+// caller env wins; the file is removed before exec and only its path is in the
+// script. Stdin is staged to a temp file and shell-redirected so fast-failing
+// commands do not race a streaming stdin writer.
 function buildLoginShellScript(input: {
   command: string;
   args: string[];
   cwd?: string;
-  env?: Record<string, string>;
+  envPath?: string;
   stdinPath?: string;
 }): string {
-  const env = input.env ?? {};
-  for (const key of Object.keys(env)) {
-    if (!isValidShellEnvKey(key)) {
-      throw new Error(`Invalid sandbox environment variable key: ${key}`);
-    }
-  }
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
   const redirected = input.stdinPath
     ? `${commandParts} < ${shellQuote(input.stdinPath)}`
     : commandParts;
-  const finalLine = envArgs.length > 0 ? `exec env ${envArgs.join(" ")} ${redirected}` : `exec ${redirected}`;
   const lines = [
     'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
@@ -250,7 +264,11 @@ function buildLoginShellScript(input: {
   if (input.cwd) {
     lines.push(`cd ${shellQuote(input.cwd)}`);
   }
-  lines.push(finalLine);
+  if (input.envPath) {
+    const quoted = shellQuote(input.envPath);
+    lines.push(`. ${quoted}`, `{ rm -f ${quoted} || true; }`);
+  }
+  lines.push(`exec ${redirected}`);
   return lines.join(" && ");
 }
 
@@ -267,18 +285,18 @@ async function ensureRemoteWorkspace(sandbox: Sandbox, remoteCwd: string): Promi
   }
 }
 
-async function stageStdin(sandbox: Sandbox, stdin: string, remotePath: string): Promise<void> {
+async function stageFile(sandbox: Sandbox, contents: string, remotePath: string): Promise<void> {
   const file = await sandbox.open(remotePath, "w");
   try {
-    await file.write(new TextEncoder().encode(stdin));
+    await file.write(new TextEncoder().encode(contents));
     await file.flush();
   } finally {
     await file.close().catch(() => undefined);
   }
 }
 
-async function deleteStdinPath(sandbox: Sandbox, remotePath: string): Promise<void> {
-  // Best-effort cleanup of the staged stdin file. We swallow errors because
+async function deleteStagedPath(sandbox: Sandbox, remotePath: string): Promise<void> {
+  // Best-effort cleanup of a staged stdin or env file. We swallow errors because
   // it is fine for the file to outlive the sandbox if it is going to be
   // terminated, and a missing rm tool would otherwise mask the real result.
   try {
@@ -610,18 +628,25 @@ const plugin = definePlugin({
           stderr: "Modal sandbox lease is no longer available.\n",
         };
       }
+      const envScript = buildEnvExportScript(params.env);
+      const envPath = envScript != null ? `/tmp/paperclip-env-${randomStagingSuffix()}` : null;
       const stdinPath = params.stdin != null
-        ? `/tmp/paperclip-stdin-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+        ? `/tmp/paperclip-stdin-${randomStagingSuffix()}`
         : null;
       try {
+        // Caller env (which carries the agent's PAPERCLIP_API_KEY) goes
+        // through the file API, never into the exec argv.
+        if (envPath && envScript != null) {
+          await stageFile(sandbox, envScript, envPath);
+        }
         if (stdinPath && params.stdin != null) {
-          await stageStdin(sandbox, params.stdin, stdinPath);
+          await stageFile(sandbox, params.stdin, stdinPath);
         }
         const script = buildLoginShellScript({
           command: params.command,
           args: params.args ?? [],
           cwd: params.cwd ?? config.workdir,
-          env: params.env,
+          envPath: envPath ?? undefined,
           stdinPath: stdinPath ?? undefined,
         });
         const proc = await sandbox.exec(["sh", "-c", script], {
@@ -647,8 +672,8 @@ const plugin = definePlugin({
         }
         throw error;
       } finally {
-        if (stdinPath) {
-          await deleteStdinPath(sandbox, stdinPath);
+        for (const stagedPath of [envPath, stdinPath]) {
+          if (stagedPath) await deleteStagedPath(sandbox, stagedPath);
         }
       }
     } finally {
