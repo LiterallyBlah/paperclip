@@ -61,12 +61,18 @@ export async function isCancelledNativeStartup(db: Db, run: Run, coordinator: Co
       : !hasRemoteTerminationReceipt(lease))) return false;
   // Reject contradictory retained evidence, including a crash after a launch
   // request but before the PID callback. Provider events never certify a stop.
+  return !await hasRetainedExecutionEvidence(db, run.companyId, run.id);
+}
+
+export const RETAINED_EXECUTION_EVENT_TYPES = ["adapter.invoke", PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED,
+  "harness.ready", "session.started", "session.resumed", "session.updated", "turn.started",
+  "provider.event", "provider.rpc_result", "tool.execution.started"];
+
+/** Any provider-sourced or launch/session event contradicts a never-dispatched claim. */
+export async function hasRetainedExecutionEvidence(db: Db, companyId: string, runId: string) {
   const [execution] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
-    eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
-    or(isNotNull(heartbeatRunEvents.sourceEventId),
-      inArray(heartbeatRunEvents.eventType, ["adapter.invoke", PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED,
-        "harness.ready", "session.started", "session.resumed", "session.updated", "turn.started",
-        "provider.event", "provider.rpc_result", "tool.execution.started"])),
+    eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, runId),
+    or(isNotNull(heartbeatRunEvents.sourceEventId), inArray(heartbeatRunEvents.eventType, RETAINED_EXECUTION_EVENT_TYPES)),
   )).limit(1);
-  return !execution;
+  return Boolean(execution);
 }

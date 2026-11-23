@@ -1,4 +1,5 @@
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
+import { recordLegacyStartupCancellationSettled } from "./legacy-startup-cancellation.js";
 import { writeExecutionControl } from "./execution-control-notifications.js";
 import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
 import { promptInjectionPreventionService } from "./prompt-injection-prevention.js";
@@ -3855,6 +3856,16 @@ export function heartbeatService(
             resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
               ${JSON.stringify({ startupPreparationSettledAt: new Date().toISOString() })}::jsonb`,
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
+        }
+        if (latestRun?.status === "cancelled" && latestRun.runtimeMode === "legacy" &&
+            latestRun.controllerBootId === legacyControllerBootId) {
+          // This executor owns the run on this boot and is past lease cleanup.
+          // Stop won before adapter entry, so no process can acknowledge it.
+          // The recorder rechecks the locked handoff and all launch evidence.
+          await recordLegacyStartupCancellationSettled(db, {
+            runId: run.id, companyId: run.companyId, controllerBootId: legacyControllerBootId,
+            adapterEntered: legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld,
+          }).catch(error => logger.warn({ runId: run.id, error }, "Could not record legacy startup cancellation settlement"));
         }
         await db.update(heartbeatRuns).set({
           executionStage: sql`case when ${heartbeatRuns.status} = 'cancelled' then 'settled' else ${heartbeatRuns.executionStage} end`,

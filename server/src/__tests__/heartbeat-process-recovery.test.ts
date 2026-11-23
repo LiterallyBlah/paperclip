@@ -39,6 +39,7 @@ function capturePluginEvents(): PluginEvent[] {
   return events;
 }
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { agentExecutionsHaveStopped } from "../services/agent-execution-stop.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
@@ -3632,6 +3633,65 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(mockAdapterExecute).not.toHaveBeenCalled();
       const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
       expect(task.executionRunId).toBeNull();
+    });
+  });
+
+  it("records executor-owned stop proof when a legacy local Stop wins before adapter entry", async () => {
+    await withTempPaperclipHome(async () => {
+      const { agentId, issueId, runId } = await seedQueuedIssueRunFixture();
+      await db.update(heartbeatRuns).set({ invocationSource: "automation" }).where(eq(heartbeatRuns.id, runId));
+      let reachedSelection = false;
+      const heartbeat = heartbeatService(db, {
+        // Preparation is complete; the locked provider handoff has not run.
+        beforeChatControlRecoveryCheck: async ({ stage, runId: id }) => {
+          if (stage !== "dispatch") return;
+          reachedSelection = true;
+          await heartbeat.cancelRun(id);
+          // Same missing-acknowledgement block as the captured Summarizer row.
+          const stopped = await heartbeat.getRun(id);
+          expect(stopped).toMatchObject({ status: "cancelled", runtimeMode: "legacy", processPid: null });
+          expect(stopped?.resultJson?.executionCancellation).toBeUndefined();
+          expect(await agentExecutionsHaveStopped(db, [agentId])).toBe(false);
+        },
+      });
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      expect(reachedSelection).toBe(true);
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      const run = await heartbeat.getRun(runId);
+      expect(run).toMatchObject({ status: "cancelled", runtimeMode: "legacy", executionStage: "settled",
+        processPid: null, processGroupId: null, sessionIdAfter: null, exitCode: null,
+        resultJson: { cancellation: { source: "control_plane" },
+          legacyStartupCancellation: { version: 1, runId, controllerBootId: run?.controllerBootId,
+            providerDispatchStarted: false, cancellationRecordedAt: (run?.resultJson?.cancellation as { recordedAt?: string })?.recordedAt } } });
+      expect(run?.usageJson?.budgetDispatch).toBeUndefined();
+      expect(run?.resultJson?.executionCancellation).toBeUndefined();
+      expect(run?.resultJson?.startupPreparationSettledAt).toBeUndefined();
+      expect(await agentExecutionsHaveStopped(db, [agentId])).toBe(true);
+      const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(task.executionRunId).toBeNull();
+    });
+  });
+
+  it("records no pre-adapter stop proof once the legacy adapter was entered", async () => {
+    await withTempPaperclipHome(async () => {
+      const { agentId, runId } = await seedQueuedIssueRunFixture();
+      let heartbeat!: ReturnType<typeof heartbeatService>;
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        // Stop lands after the locked handoff but before any adapter owner or
+        // PID is registered: the same unacknowledged row shape, after entry.
+        await heartbeat.cancelRun(runId);
+        return { exitCode: null, signal: null, timedOut: false, errorMessage: "stopped", provider: "test", model: "test-model" };
+      });
+      heartbeat = heartbeatService(db);
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      const run = await heartbeat.getRun(runId);
+      expect(run).toMatchObject({ status: "cancelled", runtimeMode: "legacy", processPid: null });
+      expect(run?.usageJson?.budgetDispatch).toMatchObject({ handedOffAt: expect.any(String) });
+      expect(run?.resultJson?.legacyStartupCancellation).toBeUndefined();
+      expect(await agentExecutionsHaveStopped(db, [agentId])).toBe(false);
     });
   });
 
