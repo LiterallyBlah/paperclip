@@ -18,6 +18,15 @@ export function isConversationAdapter(adapterType: string): boolean {
 
 export const CONVERSATION_CONTINUATION_POLICY = "continue_conversation_v1";
 
+/**
+ * Run-scoped receipt written when the conversation fold settles a legacy
+ * reconciliation hold. It records that this run's outcome is decided: the
+ * conversation continues from a new message and the run is never replayed.
+ * Stranded-work recovery treats it as the run's recorded decision so it does
+ * not re-create the hold the fold just settled.
+ */
+export const CONVERSATION_SETTLEMENT_KEY = "conversationSettlement";
+
 export function hasConversationContinuationPolicy(result: Record<string, unknown> | null | undefined): boolean {
   return result?.workspaceRestoreFailure !== "restore_unsafe_archive" && !hasRequiredWorkspaceRecovery(result) && result?.conversationContinuation === CONVERSATION_CONTINUATION_POLICY;
 }
