@@ -3,6 +3,7 @@ import { hasRequiredWorkspaceRecovery, preserveWorkspaceRestoreRecoveryMetadata,
 import { hasUnrestoredRemoteWorkspace, preserveLegacyWorkspaceRestoreSources, type LegacyWorkspaceRestoreSource } from "./legacy-workspace-restore-recovery.js";
 import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
+import { isPreAdmissionLostRunVerified } from "./pre-admission-lost-run.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
@@ -80,7 +81,9 @@ export function legacyExecutionNeedsReconciliation(
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
   return await hasUnrestoredRemoteWorkspace(db, run) ||
     (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
-      && !(await isPreDispatchExecutionWaitVerified(db, run)));
+      && !(await isPreDispatchExecutionWaitVerified(db, run))
+      // An exact retained `required` admission proves the adapter was never entered.
+      && !(await isPreAdmissionLostRunVerified(db, run)));
 }
 
 /** Persist the failed legacy run, owned lock release and operator decision together. */

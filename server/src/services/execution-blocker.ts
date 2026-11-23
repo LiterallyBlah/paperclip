@@ -1,6 +1,7 @@
 import { isPreDispatchReviewWait, neverStartedDispatchCancellationPredicate } from "./pre-dispatch-review-wait.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-execution-wait.js";
+import { preAdmissionLostRunPredicate } from "./pre-admission-lost-run.js";
 import { and, desc, eq, gt, inArray, not, or, sql } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
@@ -55,8 +56,9 @@ export function executionBlockerPredicate() {
         and ${heartbeatRuns.id} = ${canonicalExecutionUuid(sql`coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')`)}
         and ${issueRecoveryActions.sourceIssueId} = ${canonicalExecutionUuid(sql`${heartbeatRuns.contextSnapshot}->>'issueId'`)}
         and (${heartbeatRuns.issueId} is null or ${heartbeatRuns.issueId} = ${issueRecoveryActions.sourceIssueId})
-        and ${neverStartedDispatchCancellationPredicate()}
-        and ${heartbeatRuns.errorCode} <> 'issue_continuation_waiting_on_review'
+        and ((${neverStartedDispatchCancellationPredicate()}
+          and ${heartbeatRuns.errorCode} <> 'issue_continuation_waiting_on_review')
+          or ${preAdmissionLostRunPredicate(sql`${issueRecoveryActions.sourceIssueId}`)})
         and coalesce(${issueRecoveryActions.evidence}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'
         and coalesce(${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema', '') <> ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}
     ))`,
