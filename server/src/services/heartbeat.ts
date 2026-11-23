@@ -25,6 +25,7 @@ import { registerObsoletePolicyReviewWork } from "./native-runtime/obsolete-poli
 import { registerCancelledWorkspacePreservationWork } from "./native-runtime/native-failed-workspace-recovery.js";
 import { readUpgradeReadiness } from "./heartbeat/upgrade-readiness.js";
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
+import { recordLegacyStartupCancellationSettled } from "./legacy-startup-cancellation.js";
 import { writeExecutionControl } from "./execution-control-notifications.js";
 import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
 import { settleFailedNativeRecoveryPreparation } from "./native-runtime/native-recovery-preparation-failure.js";
@@ -4114,6 +4115,16 @@ export function heartbeatService(
           await acknowledgeRemoteStop(run.id, run.companyId).catch(error => {
             logger.warn({ err: error, runId: run.id }, "failed to acknowledge Stop after native process settlement");
           });
+        }
+        if (latestRun?.status === "cancelled" && latestRun.runtimeMode === "legacy" &&
+            latestRun.controllerBootId === legacyControllerBootId) {
+          // This executor owns the run on this boot and is past lease cleanup.
+          // Stop won before adapter entry, so no process can acknowledge it.
+          // The recorder rechecks the locked handoff and all launch evidence.
+          await recordLegacyStartupCancellationSettled(db, {
+            runId: run.id, companyId: run.companyId, controllerBootId: legacyControllerBootId,
+            adapterEntered: legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld,
+          }).catch(error => logger.warn({ runId: run.id, error }, "Could not record legacy startup cancellation settlement"));
         }
         await db.update(heartbeatRuns).set({
           executionStage: sql`case when ${heartbeatRuns.status} = 'cancelled' then 'settled' else ${heartbeatRuns.executionStage} end`,
