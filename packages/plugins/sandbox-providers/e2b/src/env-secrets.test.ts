@@ -45,13 +45,15 @@ const PROBE = [
   "const leftovers=fs.readdirSync(dir).filter((n)=>n.startsWith('paperclip-env-'));",
   "process.stdout.write(JSON.stringify({key:process.env.PAPERCLIP_API_KEY??null,other:process.env.OTHER_SECRET??null,",
   "multi:process.env.MULTI??null,uid:process.env.UID??null,profileOnly:process.env.PROFILE_ONLY??null,",
+  "aliases:Object.keys(process.env).filter((k)=>k.startsWith('__paperclip_env')),",
   "argv:process.argv,stdin,leftovers}));",
   "process.exit(Number(process.env.PROBE_EXIT??0));",
 ].join("");
 
 let root: string;
 
-function createRealShellSandbox() {
+// `binSh` emulates an image whose /bin/sh is another shell (for example bash).
+function createRealShellSandbox(shell: { binSh?: string } = {}) {
   const toLocal = (remote: string) => remote.replace(/^\/tmp\//, `${root}/`);
   const commandTexts: string[] = [];
   const runOptions: unknown[] = [];
@@ -70,8 +72,9 @@ function createRealShellSandbox() {
       run: vi.fn(async (command: string, options?: unknown) => {
         commandTexts.push(command);
         runOptions.push(options);
-        const localCommand = command.replace(/'\/tmp\/paperclip-/g, () => `'${root}/paperclip-`);
-        const res = spawnSync("bash", ["-c", localCommand], {
+        let localCommand = command.replace(/'\/tmp\/paperclip-/g, () => `'${root}/paperclip-`);
+        if (shell.binSh) localCommand = localCommand.replace("exec /bin/sh -c ", () => `exec ${shell.binSh} -c `);
+        const res = spawnSync("/bin/bash", ["-c", localCommand], {
           cwd: root,
           env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, PROBE_DIR: root },
           encoding: "utf8",
@@ -225,5 +228,85 @@ describe("E2B execute keeps env secrets out of command text and argv (BLA-3978)"
     expect(out.key).toBe(DUMMY_API_KEY);
     expectNoSecretIn(fake.commandTexts, [DUMMY_API_KEY]);
     expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);
+  });
+
+  // An image whose /bin/sh is bash: bash owns readonly UID even as `sh --posix`,
+  // so the fresh shell cannot assign it and an execve helper applies the env.
+  describe("when /bin/sh is bash", () => {
+    const BASH_AS_SH = "/bin/bash --posix";
+    const multi = `line one\nit's "quoted" $HOME \`not run\` \\ back\n\ttab'`;
+    const commandOn = (bin: string) => spawnSync("/bin/sh", ["-c", `command -v ${bin}`], { encoding: "utf8" }).stdout.trim();
+    // Limit the sandbox PATH to `rm` plus the given helpers. Set from ~/.profile,
+    // which the wrapper sources after /etc/profile (that may reset PATH).
+    function onlyHelpers(bins: string[]) {
+      const dir = path.join(root, `bin-${bins.join("-") || "none"}`);
+      fs.mkdirSync(dir);
+      for (const bin of ["rm", ...bins]) fs.symlinkSync(commandOn(bin), path.join(dir, bin));
+      fs.appendFileSync(path.join(root, ".profile"), `export PATH='${dir}'\n`);
+    }
+
+    it("keeps UID, readonly-profile names and multiline values (perl helper)", async () => {
+      fs.writeFileSync(
+        path.join(root, ".profile"),
+        "export OTHER_SECRET='profile-dummy'\nreadonly OTHER_SECRET\nexport PROFILE_ONLY='from-profile'\n",
+      );
+      onlyHelpers(["perl"]);
+      const fake = createRealShellSandbox({ binSh: BASH_AS_SH });
+      mockConnect.mockResolvedValue(fake.sandbox);
+
+      const result = await execute({
+        PAPERCLIP_API_KEY: DUMMY_API_KEY,
+        OTHER_SECRET: DUMMY_OTHER,
+        UID: "dummy-uid-bla3978",
+        MULTI: multi,
+      });
+
+      expect(result?.exitCode).toBe(0);
+      const out = JSON.parse(result!.stdout);
+      expect(out.key).toBe(DUMMY_API_KEY);
+      expect(out.other).toBe(DUMMY_OTHER);
+      expect(out.uid).toBe("dummy-uid-bla3978");
+      expect(out.multi).toBe(multi);
+      expect(out.profileOnly).toBe("from-profile");
+      expect(out.aliases).toEqual([]);
+      expect(out.leftovers).toEqual([]);
+      expectNoSecretIn(out.argv, [DUMMY_API_KEY, DUMMY_OTHER]);
+      expectNoSecretIn(fake.commandTexts, [DUMMY_API_KEY, DUMMY_OTHER, "not run"]);
+      expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);
+    });
+
+    it("falls back to python3 and keeps stdin and the exit code", async () => {
+      onlyHelpers(["python3"]);
+      const fake = createRealShellSandbox({ binSh: BASH_AS_SH });
+      mockConnect.mockResolvedValue(fake.sandbox);
+
+      const result = await execute(
+        { PAPERCLIP_API_KEY: DUMMY_API_KEY, UID: "dummy-uid-bla3978", PROBE_READ_STDIN: "1", PROBE_EXIT: "7" },
+        { stdin: "first\nsecond line\n" },
+      );
+
+      expect(result?.exitCode).toBe(7);
+      const out = JSON.parse(result!.stdout);
+      expect(out.key).toBe(DUMMY_API_KEY);
+      expect(out.uid).toBe("dummy-uid-bla3978");
+      expect(out.stdin).toBe("first\nsecond line\n");
+      expect(out.aliases).toEqual([]);
+      expectNoSecretIn(fake.commandTexts, [DUMMY_API_KEY]);
+      expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);
+    });
+
+    it("fails loudly without leaking values when no helper exists", async () => {
+      onlyHelpers([]);
+      const fake = createRealShellSandbox({ binSh: BASH_AS_SH });
+      mockConnect.mockResolvedValue(fake.sandbox);
+
+      const result = await execute({ PAPERCLIP_API_KEY: DUMMY_API_KEY, UID: "dummy-uid-bla3978" });
+
+      expect(result?.exitCode).toBe(126);
+      expect(result?.stderr).toContain("neither perl nor python3 is available");
+      expectNoSecretIn([result?.stdout, result?.stderr], [DUMMY_API_KEY, "dummy-uid-bla3978"]);
+      expectNoSecretIn(fake.commandTexts, [DUMMY_API_KEY]);
+      expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);
+    });
   });
 });

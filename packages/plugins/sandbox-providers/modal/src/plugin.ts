@@ -216,11 +216,14 @@ function isValidShellEnvKey(value: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
-// Render caller env as a POSIX `export` script. It is staged into the sandbox
-// through `sandbox.open` and sourced by the wrapper, so no env value appears in
-// the `sh -c` script handed to `sandbox.exec`, in the remote argv, or in an
-// `env` helper's argv (BLA-3978). Single-quoting keeps the exact bytes,
-// including quotes, newlines and `$`.
+// Render caller env as a POSIX script staged into the sandbox through the
+// provider file API, so no env value appears in the command text handed to the
+// SDK, in any remote argv, or in an `env` helper's argv (BLA-3978). Each value
+// is held in a private alias (`__paperclip_env_<i>`); single-quoting keeps the
+// exact bytes, including quotes, newlines and `$`. The script also defines
+// small functions that CALLER_ENV_EXEC_SCRIPT uses to apply the aliases under
+// the caller's names, plus the name list for the execve fallback. Names are
+// validated identifiers and are not secret.
 function buildEnvExportScript(env: Record<string, string> | undefined): string | null {
   const entries = Object.entries(env ?? {});
   for (const [key] of entries) {
@@ -228,20 +231,55 @@ function buildEnvExportScript(env: Record<string, string> | undefined): string |
       throw new Error(`Invalid sandbox environment variable key: ${key}`);
     }
   }
-  const lines = entries
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `export ${key}=${shellQuote(value)}`);
-  return lines.length > 0 ? `${lines.join("\n")}\n` : null;
+  const kept = entries.filter((entry): entry is [string, string] => typeof entry[1] === "string");
+  if (kept.length === 0) return null;
+  const aliases = kept.map((_, index) => `__paperclip_env_${index}`);
+  const lines = [
+    ...kept.map(([, value], index) => `${aliases[index]}=${shellQuote(value)}`),
+    `__paperclip_env_apply() { ${kept.map(([key], index) => `export ${key}="$${aliases[index]}"`).join(" && ")}; }`,
+    `__paperclip_env_export() { export ${aliases.join(" ")}; }`,
+    `__paperclip_env_unset() { unset ${aliases.join(" ")}; }`,
+    `__paperclip_env_names=${shellQuote(`${kept.length} ${kept.map(([key]) => key).join(" ")}`)}`,
+  ];
+  return `${lines.join("\n")}\n`;
 }
 
+// execve helpers for a fresh shell that refuses to assign a caller name. Both
+// read each value from its `__paperclip_env_<i>` alias in their own environment,
+// set it under the caller's name, drop the alias, and execvp the target; only
+// the name count and names are in their argv. Neither contains a single quote.
+const CALLER_ENV_PERL_EXEC =
+  'my $c=shift @ARGV; my @n=splice(@ARGV,0,$c); for my $i (0..$#n) { $ENV{$n[$i]}=delete $ENV{"__paperclip_env_$i"}; } exec { $ARGV[0] } @ARGV; print STDERR "paperclip-env: $ARGV[0]: $!\\n"; exit 127;';
+const CALLER_ENV_PYTHON_EXEC = [
+  "import os,sys",
+  "a=sys.argv[1:];c=int(a[0]);n=a[1:1+c];a=a[1+c:]",
+  'for i,k in enumerate(n): os.environ[k]=os.environ.pop("__paperclip_env_%d"%i)',
+  "try: os.execvp(a[0],a)",
+  "except OSError as e:",
+  '  sys.stderr.write("paperclip-env: %s: %s\\n"%(a[0],e.strerror)); sys.exit(127)',
+].join("\n");
+
 // Applies the staged caller env in a fresh `/bin/sh` that has not sourced any
-// profile, then execs the target. A profile can mark a name readonly, and
-// assigning caller env in the profile shell would then fail, where
-// `exec env K=v` used to override it for the child. The fresh shell inherits
-// only the profile's exported values, not readonly attributes, so caller env
-// still wins. `$1` is the env file path; it is removed before exec, and only
-// the path is ever in argv (BLA-3978).
-const CALLER_ENV_EXEC_SCRIPT = '. "$1" && { rm -f "$1" || true; } && shift && exec "$@"';
+// profile, then execs the target. `$1` is the env file path; it is removed
+// before exec, and only the path is in argv (BLA-3978). Profiles can mark names
+// readonly; the fresh shell inherits only their exported values, not that
+// attribute. If `/bin/sh` itself refuses a caller name (bash owns readonly UID,
+// EUID, PPID, BASHOPTS, SHELLOPTS and BASH_VERSINFO even as `sh --posix`), the
+// trial in a subshell fails and the env is applied without shell assignment by
+// a perl or python3 execve helper, so every name `exec env K=v` used to accept
+// still reaches the child. Only when the shell refuses a name and neither
+// helper exists does it fail, loudly, with exit 126.
+const CALLER_ENV_EXEC_SCRIPT = [
+  '. "$1" || exit 125',
+  '{ rm -f "$1" || true; }',
+  "shift",
+  'if ( __paperclip_env_apply ) >/dev/null 2>&1; then __paperclip_env_apply || exit 125; __paperclip_env_unset; exec "$@"; fi',
+  "__paperclip_env_export",
+  `if command -v perl >/dev/null 2>&1; then exec perl -e ${shellQuote(CALLER_ENV_PERL_EXEC)} $__paperclip_env_names "$@"; fi`,
+  `if command -v python3 >/dev/null 2>&1; then exec python3 -I -c ${shellQuote(CALLER_ENV_PYTHON_EXEC)} $__paperclip_env_names "$@"; fi`,
+  'echo "paperclip-env: /bin/sh refuses a caller env name and neither perl nor python3 is available" >&2',
+  "exit 126",
+].join("\n");
 
 // Modal's `sandbox.exec` takes an argv array and bypasses the shell entirely,
 // so adapter probes that rely on PATH mutations from /etc/profile or ~/.bashrc
