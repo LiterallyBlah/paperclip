@@ -19,7 +19,7 @@ import { actorBinding } from "./tool-access/actor.js";
 import { toApplication } from "./tool-access/applications/projection.js";
 import { groupedActions } from "./tool-access/catalog/action-summary.js";
 import { createConnectionSetupPolicy, assertSupportedConnection } from "./tool-access/connections/setup-policy.js";
-import { createOrganizationGrantStore } from "./tool-access/connections/organization-grant.js";
+import { createOrganizationGrantCredentialSync, createOrganizationGrantStore } from "./tool-access/connections/organization-grant.js";
 import { createPersonalConnectionIdentity } from "./tool-access/connections/personal-identity.js";
 import { createOAuthStateStore } from "./tool-access/oauth/state.js";
 import { createOAuthCatalogCompletion } from "./tool-access/oauth/catalog-completion.js";
@@ -740,6 +740,7 @@ export function toolAccessService(
   const { resolveInstalledConnectionsForAgent, listConnectionInstalls } = connectionInstalls;
   const audit = createToolAccessAudit(db);
   const ensureDefaultOrganizationGrant = createOrganizationGrantStore(db);
+  const syncDefaultOrganizationGrantCredentials = createOrganizationGrantCredentialSync(db);
   const { mintConnectionTokenForAgent, loadBrokerRunContext } = createConnectionTokenBroker(db, { now, secrets, policySvc, audit, getConnectionRow, ensureDefaultOrganizationGrant });
   const profileService = createToolProfileService(db, now);
   const profileDetails = profileService.getProfile;
@@ -4607,16 +4608,22 @@ export function toolAccessService(
         })
         .where(eq(toolConnections.id, connectionId))
         .returning();
-      const [row] = existing.transport === "chat_sdk"
-        ? await db.transaction(async tx => {
-            await notifyChatEndpointWork(tx, existing.id);
-            const rows = await write(tx as unknown as Db);
-            // Credential resolution must never observe the binding rebuild's
-            // delete/insert gap after a configuration wake.
-            await syncCredentialBindings(rows[0]!, [], tx);
-            return rows;
-          })
-        : await write(db);
+      const credentialRefsChanged =
+        input.credentialRefs !== undefined ||
+        input.credentialSecretRefs !== undefined ||
+        (input.credentialPolicy !== undefined &&
+          input.credentialPolicy !== existing.credentialPolicy);
+      const [row] = await db.transaction(async tx => {
+        if (existing.transport === "chat_sdk") await notifyChatEndpointWork(tx, existing.id);
+        const rows = await write(tx as unknown as Db);
+        // Credential resolution must never observe the binding rebuild's
+        // delete/insert gap after a configuration wake.
+        if (existing.transport === "chat_sdk") await syncCredentialBindings(rows[0]!, [], tx);
+        // Invocation reads the default organization grant, not the connection
+        // row, so an edited shared credential must reach the grant atomically.
+        if (credentialRefsChanged) await syncDefaultOrganizationGrantCredentials(rows[0]!, tx);
+        return rows;
+      });
       if (existing.transport !== "chat_sdk") await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
       emitConnectionUpdated(row, existing, "api");

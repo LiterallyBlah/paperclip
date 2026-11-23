@@ -34,6 +34,27 @@ export function connectionGrantCredentialRef(
   );
 }
 
+/**
+ * Pair each header credential a connection declares with the selected grant's
+ * secret ref. Tool invocation and health/catalog checks both use this, so a
+ * grant that cannot supply a declared header fails both paths the same way
+ * instead of the invocation silently going out without that header.
+ */
+export function connectionHeaderCredentialPlan<Ref extends { name: string; placement: string }>(
+  connection: { credentialRefs?: readonly Ref[] | null },
+  grant: Pick<typeof connectionGrants.$inferSelect, "credentialSecretRefs">,
+): { resolved: Array<{ ref: Ref; grantRef: ToolCredentialSecretRef }>; missing: Ref[] } {
+  const resolved: Array<{ ref: Ref; grantRef: ToolCredentialSecretRef }> = [];
+  const missing: Ref[] = [];
+  for (const ref of connection.credentialRefs ?? []) {
+    if (ref.placement !== "header") continue;
+    const grantRef = connectionGrantCredentialRef(grant, ref);
+    if (grantRef) resolved.push({ ref, grantRef });
+    else missing.push(ref);
+  }
+  return { resolved, missing };
+}
+
 /** Create/replace invocation credentials in the selected identity's vault. */
 export async function writeConnectionCredential(
   db: CredentialDb,

@@ -2868,6 +2868,93 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(stillBlocked!.status).toBe("disabled");
   });
 
+  it("fails the shared header-bearer health check when the organization grant lacks the header ref, and PATCH re-syncs the grant", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const secret = await secretService(db).create(company.id, {
+      name: `Shared health token ${randomUUID()}`,
+      key: `shared_health_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: "shared-health-test-token",
+    });
+    const authorizations: Array<string | null> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      authorizations.push(new Headers(init?.headers).get("authorization"));
+      return mcpSseResponse(catalogResponse([
+        { name: "kv_get", description: "Read a value.", annotations: { readOnlyHint: true } },
+      ]));
+    });
+    // API-created with header refs only, so the default organization grant
+    // (which invocation uses) carries no matching credential ref.
+    const connection = await service.createConnection(company.id, {
+      name: "Shared bearer fixture",
+      transport: "mcp_remote",
+      config: { url: "http://127.0.0.1:8848/mcp" },
+      enabled: true,
+      status: "active",
+      credentialRefs: [{
+        name: "authorization", secretId: secret.id, version: "latest",
+        placement: "header", key: "Authorization", prefix: "Bearer ",
+      }],
+    });
+
+    await expect(service.checkHealth(connection.id)).rejects.toMatchObject({
+      status: 422,
+      details: { code: "mcp_remote_missing_secret" },
+    });
+    // The probe must not succeed through a credential invocation cannot use.
+    expect(authorizations).toEqual([]);
+    const [unhealthy] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+    expect(unhealthy?.healthStatus).toBe("missing_secret");
+
+    // Editing the connection's credential refs repairs the execution grant.
+    await service.updateConnection(connection.id, {
+      credentialSecretRefs: [{
+        secretId: secret.id, versionSelector: "latest",
+        configPath: "credentials.authorization", required: true, label: "Bearer token",
+      }],
+    });
+    const [grant] = await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, connection.id),
+      eq(connectionGrants.kind, "organization"),
+      eq(connectionGrants.isDefault, true),
+    ));
+    expect(grant?.status).toBe("active");
+    expect(grant?.credentialSecretRefs).toEqual([
+      expect.objectContaining({ secretId: secret.id, configPath: "credentials.authorization" }),
+    ]);
+    const health = await service.checkHealth(connection.id);
+    expect(health.connection.healthStatus).toBe("ok");
+    expect(authorizations.length).toBeGreaterThan(0);
+    expect(new Set(authorizations)).toEqual(new Set(["Bearer shared-health-test-token"]));
+  });
+
+  it("does not reactivate a revoked organization grant when a connection is edited", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const secret = await secretService(db).create(company.id, {
+      name: `Revoked grant token ${randomUUID()}`,
+      key: `revoked_grant_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: "revoked-grant-test-token",
+    });
+    const connection = await service.createConnection(company.id, {
+      name: "Revoked grant fixture",
+      transport: "mcp_remote",
+      config: { url: "http://127.0.0.1:8848/mcp" },
+    });
+    await db.update(connectionGrants).set({ status: "revoked", revokedAt: new Date() })
+      .where(eq(connectionGrants.connectionId, connection.id));
+    await service.updateConnection(connection.id, {
+      credentialSecretRefs: [{ secretId: secret.id, versionSelector: "latest", configPath: "credentials.authorization" }],
+    });
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection.id));
+    expect(grant?.status).toBe("revoked");
+    expect(grant?.credentialSecretRefs).toEqual([
+      expect.objectContaining({ secretId: secret.id, configPath: "credentials.authorization" }),
+    ]);
+  });
+
   it("sends the MCP Streamable HTTP Accept header and decodes an SSE catalog response", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
