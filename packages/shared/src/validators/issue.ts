@@ -636,6 +636,9 @@ export const resolveIssueRecoveryActionSchema = z
       // A retained-source repair records evidence without changing task state.
       // The route verifies the exact server-owned source and unchanged status.
       if (value.executionReconciliation?.workspaceRepairEvidence) return;
+      // A stopped pending stage that its own automatic no-replay settlement
+      // blocked keeps `blocked`; the route proves that projection (BLA-4186).
+      if (value.executionReconciliation && value.sourceIssueStatus === "blocked") return;
       if (
         value.sourceIssueStatus !== "todo" &&
         value.sourceIssueStatus !== "done" &&
