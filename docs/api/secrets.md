@@ -88,6 +88,8 @@ POST /api/agents/me/secret-proposals
 }
 ```
 
+The create body is strict. `kind: "secret"` accepts only `name`, `key`, `description`, `value` and `justification`; `kind: "binding"` accepts only `secretId`, `sourceConfigPath`, `secretProposalId`, `targetAgentId`, `configPath` and `justification`. An unknown field, or a missing or non-string required field (including `justification`), returns `422` with only the field paths and issue codes; no submitted value is echoed.
+
 `sourceConfigPath` must resolve from the proposing agent's own binding. An
 unknown path or another agent's path returns `404`. A binding request must
 provide exactly one of `sourceConfigPath`, `secretId`, or `secretProposalId`.

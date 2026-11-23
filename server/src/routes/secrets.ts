@@ -3,6 +3,7 @@ import { companySecretBindings, heartbeatRuns, type Db } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
 import {
   agentRotateBoundSecretSchema,
+  createAgentSecretProposalSchema,
   createSecretProviderConfigSchema,
   isUuidLike,
   createSecretSchema,
@@ -198,7 +199,20 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
 
   router.post("/agents/me/secret-proposals", async (req, res) => {
     const context = await proposalAgentContext(req);
-    const body = req.body ?? {};
+    const rawKind = (req.body as { kind?: unknown } | undefined)?.kind;
+    if (rawKind !== "secret" && rawKind !== "binding") throw unprocessable("kind must be secret or binding");
+    const parsed = createAgentSecretProposalSchema.safeParse(req.body);
+    if (!parsed.success) {
+      // Never echo the Zod issues: their messages can quote the input or an
+      // unknown key. Report only schema-defined field paths and issue codes.
+      throw unprocessable("Secret proposal body has unknown fields or missing or invalid required fields", {
+        issues: parsed.error.issues.map((issue) => ({
+          code: issue.code,
+          path: issue.path.map(String),
+        })),
+      });
+    }
+    const body = parsed.data;
     const proposal = body.kind === "secret"
       ? await proposals.createSecret({
           companyId: context.companyId,
@@ -211,13 +225,11 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
           value: body.value,
           justification: body.justification,
         })
-      : body.kind === "binding"
-        ? await proposals.createBinding({ companyId: context.companyId, heartbeatRunId: context.heartbeatRunId }, {
-            secretId: body.secretId, sourceConfigPath: body.sourceConfigPath,
-            secretProposalId: body.secretProposalId, targetAgentId: body.targetAgentId,
-            configPath: body.configPath, justification: body.justification, bindingTargetPolicy: "self_and_reports",
-          })
-        : (() => { throw unprocessable("kind must be secret or binding"); })();
+      : await proposals.createBinding({ companyId: context.companyId, heartbeatRunId: context.heartbeatRunId }, {
+          secretId: body.secretId, sourceConfigPath: body.sourceConfigPath,
+          secretProposalId: body.secretProposalId, targetAgentId: body.targetAgentId,
+          configPath: body.configPath, justification: body.justification, bindingTargetPolicy: "self_and_reports",
+        });
     res.status(201).json(agentProposalView(await proposals.view(proposal)));
   });
 

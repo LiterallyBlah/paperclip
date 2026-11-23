@@ -131,6 +131,39 @@ export const agentRotateBoundSecretSchema = z.object({
 
 export type AgentRotateBoundSecret = z.infer<typeof agentRotateBoundSecretSchema>;
 
+// Body of POST /api/agents/me/secret-proposals. Strict so an unknown field
+// (which could carry a value) is rejected instead of silently dropped. Only
+// shapes and types are checked here; the proposals service keeps the semantic
+// checks (name format, blank justification, size limits, reference count) and
+// their existing messages.
+const optionalProposalString = z.string().nullable().optional();
+
+export const agentSecretValueProposalSchema = z.object({
+  kind: z.literal("secret"),
+  name: z.string(),
+  key: optionalProposalString,
+  description: optionalProposalString,
+  value: z.string(),
+  justification: z.string(),
+}).strict();
+
+export const agentSecretBindingProposalSchema = z.object({
+  kind: z.literal("binding"),
+  secretId: optionalProposalString,
+  sourceConfigPath: optionalProposalString,
+  secretProposalId: optionalProposalString,
+  targetAgentId: optionalProposalString,
+  configPath: z.string(),
+  justification: z.string(),
+}).strict();
+
+export const createAgentSecretProposalSchema = z.discriminatedUnion("kind", [
+  agentSecretValueProposalSchema,
+  agentSecretBindingProposalSchema,
+]);
+
+export type CreateAgentSecretProposal = z.infer<typeof createAgentSecretProposalSchema>;
+
 export const updateSecretSchema = z.object({
   name: z.string().min(1).optional(),
   key: secretKeySchema.optional(),
