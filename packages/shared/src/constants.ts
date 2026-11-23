@@ -1022,6 +1022,11 @@ export const PERMISSION_KEYS = [
   "tasks:assign_scope",
   "tasks:manage_active_checkouts",
   "joins:approve",
+  // Fork feature: lets one agent rotate the value of exactly one secret record
+  // it is already bound to. The grant scope must name that `secretId` and
+  // `bindingId`; see `decideBoundSecretRotation` in the server authorization
+  // service.
+  "secrets:rotate_bound",
 ] as const;
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
 
