@@ -13,6 +13,7 @@ import { PLUGIN_WORKER_UNAVAILABLE_CODE } from "./plugin-worker-unavailable-erro
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "./environment-provider-unavailable-error.js";
 import { REPOSITORY_CATALOG_UNAVAILABLE_CODE } from "./repository-catalog-unavailable-error.js";
 import { RUNNER_REVISION_MISMATCH_CODE } from "./runner-revision-mismatch.js";
+import { isPreAdmissionLostRunVerified } from "./pre-admission-lost-run.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
@@ -156,7 +157,9 @@ export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run
   return await hasUnrestoredRemoteWorkspace(db, run) ||
     (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
       && !(await isPreDispatchExecutionWaitVerified(db, run))
-      && !(await isEffectFreeGatewayTransientFailure(db, run)));
+      && !(await isEffectFreeGatewayTransientFailure(db, run))
+      // An exact retained `required` admission proves the adapter was never entered.
+      && !(await isPreAdmissionLostRunVerified(db, run)));
 }
 
 /** Persist the failed legacy run, owned lock release and operator decision together. */
