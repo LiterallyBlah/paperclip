@@ -19,6 +19,7 @@
  */
 
 import { Exec } from "@kubernetes/client-node";
+import { buildCallerEnvStdinHeader, CALLER_ENV_STDIN_READER, CALLER_ENV_VAR_EXEC } from "./caller-env.js";
 import { PassThrough } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 import type { KubeConfig } from "@kubernetes/client-node";
@@ -34,24 +35,30 @@ export function shQuote(segment: string): string {
   return `'${segment.replace(/'/g, "'\\''")}'`;
 }
 
-// Wrap a command so the given env vars are exported before it runs. The Kubernetes
-// exec API has no env field, so the only way to give an exec'd process additional
-// env is to run it under a shell that exports the vars and then `exec`s the real
-// command. PATH is deliberately skipped (the caller's PATH is the orchestrator's,
-// not the sandbox image's, and overriding it would break command resolution), and
-// only valid shell identifiers are exported. Returns the original command unchanged
-// when there is nothing to apply.
+// Wrap a command so the given env vars reach it. The Kubernetes exec API has no
+// env field and no file API, so the command must run under a shell that applies
+// the env. Caller env carries the agent's PAPERCLIP_API_KEY, and the exec argv is
+// both the in-pod process argv and part of the apiserver request URL, so values
+// never go there (BLA-4139). As PR #57 does for SSH remote agents, the values
+// travel as a header at the front of the exec stdin stream (`stdinPrefix`); the
+// argv carries only a fixed reader, a fresh `/bin/sh` that sources no profile,
+// and the target command. Callers send `stdinPrefix + callerStdin` as stdin.
+// PATH is deliberately skipped (the caller's PATH is the orchestrator's, not the
+// sandbox image's, and overriding it would break command resolution), and only
+// valid shell identifiers with string values are applied. Returns the original
+// command and no prefix when there is nothing to apply.
 export function wrapCommandWithEnv(
   command: string[],
   env: Record<string, string> | undefined | null,
-): string[] {
+): { command: string[]; stdinPrefix: string | null } {
   const entries = Object.entries(env && typeof env === "object" ? env : {}).filter(
-    ([key, value]) =>
-      typeof value === "string" && key !== "PATH" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key),
+    (entry): entry is [string, string] =>
+      typeof entry[1] === "string" && entry[0] !== "PATH" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(entry[0]),
   );
-  if (entries.length === 0) return command;
-  const exports = entries.map(([k, v]) => `export ${k}=${shQuote(v)};`).join(" ");
-  return ["/bin/sh", "-c", `${exports} exec ${command.map(shQuote).join(" ")}`];
+  const stdinPrefix = buildCallerEnvStdinHeader(entries);
+  if (stdinPrefix == null) return { command, stdinPrefix: null };
+  const script = `${CALLER_ENV_STDIN_READER}; export __pc_env && exec /bin/sh -c ${shQuote(CALLER_ENV_VAR_EXEC)} paperclip-env "$@"`;
+  return { command: ["/bin/sh", "-c", script, "paperclip-env", ...command], stdinPrefix };
 }
 
 export async function execInPod(

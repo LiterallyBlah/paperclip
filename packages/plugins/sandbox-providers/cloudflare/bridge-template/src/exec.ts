@@ -1,4 +1,5 @@
 import type { Sandbox as CloudflareSandbox } from "@cloudflare/sandbox";
+import { buildCallerEnvScript, CALLER_ENV_FILE_EXEC } from "./caller-env.js";
 import { shellQuote } from "./helpers.js";
 import { isTimeoutError } from "./sandboxes.js";
 import { cleanupTimedOutExecution, resolveExecutionTarget, type SessionStrategy } from "./sessions.js";
@@ -26,28 +27,37 @@ function randomToken(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-export function buildLoginShellScript(input: {
-  command: string;
-  args: string[];
-  cwd?: string;
-  env?: Record<string, string>;
-  stdinFile?: string | null;
-}): string {
-  const env = input.env ?? {};
-  for (const key of Object.keys(env)) {
+// Validate caller env and render it as the staged env script, or null when
+// there is nothing to send. Caller env carries the agent's PAPERCLIP_API_KEY,
+// so it travels only through the sandbox file API, never the command text or
+// any argv (BLA-4139).
+export function buildBridgeCallerEnvScript(env: Record<string, string> | undefined): string | null {
+  const entries = Object.entries(env ?? {});
+  for (const [key] of entries) {
     if (!isValidShellEnvKey(key)) {
       throw new Error(`Invalid sandbox environment variable key: ${key}`);
     }
   }
+  return buildCallerEnvScript(
+    entries.filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
+}
 
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
+export function buildLoginShellScript(input: {
+  command: string;
+  args: string[];
+  cwd?: string;
+  envFile?: string | null;
+  stdinFile?: string | null;
+}): string {
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
   const stdinRedirect = input.stdinFile ? ` < ${shellQuote(input.stdinFile)}` : "";
   // Source the common login profiles before exec so the command runs with the
   // interactive-shell PATH. The wrapper sources no `nvm.sh`; the sandbox image
-  // supplies node on the PATH.
+  // supplies node on the PATH. Caller env is applied after the profiles, in a
+  // fresh `/bin/sh` that sources none (CALLER_ENV_FILE_EXEC), so it still wins
+  // over anything a profile exports or marks readonly. Only the env file path
+  // is in the command text; the fresh shell removes the file before exec.
   const lines = [
     'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
@@ -57,8 +67,8 @@ export function buildLoginShellScript(input: {
   if (input.cwd) {
     lines.push(`cd ${shellQuote(input.cwd)}`);
   }
-  const execLine = envArgs.length > 0
-    ? `exec env ${envArgs.join(" ")} ${commandParts}${stdinRedirect}`
+  const execLine = input.envFile
+    ? `exec /bin/sh -c ${shellQuote(CALLER_ENV_FILE_EXEC)} paperclip-env ${shellQuote(input.envFile)} ${commandParts}${stdinRedirect}`
     : `exec ${commandParts}${stdinRedirect}`;
   lines.push(execLine);
   return lines.join(" && ");
@@ -93,12 +103,17 @@ export async function executeInSandbox(params: BridgeExecuteParams) {
     ? params.stdin
     : null;
   const stdinFile = stdinPayload ? `/tmp/.paperclip-bridge-stdin-${randomToken()}` : null;
-
-  if (stdinFile && stdinPayload) {
-    await params.sandbox.writeFile(stdinFile, stdinPayload, { encoding: "utf8" });
-  }
+  // Validate and render caller env before anything is staged.
+  const envScript = buildBridgeCallerEnvScript(params.env);
+  const envFile = envScript != null ? `/tmp/.paperclip-bridge-env-${randomToken()}` : null;
 
   try {
+    if (envFile && envScript != null) {
+      await params.sandbox.writeFile(envFile, envScript, { encoding: "utf8" });
+    }
+    if (stdinFile && stdinPayload) {
+      await params.sandbox.writeFile(stdinFile, stdinPayload, { encoding: "utf8" });
+    }
     const target = await resolveExecutionTarget(params.sandbox, {
       sessionStrategy: params.sessionStrategy,
       sessionId: params.sessionId,
@@ -110,7 +125,7 @@ export async function executeInSandbox(params: BridgeExecuteParams) {
       command: params.command,
       args: params.args ?? [],
       cwd: params.cwd,
-      env: params.env,
+      envFile,
       stdinFile,
     });
     const fullCommand = `sh -lc ${shellQuote(script)}`;
@@ -143,6 +158,15 @@ export async function executeInSandbox(params: BridgeExecuteParams) {
   } finally {
     if (stdinFile) {
       await params.sandbox.deleteFile?.(stdinFile).catch(() => undefined);
+    }
+    // The fresh shell removes the env file before exec; this covers a failed
+    // stdin write, a failed exec or a timeout.
+    if (envFile) {
+      try {
+        await params.sandbox.deleteFile?.(envFile);
+      } catch {
+        // Best effort, as for the stdin file.
+      }
     }
   }
 }

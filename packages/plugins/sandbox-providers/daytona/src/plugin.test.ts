@@ -3716,7 +3716,10 @@ describe("Daytona sandbox provider plugin", () => {
     expect(command).toMatch(/"\$HOME\/\.profile"/);
     expect(command).not.toMatch(/nvm\.sh/);
     expect(command).toMatch(/&& cd '\/workspace'/);
-    expect(command).toMatch(/&& env GIT_TERMINAL_PROMPT='0' GCM_INTERACTIVE='Never' GIT_ASKPASS='echo' SSH_ASKPASS='echo' SSH_ASKPASS_REQUIRE='force' FOO='bar' 'printf' 'hello'$/);
+    // Caller env comes from a staged env file, applied in a fresh `/bin/sh`;
+    // only the file path and the fixed git defaults are in the command text.
+    expect(command).toMatch(/&& env GIT_TERMINAL_PROMPT='0' GCM_INTERACTIVE='Never' GIT_ASKPASS='echo' SSH_ASKPASS='echo' SSH_ASKPASS_REQUIRE='force' \/bin\/sh -c '[^']*' paperclip-env '\/tmp\/paperclip-env-[0-9a-f-]+' 'printf' 'hello'$/);
+    expect(command).not.toContain("FOO='bar'");
     expect(command).not.toMatch(/(?:^|&& )exec /);
     // cwd/env are baked into the command itself; we pass undefined to the SDK
     // so its own cwd argument does not run before the caller env is applied.
@@ -4023,7 +4026,8 @@ describe("Daytona sandbox provider plugin", () => {
     expect(command).toMatch(/^if \[ -f \/etc\/profile \]/);
     expect(command).toMatch(/&& cd '\/workspace' && env /);
     expect(command).toMatch(/GIT_TERMINAL_PROMPT='0'/);
-    expect(command).toMatch(/FOO='bar' 'base64' '-d'$/);
+    expect(command).toMatch(/paperclip-env '\/tmp\/paperclip-env-[0-9a-f-]+' 'base64' '-d'$/);
+    expect(command).not.toContain("bar");
     expect(command).toMatch(/\/etc\/profile/);
     expect(command).not.toMatch(/nvm\.sh/);
     // durationMs attribution stays intact.
