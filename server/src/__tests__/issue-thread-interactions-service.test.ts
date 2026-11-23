@@ -2498,9 +2498,12 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         status: "running",
         startedAt: new Date(),
       });
+      // The card itself must allow an agent resolver so the lock test reaches
+      // the review-policy check; unaddressed cards now inherit human_only.
       const created = await interactionsSvc.create({ id: issueId, companyId }, {
         kind: "request_confirmation",
         payload: { version: 1, prompt: "Approve this review?" },
+        resolverPolicy: "anyone",
       }, {
         userId: "local-board",
       });
@@ -2561,10 +2564,14 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         }),
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      expect(verdictSettled).toBe(false);
-      releasePolicyLock();
-      await tightenPolicy;
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        expect(verdictSettled).toBe(false);
+      } finally {
+        // Never leave the row lock held: later tests would block on it.
+        releasePolicyLock();
+        await tightenPolicy;
+      }
       await denied;
 
       const persisted = await db.select({ status: issueThreadInteractions.status })

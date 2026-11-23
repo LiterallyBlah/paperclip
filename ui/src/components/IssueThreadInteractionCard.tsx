@@ -4105,9 +4105,22 @@ export function IssueThreadInteractionCard({
                 reader is the person who may consent. Rendering the summary here
                 as well would be the second body PAP-17859 removed. */}
             {interaction.summary && !connectionAuthorization && interaction.kind !== "connection_intent" ? (
-              <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-                {interaction.summary}
-              </p>
+              // Agents often write the summary in Markdown. It goes through the
+              // shared renderer (raw HTML ignored, unsafe URLs neutralised),
+              // with images shown as text references so a summary cannot load
+              // remote content into the card.
+              <div
+                className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground"
+                data-testid="interaction-summary"
+              >
+                <MarkdownBody
+                  className="text-sm leading-6 text-muted-foreground [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
+                  mediaMode="reference"
+                  externalReferences={externalReferences}
+                >
+                  {interaction.summary}
+                </MarkdownBody>
+              </div>
             ) : null}
             {interaction.status === "pending" ? (
               <InteractionAudienceLine audience={audience} className="mt-3" />

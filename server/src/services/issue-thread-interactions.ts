@@ -419,6 +419,14 @@ export const DEFAULT_RESOLVER_POLICY_BY_KIND: Record<
   connection_intent: "human_only",
 };
 
+/**
+ * Inherited policy for a card with no agent addressee (addressed to a user or
+ * to nobody). It is the most restrictive policy, so it can only narrow what
+ * the kind or company default would have given.
+ */
+export const HUMAN_FACING_INHERITED_RESOLVER_POLICY: IssueThreadInteractionCanonicalResolverPolicy =
+  "human_only";
+
 const RESOLVER_POLICY_RESTRICTION_RANK: Record<
   IssueThreadInteractionCanonicalResolverPolicy,
   number
@@ -434,12 +442,22 @@ export function resolveInteractionPolicy(args: {
   governance: InteractionResolverGovernance;
   hasToolAction: boolean;
   hasSecretProposal?: boolean;
+  /**
+   * True when the card names an agent addressee. A card with no agent
+   * addressee is addressed to a user or to nobody (the board), so it is a
+   * human decision: an omitted policy inherits `human_only` instead of the
+   * kind or company default. Explicit policies are unaffected.
+   */
+  addressedToAgent?: boolean;
 }) {
   const kindGovernance = args.governance[args.kind];
+  const humanFacing = args.addressedToAgent !== true;
   const requestedPolicyInput =
     args.requested ??
-    kindGovernance?.defaultPolicy ??
-    DEFAULT_RESOLVER_POLICY_BY_KIND[args.kind];
+    (humanFacing
+      ? HUMAN_FACING_INHERITED_RESOLVER_POLICY
+      : kindGovernance?.defaultPolicy ??
+        DEFAULT_RESOLVER_POLICY_BY_KIND[args.kind]);
   const requestedResolverPolicy =
     normalizeIssueThreadInteractionResolverPolicy(requestedPolicyInput);
   const resolverPolicyProvenance: IssueThreadInteractionResolverPolicyProvenance =
@@ -621,10 +639,18 @@ function isEquivalentCreateRequest(
   input: CreateIssueThreadInteraction,
   actor: InteractionActor,
   defaultAddresseeUserId: string | null = null,
+  resolverPolicyInherited = false,
 ) {
+  // A replay that omits resolverPolicy matches a card that also inherited its
+  // policy, even when the inherited default has since changed (for example a
+  // pre-existing unaddressed card stored as `anyone`). The replay returns the
+  // stored card unchanged; it never rewrites that card's policy.
+  const sameResolverPolicy =
+    row.requestedResolverPolicy === input.resolverPolicy ||
+    (resolverPolicyInherited && row.resolverPolicyProvenance !== "explicit");
   return (
     row.kind === input.kind &&
-    row.requestedResolverPolicy === input.resolverPolicy &&
+    sameResolverPolicy &&
     (row.addresseeAgentId ?? null) === (input.addresseeAgentId ?? null) &&
     (row.addresseeUserId ?? defaultAddresseeUserId) === (input.addresseeUserId ?? defaultAddresseeUserId) &&
     row.continuationPolicy === input.continuationPolicy &&
@@ -3818,6 +3844,7 @@ export function issueThreadInteractionService(
         hasSecretProposal:
           data.kind === "request_confirmation" &&
           data.payload.secretProposal !== undefined,
+        addressedToAgent: Boolean(data.addresseeAgentId),
       });
       const normalizedData = {
         ...data,
@@ -3890,7 +3917,7 @@ export function issueThreadInteractionService(
           idempotencyKey: normalizedData.idempotencyKey,
         });
         if (existing) {
-          if (!isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId)) {
+          if (!isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId, policy.resolverPolicyProvenance === "inherited")) {
             if (!options.replayAcceptedInteractionIds?.includes(existing.id)) {
               throw conflict(
                 "Interaction idempotency key already exists for a different request",
@@ -4007,7 +4034,7 @@ export function issueThreadInteractionService(
             if (existing) {
               const acceptedReplay = await isEquivalentAcceptedReplay(tx as unknown as Db, existing, normalizedData, actor,
                 options.replayAcceptedInteractionIds, defaultAddresseeUserId);
-              if ((options.requireAcceptedReplay || !isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId)) && !acceptedReplay) {
+              if ((options.requireAcceptedReplay || !isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId, policy.resolverPolicyProvenance === "inherited")) && !acceptedReplay) {
                 throw conflict("Interaction idempotency key already exists for a different request", { idempotencyKey: normalizedData.idempotencyKey });
               }
               if (acceptedReplay) return { row: existing, supersededRows: [], reused: true };
@@ -4308,7 +4335,7 @@ export function issueThreadInteractionService(
           idempotencyKey: normalizedData.idempotencyKey,
         });
         if (!existing) throw error;
-        if (!isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId)) {
+        if (!isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId, policy.resolverPolicyProvenance === "inherited")) {
           throw conflict(
             "Interaction idempotency key already exists for a different request",
             {

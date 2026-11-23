@@ -824,8 +824,12 @@
           "type": "string"
         },
         "resolverPolicy": {
-          "const": "human_only",
-          "description": "Optionally require an authenticated human response."
+          "description": "Who may resolve the card. Omitted means human_only. Send anyone on an ordinary confirmation or checkbox card whose chat answer you will record.",
+          "enum": [
+            "anyone",
+            "not_creator",
+            "human_only"
+          ]
         },
         "targetRevisionId": {
           "description": "Optional bound document revision.",

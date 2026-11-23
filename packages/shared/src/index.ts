@@ -2911,3 +2911,4 @@ export {
   TASK_IDENTITY_CHANGED_FIELD,
   issueActivityChangesTaskIdentity,
 } from "./issue-activity-identity.js";
+export { markdownToPlainPreview } from "./markdown-plain-text.js";
