@@ -220,20 +220,32 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(resolveConfirmationFromComment(db, f.args)).rejects.toThrow();
     expect((await readCard(f.card.id)).status).toBe("pending");
   });
-  it.each([false, true])("refuses to record a reply on an ordinary task card that omitted resolverPolicy (checkbox: %s)", async (checkbox) => {
-    const f = await seed(checkbox, false, null);
-    expect(f.card.requestedResolverPolicy).toBe("human_only");
-    expect(f.card.effectiveResolverPolicy).toBe("human_only");
+  it.each([[false, false], [false, true], [true, false], [true, true]])("refuses to record a reply on a card that omitted resolverPolicy (chat: %s, checkbox: %s)", async (conversation, checkbox) => {
+    const f = await seed(checkbox, conversation, null);
+    expect(f.card).toMatchObject({ requestedResolverPolicy: "human_only", effectiveResolverPolicy: "human_only", resolverPolicyProvenance: "inherited" });
     await expect(resolveConfirmationFromComment(db, f.args)).rejects.toThrow();
     expect((await readCard(f.card.id)).status).toBe("pending");
+    expect(await audit(f.issueId)).toHaveLength(0);
   });
 
-  it("keeps recording replies on an Agent Chat card that omitted resolverPolicy", async () => {
-    const f = await seed(false, true, null);
-    expect(f.card.requestedResolverPolicy).toBe("anyone");
-    expect(f.card.resolverPolicyProvenance).toBe("inherited");
+  it.each(["request_confirmation", "ask_user_questions"] as const)("inherits human_only for a user-addressed Agent Chat %s that omitted resolverPolicy", async kind => {
+    const f = await seed(false, true);
+    const card = await f.svc.create(f.issue, kind === "ask_user_questions"
+      ? { kind, payload: { version: 1, questions: [{ id: "q", prompt: "Which note?", selectionMode: "single", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] }] } }
+      : { kind, addresseeUserId: "operator", payload: { version: 1, prompt: "Approve the poster?" } }, { agentId: f.agentId });
+    expect(card).toMatchObject({ addresseeUserId: "operator", requestedResolverPolicy: "human_only", effectiveResolverPolicy: "human_only", resolverPolicyProvenance: "inherited" });
+    if (kind === "request_confirmation") {
+      await expect(resolveConfirmationFromComment(db, { ...f.args, interactionId: card.id })).rejects.toThrow();
+      expect((await readCard(card.id)).status).toBe("pending");
+    }
+  });
+
+  it.each([false, true])("records a chat reply on an Agent Chat card that requested anyone explicitly (checkbox: %s)", async checkbox => {
+    const f = await seed(checkbox, true);
+    expect(f.card).toMatchObject({ requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "explicit" });
     const result = await resolveConfirmationFromComment(db, f.args);
     expect(result.interaction.status).toBe("accepted");
+    expect(await audit(f.issueId)).toHaveLength(1);
   });
 
   it.each(["human_only", "not_creator", "addressee", "toolAction", "secretProposal", "connectionAuthorization", "questions", "closed"])("preserves %s restrictions", async kind => {

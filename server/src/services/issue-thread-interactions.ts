@@ -426,16 +426,9 @@ export function resolveInteractionPolicy(args: {
    * kind or company default. Explicit policies are unaffected.
    */
   addressedToAgent?: boolean;
-  /**
-   * True on an Agent Chat conversation issue. There the agent records the
-   * owner's typed replies and earlier-turn `anyone` cards stop gating the next
-   * turn, so an omitted policy keeps the kind or company default.
-   */
-  agentChatConversation?: boolean;
 }) {
   const kindGovernance = args.governance[args.kind];
-  const humanFacing =
-    args.addressedToAgent !== true && args.agentChatConversation !== true;
+  const humanFacing = args.addressedToAgent !== true;
   const requestedPolicyInput =
     args.requested ??
     (humanFacing
@@ -3471,14 +3464,12 @@ export function issueThreadInteractionService(
       // Chat ownership is server-owned and immutable. Ordinary human questions
       // must not depend on a model copying an opaque user identity correctly.
       let defaultAddresseeUserId: string | null = null;
-      let agentChatConversation = false;
-      if (!data.addresseeAgentId) {
+      if (data.kind === "ask_user_questions" && !data.addresseeAgentId) {
         const [conversation] = await db
           .select({ agentId: issues.conversationAgentId, userId: issues.conversationUserId })
           .from(issues)
           .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)));
-        agentChatConversation = Boolean(conversation?.agentId && conversation.userId);
-        if (data.kind === "ask_user_questions" && conversation?.agentId && conversation.userId) {
+        if (conversation?.agentId && conversation.userId) {
           defaultAddresseeUserId = conversation.userId;
           if (data.addresseeUserId && data.addresseeUserId !== defaultAddresseeUserId) {
             throw unprocessable("Chat questions must address the conversation owner; omit addresseeUserId", {
@@ -3510,7 +3501,6 @@ export function issueThreadInteractionService(
           data.kind === "request_confirmation" &&
           data.payload.secretProposal !== undefined,
         addressedToAgent: Boolean(data.addresseeAgentId),
-        agentChatConversation,
       });
       const normalizedData = {
         ...data,

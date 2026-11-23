@@ -218,25 +218,6 @@ describe("issueThreadInteractionService", () => {
     },
   );
 
-  it.each(ALL_INTERACTION_KINDS.filter((kind) => kind !== "connection_intent"))(
-    "keeps the kind default for an unaddressed %s card on an Agent Chat conversation",
-    async (kind) => {
-      const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
-      expect(resolveInteractionPolicy({
-        kind,
-        governance: { [kind]: { cap: "not_creator" } },
-        hasToolAction: false,
-        addressedToAgent: false,
-        agentChatConversation: true,
-      })).toEqual({
-        requestedResolverPolicy: "anyone",
-        effectiveResolverPolicy: "not_creator",
-        resolverPolicyProvenance: "inherited",
-        effectiveResolverPolicySource: "company_cap",
-      });
-    },
-  );
-
   it("keeps a company default for an agent-addressed card and lets a cap narrow it", async () => {
     const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
     expect(resolveInteractionPolicy({
@@ -304,7 +285,7 @@ describe("issueThreadInteractionService", () => {
     const db: any = {
       select: vi.fn(() => {
         selectCallCount += 1;
-        return createSelectChain(selectCallCount <= 3 ? [existingRow] : []);
+        return createSelectChain(selectCallCount <= 2 ? [existingRow] : []);
       }),
       insert: vi.fn(),
       update: vi.fn(),
@@ -373,7 +354,7 @@ describe("issueThreadInteractionService", () => {
       const db: any = {
         select: vi.fn(() => {
           selectCallCount += 1;
-          return createSelectChain(selectCallCount <= 3 ? [existingRow] : []);
+          return createSelectChain(selectCallCount <= 2 ? [existingRow] : []);
         }),
         insert: vi.fn(),
         update: vi.fn(),
