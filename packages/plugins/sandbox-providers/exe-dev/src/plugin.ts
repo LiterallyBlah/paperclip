@@ -4,6 +4,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { definePlugin } from "@paperclipai/plugin-sdk";
+import { buildCallerEnvScript, CALLER_ENV_VAR_EXEC } from "./caller-env.js";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -535,28 +536,62 @@ async function prepareSshIdentity(config: ExeDevDriverConfig): Promise<{
   };
 }
 
-function buildLoginShellScript(input: {
-  command: string;
-  args: string[];
-  cwd?: string;
-  env?: Record<string, string>;
-}): string {
-  const env = input.env ?? {};
-  for (const key of Object.keys(env)) {
+// Caller env (which carries the agent's PAPERCLIP_API_KEY) never rides a
+// process argument (BLA-3999). exe.dev has no file API, so, as PR #57 does for
+// SSH remote agents, the values travel as a header at the front of the ssh
+// stdin stream. The local ssh argv and the remote command text carry only a
+// fixed reader and the target command.
+//
+// Header format: one decimal line count N, then N lines of POSIX shell from
+// buildCallerEnvScript. A quoted value can span lines, so multiline values
+// survive. The reader uses only shell builtins, so no `env KEY=value` process
+// exists at either end. A POSIX shell reads a pipe one byte at a time, so the
+// reader stops exactly at the end of the header and the caller's own stdin,
+// and its EOF, reach the target untouched.
+export function buildEnvStdinHeader(env: Record<string, string> | undefined): string | null {
+  const entries = Object.entries(env ?? {});
+  for (const [key] of entries) {
     if (!isValidShellEnvKey(key)) {
       throw new Error(`Invalid exe.dev environment variable key: ${key}`);
     }
   }
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
+  const script = buildCallerEnvScript(
+    entries.filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
+  if (script == null) return null;
+  return `${script.slice(0, -1).split("\n").length}\n${script}`;
+}
+
+// Read the env header from stdin into `__pc_env` before any profile runs, so a
+// profile that reads stdin cannot take it. This is PR #57's reader: single
+// line, `;` separated, so a login shell of any family passes it through
+// intact, with the newline from the `printf` builtin. A short or malformed
+// header exits 125 before any profile or target command runs. Tracing and
+// verbose mode are switched off first so a trace cannot print the header.
+const ENV_HEADER_READER = [
+  "set +xv",
+  "__pc_nl=$(printf '\\n_')",
+  "__pc_nl=${__pc_nl%_}",
+  "__pc_env=",
+  "IFS= read -r __pc_n || exit 125",
+  "case \"$__pc_n\" in ''|*[!0-9]*) exit 125;; esac",
+  "__pc_i=0",
+  "while [ \"$__pc_i\" -lt \"$__pc_n\" ]; do IFS= read -r __pc_l || exit 125; __pc_env=\"$__pc_env$__pc_l$__pc_nl\"; __pc_i=$((__pc_i + 1)); done",
+  "unset __pc_l __pc_i __pc_n __pc_nl",
+].join("; ");
+
+function buildLoginShellScript(input: {
+  command: string;
+  args: string[];
+  cwd?: string;
+  hasEnvHeader: boolean;
+}): string {
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
-  const finalLine = envArgs.length > 0
-    ? `exec env ${envArgs.join(" ")} ${commandParts}`
-    : `exec ${commandParts}`;
   // Source the common login profiles before exec so the command runs with the
   // interactive-shell PATH. The wrapper sources no `nvm.sh`; the sandbox image
-  // supplies node on the PATH.
+  // supplies node on the PATH. Caller env is applied after the profiles, in a
+  // fresh `/bin/sh` that sources none (see CALLER_ENV_VAR_EXEC), so it still
+  // wins over anything the profiles export.
   const lines = [
     'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
@@ -566,8 +601,13 @@ function buildLoginShellScript(input: {
   if (input.cwd) {
     lines.push(`cd ${shellQuote(input.cwd)}`);
   }
-  lines.push(finalLine);
-  return lines.join(" && ");
+  lines.push(
+    input.hasEnvHeader
+      ? `export __pc_env && exec /bin/sh -c ${shellQuote(CALLER_ENV_VAR_EXEC)} paperclip-env ${commandParts}`
+      : `exec ${commandParts}`,
+  );
+  const script = lines.join(" && ");
+  return input.hasEnvHeader ? `${ENV_HEADER_READER}; ${script}` : script;
 }
 
 function formatSshFailure(
@@ -648,6 +688,9 @@ async function runSshCommand(
       });
 
       if (options.stdin != null && child.stdin) {
+        // An early ssh exit (an auth failure, for one) makes the write fail
+        // with EPIPE; the close handler reports the real failure.
+        child.stdin.on("error", () => {});
         child.stdin.write(options.stdin);
         child.stdin.end();
       }
@@ -958,11 +1001,12 @@ const plugin = definePlugin({
       };
     }
 
+    const envHeader = buildEnvStdinHeader(params.env);
     const command = buildLoginShellScript({
       command: params.command,
       args: params.args ?? [],
       cwd: params.cwd ?? parseOptionalString(params.lease.metadata?.remoteCwd) ?? undefined,
-      env: params.env,
+      hasEnvHeader: envHeader !== null,
     });
     // `buildLoginShellScript` already explicitly sources `/etc/profile`,
     // `~/.profile`, `~/.bash_profile`/`~/.bashrc`, and `~/.zprofile`. Wrapping
@@ -974,7 +1018,12 @@ const plugin = definePlugin({
       config,
       vm,
       `sh -c ${shellQuote(command)}`,
-      { stdin: params.stdin, timeoutMs: params.timeoutMs ?? config.timeoutMs },
+      {
+        // The env header goes ahead of the caller's stdin. With a header and no
+        // caller stdin, the target still gets EOF right after the header.
+        stdin: envHeader !== null ? envHeader + (params.stdin ?? "") : params.stdin,
+        timeoutMs: params.timeoutMs ?? config.timeoutMs,
+      },
     );
 
     return {
