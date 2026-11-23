@@ -114,6 +114,29 @@ describe("TaskChatInteractionCard", () => {
     container.remove();
   });
 
+  it("shows a Markdown summary as plain text in the one-line pending request row", () => {
+    flushSync(() => {
+      root.render(
+        <TooltipProvider>
+          <ThemeProvider>
+            <TaskChatInteractionCard
+              item={interactionItem(createRequestConfirmation({
+                summary: "**Decision needed.** See the [brief](/api/attachments/a-1/content)\n- one\n- two",
+              }))}
+              showPendingRequest
+              onReviewRequest={() => undefined}
+            />
+          </ThemeProvider>
+        </TooltipProvider>,
+      );
+    });
+    const row = container.querySelector('[data-testid="task-chat-pending-request"]');
+    expect(row).not.toBeNull();
+    expect(row?.textContent).toContain("Decision needed. See the brief one two");
+    expect(row?.textContent).not.toContain("**");
+    expect(row?.querySelector("a, strong, li")).toBeNull();
+  });
+
   it("does not render a pending confirmation in the timeline", () => {
     flushSync(() => {
       root.render(

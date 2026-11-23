@@ -2844,3 +2844,4 @@ export * from "./prompt-injection-prevention.js";
 
 export * from "./workspace-provider.js";
 export * from "./workflows.js";
+export { markdownToPlainPreview } from "./markdown-plain-text.js";

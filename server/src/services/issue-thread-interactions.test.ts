@@ -107,7 +107,7 @@ describe("issueThreadInteractionService", () => {
     ["request_checkbox_confirmation", undefined, { request_checkbox_confirmation: { defaultPolicy: "not_creator" } }, "not_creator", "not_creator", "inherited", "requested"],
     ["request_item_verdicts", "anyone", { request_item_verdicts: { cap: "not_creator" } }, "anyone", "not_creator", "explicit", "company_cap"],
   ] as const)(
-    "resolves %s requested/default/cap policy snapshots",
+    "resolves %s requested/default/cap policy snapshots for an agent-addressed card",
     async (kind, requested, governance, expectedRequested, expectedEffective, expectedProvenance, expectedSource) => {
       const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
       expect(resolveInteractionPolicy({
@@ -115,6 +115,7 @@ describe("issueThreadInteractionService", () => {
         requested,
         governance,
         hasToolAction: false,
+        addressedToAgent: true,
       })).toEqual({
         requestedResolverPolicy: expectedRequested,
         effectiveResolverPolicy: expectedEffective,
@@ -123,6 +124,114 @@ describe("issueThreadInteractionService", () => {
       });
     },
   );
+
+  const ALL_INTERACTION_KINDS = [
+    "suggest_tasks",
+    "ask_user_questions",
+    "request_confirmation",
+    "request_checkbox_confirmation",
+    "request_item_verdicts",
+    "connection_intent",
+  ] as const;
+
+  describe.each(ALL_INTERACTION_KINDS)("human-facing %s cards", (kind) => {
+    it.each([
+      ["unaddressed", undefined],
+      ["user-addressed", false],
+    ] as const)("inherit human_only when %s and resolverPolicy is omitted", async (_label, addressedToAgent) => {
+      const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
+      expect(resolveInteractionPolicy({
+        kind,
+        governance: {},
+        hasToolAction: false,
+        ...(addressedToAgent === undefined ? {} : { addressedToAgent }),
+      })).toEqual({
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        resolverPolicyProvenance: "inherited",
+        effectiveResolverPolicySource: "requested",
+      });
+    });
+
+    it("ignore a looser company default when inheriting", async () => {
+      const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
+      expect(resolveInteractionPolicy({
+        kind,
+        governance: { [kind]: { defaultPolicy: "anyone" } },
+        hasToolAction: false,
+        addressedToAgent: false,
+      })).toMatchObject({
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        resolverPolicyProvenance: "inherited",
+      });
+    });
+
+    it("still honour an explicit anyone", async () => {
+      const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
+      expect(resolveInteractionPolicy({
+        kind,
+        requested: "anyone",
+        governance: {},
+        hasToolAction: false,
+        addressedToAgent: false,
+      })).toEqual({
+        requestedResolverPolicy: "anyone",
+        effectiveResolverPolicy: "anyone",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
+      });
+    });
+
+    it("still let a company cap narrow an explicit anyone", async () => {
+      const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
+      expect(resolveInteractionPolicy({
+        kind,
+        requested: "anyone",
+        governance: { [kind]: { cap: "not_creator" } },
+        hasToolAction: false,
+        addressedToAgent: false,
+      })).toEqual({
+        requestedResolverPolicy: "anyone",
+        effectiveResolverPolicy: "not_creator",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "company_cap",
+      });
+    });
+  });
+
+  it.each(ALL_INTERACTION_KINDS.filter((kind) => kind !== "connection_intent"))(
+    "keeps the kind default for an agent-addressed %s card",
+    async (kind) => {
+      const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
+      expect(resolveInteractionPolicy({
+        kind,
+        governance: {},
+        hasToolAction: false,
+        addressedToAgent: true,
+      })).toEqual({
+        requestedResolverPolicy: "anyone",
+        effectiveResolverPolicy: "anyone",
+        resolverPolicyProvenance: "inherited",
+        effectiveResolverPolicySource: "requested",
+      });
+    },
+  );
+
+  it("keeps a company default for an agent-addressed card and lets a cap narrow it", async () => {
+    const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
+    expect(resolveInteractionPolicy({
+      kind: "request_confirmation",
+      governance: { request_confirmation: { defaultPolicy: "anyone", cap: "human_only" } },
+      hasToolAction: false,
+      addressedToAgent: true,
+    })).toEqual({
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "inherited",
+      effectiveResolverPolicySource: "company_cap",
+    });
+  });
 
   it("always clamps tool-action confirmations to human-only", async () => {
     const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
@@ -205,6 +314,71 @@ describe("issueThreadInteractionService", () => {
     expect(created.idempotencyKey).toBe("run-1:suggest");
     expect(db.insert).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["inherited", true],
+    ["explicit", false],
+  ] as const)(
+    "create replay without resolverPolicy against a stored %s anyone card reuses it only when inherited",
+    async (storedProvenance, reused) => {
+      const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+      const existingRow = {
+        id: "interaction-1",
+        companyId: "company-1",
+        issueId: "11111111-1111-4111-8111-111111111111",
+        kind: "suggest_tasks",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        requestedResolverPolicy: "anyone",
+        effectiveResolverPolicy: "anyone",
+        resolverPolicyProvenance: storedProvenance,
+        effectiveResolverPolicySource: "requested",
+        addresseeAgentId: null,
+        addresseeUserId: null,
+        idempotencyKey: "run-1:confirm",
+        sourceCommentId: null,
+        sourceRunId: null,
+        title: null,
+        summary: null,
+        createdByAgentId: "agent-1",
+        createdByUserId: null,
+        resolvedByAgentId: null,
+        resolvedByUserId: null,
+        payload: { version: 1, tasks: [{ clientKey: "task-1", title: "One" }] },
+        result: null,
+        resolvedAt: null,
+        createdAt: new Date("2026-04-20T10:00:00.000Z"),
+        updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+      };
+      let selectCallCount = 0;
+      const db: any = {
+        select: vi.fn(() => {
+          selectCallCount += 1;
+          return createSelectChain(selectCallCount <= 2 ? [existingRow] : []);
+        }),
+        insert: vi.fn(),
+        update: vi.fn(),
+      };
+      const svc = issueThreadInteractionService(db as never);
+      const attempt = svc.create({
+        id: "11111111-1111-4111-8111-111111111111",
+        companyId: "company-1",
+      }, {
+        kind: "suggest_tasks",
+        idempotencyKey: "run-1:confirm",
+        continuationPolicy: "wake_assignee",
+        payload: { version: 1, tasks: [{ clientKey: "task-1", title: "One" }] },
+      }, {
+        agentId: "agent-1",
+      });
+      if (reused) {
+        await expect(attempt).resolves.toMatchObject({ id: "interaction-1", effectiveResolverPolicy: "anyone" });
+      } else {
+        await expect(attempt).rejects.toThrow("Interaction idempotency key already exists for a different request");
+      }
+      expect(db.insert).not.toHaveBeenCalled();
+    },
+  );
 
   it("answerQuestions normalizes duplicate option ids and persists answered results", async () => {
     const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
