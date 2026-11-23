@@ -583,7 +583,7 @@ describe("Modal sandbox provider plugin", () => {
     expect(script).not.toContain("bar");
     expect(script).toMatch(/&& cd '\/srv\/work' && exec \/bin\/sh -c '\. "\$1" \|\| exit 125\n[\s\S]*\nexit 126' paperclip-env '\/tmp\/paperclip-env-[^']+' 'printf' 'hello'$/);
     expect(sandbox.openedFiles[0]?.path).toMatch(/^\/tmp\/paperclip-env-/);
-    expect(new TextDecoder().decode(sandbox.openedFiles[0]!.written!)).toBe("__paperclip_env_0='bar'\n__paperclip_env_apply() { export FOO=\"$__paperclip_env_0\"; }\n__paperclip_env_export() { export __paperclip_env_0; }\n__paperclip_env_unset() { unset __paperclip_env_0; }\n__paperclip_env_names='1 FOO'\n");
+    expect(new TextDecoder().decode(sandbox.openedFiles[0]!.written!)).toBe("__paperclip_env_0='bar'\n__paperclip_env_apply() { export FOO=\"$__paperclip_env_0\"; }\n__paperclip_env_export() { export __paperclip_env_0; }\n__paperclip_env_unset() { unset __paperclip_env_0; }\n__paperclip_env_names='1 FOO'\n__paperclip_env_split='-u __paperclip_env_0 -- FOO=${__paperclip_env_0}'\n");
     expect(call.params).toMatchObject({
       timeoutMs: 12_000,
       stdout: "pipe",

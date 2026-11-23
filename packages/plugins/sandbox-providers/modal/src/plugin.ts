@@ -240,11 +240,17 @@ function buildEnvExportScript(env: Record<string, string> | undefined): string |
     `__paperclip_env_export() { export ${aliases.join(" ")}; }`,
     `__paperclip_env_unset() { unset ${aliases.join(" ")}; }`,
     `__paperclip_env_names=${shellQuote(`${kept.length} ${kept.map(([key]) => key).join(" ")}`)}`,
+    // `env -S` arguments: drop the aliases, then set each caller name from its
+    // alias. GNU env expands `${alias}` from its own environment, so values never
+    // enter argv. Contains only names.
+    `__paperclip_env_split=${shellQuote(
+      `${aliases.map((alias) => `-u ${alias}`).join(" ")} -- ${kept.map(([key], index) => `${key}=\${${aliases[index]}}`).join(" ")}`,
+    )}`,
   ];
   return `${lines.join("\n")}\n`;
 }
 
-// execve helpers for a fresh shell that refuses to assign a caller name. Both
+// Interpreter execve helpers, used only when `env -S` is unavailable. Both
 // read each value from its `__paperclip_env_<i>` alias in their own environment,
 // set it under the caller's name, drop the alias, and execvp the target; only
 // the name count and names are in their argv. Neither contains a single quote.
@@ -265,19 +271,23 @@ const CALLER_ENV_PYTHON_EXEC = [
 // readonly; the fresh shell inherits only their exported values, not that
 // attribute. If `/bin/sh` itself refuses a caller name (bash owns readonly UID,
 // EUID, PPID, BASHOPTS, SHELLOPTS and BASH_VERSINFO even as `sh --posix`), the
-// trial in a subshell fails and the env is applied without shell assignment by
-// a perl or python3 execve helper, so every name `exec env K=v` used to accept
-// still reaches the child. Only when the shell refuses a name and neither
-// helper exists does it fail, loudly, with exit 126.
+// trial in a subshell fails and the env is applied without shell assignment,
+// so every name `exec env K=v` used to accept still reaches the child (BLA-4033).
+// GNU coreutils `env -S` does this with no interpreter: it expands each
+// `${__paperclip_env_<i>}` from its own environment, so its kernel argv holds
+// only names. Where `env` lacks `-S` (for example busybox), a perl or python3
+// execve helper does the same. Only when the shell refuses a name and none of
+// these exists does it fail, loudly, with exit 126.
 const CALLER_ENV_EXEC_SCRIPT = [
   '. "$1" || exit 125',
   '{ rm -f "$1" || true; }',
   "shift",
   'if ( __paperclip_env_apply ) >/dev/null 2>&1; then __paperclip_env_apply || exit 125; __paperclip_env_unset; exec "$@"; fi',
   "__paperclip_env_export",
+  'if env -S -i >/dev/null 2>&1; then exec env -S "$__paperclip_env_split" "$@"; fi',
   `if command -v perl >/dev/null 2>&1; then exec perl -e ${shellQuote(CALLER_ENV_PERL_EXEC)} $__paperclip_env_names "$@"; fi`,
   `if command -v python3 >/dev/null 2>&1; then exec python3 -I -c ${shellQuote(CALLER_ENV_PYTHON_EXEC)} $__paperclip_env_names "$@"; fi`,
-  'echo "paperclip-env: /bin/sh refuses a caller env name and neither perl nor python3 is available" >&2',
+  'echo "paperclip-env: /bin/sh refuses a caller env name and no env -S, perl or python3 is available" >&2',
   "exit 126",
 ].join("\n");
 

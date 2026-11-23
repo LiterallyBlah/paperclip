@@ -36,7 +36,7 @@ const PROBE = [
   "const stdin=process.env.PROBE_READ_STDIN?fs.readFileSync(0,'utf8'):null;",
   "const leftovers=fs.readdirSync(dir).filter((n)=>n.startsWith('paperclip-env-'));",
   "process.stdout.write(JSON.stringify({key:process.env.PAPERCLIP_API_KEY??null,other:process.env.OTHER_SECRET??null,",
-  "multi:process.env.MULTI??null,uid:process.env.UID??null,profileOnly:process.env.PROFILE_ONLY??null,",
+  "multi:process.env.MULTI??null,uid:process.env.UID??null,ppid:process.env.PPID??null,euid:process.env.EUID??null,profileOnly:process.env.PROFILE_ONLY??null,",
   "aliases:Object.keys(process.env).filter((k)=>k.startsWith('__paperclip_env')),",
   "argv:process.argv,stdin,leftovers}));",
   "process.exit(Number(process.env.PROBE_EXIT??0));",
@@ -233,6 +233,79 @@ describe("Modal execute keeps env secrets out of exec argv (BLA-3978)", () => {
       fs.appendFileSync(path.join(root, ".profile"), `export PATH='${dir}'\n`);
     }
 
+    // BLA-4033: bash as /bin/sh with no perl or python3. GNU `env -S` applies
+    // the refused names; a recording `env` shim proves its argv holds no value.
+    function envShimOnly() {
+      const dir = path.join(root, "bin-env-shim");
+      fs.mkdirSync(dir);
+      fs.symlinkSync(commandOn("rm"), path.join(dir, "rm"));
+      fs.writeFileSync(
+        path.join(dir, "env"),
+        `#!${commandOn("bash")}\nprintf '%s\\0' "$@" >>"$PROBE_DIR/env-argv.log"\nexec ${commandOn("env")} "$@"\n`,
+        { mode: 0o755 },
+      );
+      fs.appendFileSync(path.join(root, ".profile"), `export PATH='${dir}'\n`);
+    }
+
+    it("keeps bash-refused names (UID, EUID, PPID) without perl or python3, via env -S", async () => {
+      fs.writeFileSync(
+        path.join(root, ".profile"),
+        "export OTHER_SECRET='profile-dummy'\nreadonly OTHER_SECRET\nexport PROFILE_ONLY='from-profile'\n",
+      );
+      envShimOnly();
+      const fake = createRealShellSandbox({ binSh: BASH_AS_SH });
+      mockSandboxesFromId.mockResolvedValue(fake.sandbox);
+
+      const result = await execute({
+        PAPERCLIP_API_KEY: DUMMY_API_KEY,
+        OTHER_SECRET: DUMMY_OTHER,
+        UID: "dummy-uid-bla4033",
+        EUID: "dummy-euid-bla4033",
+        PPID: "dummy-ppid-bla4033",
+        MULTI: multi,
+      });
+
+      expect(result?.exitCode).toBe(0);
+      const out = JSON.parse(result!.stdout);
+      expect(out.key).toBe(DUMMY_API_KEY);
+      expect(out.other).toBe(DUMMY_OTHER);
+      expect(out.uid).toBe("dummy-uid-bla4033");
+      expect(out.euid).toBe("dummy-euid-bla4033");
+      expect(out.ppid).toBe("dummy-ppid-bla4033");
+      expect(out.multi).toBe(multi);
+      expect(out.profileOnly).toBe("from-profile");
+      expect(out.aliases).toEqual([]);
+      expect(out.leftovers).toEqual([]);
+      const envArgv = fs.readFileSync(path.join(root, "env-argv.log"), "utf8");
+      expect(envArgv).toContain("UID=${__paperclip_env_");
+      const values = [DUMMY_API_KEY, DUMMY_OTHER, "dummy-uid-bla4033", "dummy-euid-bla4033", "dummy-ppid-bla4033", "not run"];
+      expectNoSecretIn([envArgv], values);
+      expectNoSecretIn(out.argv, values);
+      expectNoSecretIn(fake.execArgvs, values);
+      expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);
+    });
+
+    it("keeps stdin to EOF and the exit code on the env -S path", async () => {
+      envShimOnly();
+      const fake = createRealShellSandbox({ binSh: BASH_AS_SH });
+      mockSandboxesFromId.mockResolvedValue(fake.sandbox);
+
+      const result = await execute(
+        { PAPERCLIP_API_KEY: DUMMY_API_KEY, UID: "dummy-uid-bla4033", PROBE_READ_STDIN: "1", PROBE_EXIT: "7" },
+        { stdin: "first\nsecond line\n" },
+      );
+
+      expect(result?.exitCode).toBe(7);
+      const out = JSON.parse(result!.stdout);
+      expect(out.key).toBe(DUMMY_API_KEY);
+      expect(out.uid).toBe("dummy-uid-bla4033");
+      expect(out.stdin).toBe("first\nsecond line\n");
+      expect(out.aliases).toEqual([]);
+      expectNoSecretIn([fs.readFileSync(path.join(root, "env-argv.log"), "utf8")], [DUMMY_API_KEY, "dummy-uid-bla4033"]);
+      expectNoSecretIn(fake.execArgvs, [DUMMY_API_KEY]);
+      expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);
+    });
+
     it("keeps UID, readonly-profile names and multiline values (perl helper)", async () => {
       fs.writeFileSync(
         path.join(root, ".profile"),
@@ -283,7 +356,7 @@ describe("Modal execute keeps env secrets out of exec argv (BLA-3978)", () => {
       expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);
     });
 
-    it("fails loudly without leaking values when no helper exists", async () => {
+    it("fails loudly without leaking values when no env -S or interpreter helper exists", async () => {
       onlyHelpers([]);
       const fake = createRealShellSandbox({ binSh: BASH_AS_SH });
       mockSandboxesFromId.mockResolvedValue(fake.sandbox);
@@ -291,7 +364,7 @@ describe("Modal execute keeps env secrets out of exec argv (BLA-3978)", () => {
       const result = await execute({ PAPERCLIP_API_KEY: DUMMY_API_KEY, UID: "dummy-uid-bla3978" });
 
       expect(result?.exitCode).toBe(126);
-      expect(result?.stderr).toContain("neither perl nor python3 is available");
+      expect(result?.stderr).toContain("no env -S, perl or python3 is available");
       expectNoSecretIn([result?.stdout, result?.stderr], [DUMMY_API_KEY, "dummy-uid-bla3978"]);
       expectNoSecretIn(fake.execArgvs, [DUMMY_API_KEY]);
       expect(fs.readdirSync(root).filter((n) => n.startsWith("paperclip-"))).toEqual([]);

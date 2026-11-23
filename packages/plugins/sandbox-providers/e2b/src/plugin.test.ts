@@ -308,7 +308,7 @@ describe("E2B sandbox provider plugin", () => {
     if (!stdinCall) throw new Error("stdinCall not found");
     expect(stdinCall[0]).toMatch(/\.profile/);
     // Env is staged through the files API and sourced; only its path is in the command (BLA-3978).
-    expect(sandbox.files.write).toHaveBeenCalledWith(expect.stringMatching(/^\/tmp\/paperclip-env-/), "__paperclip_env_0='bar'\n__paperclip_env_apply() { export FOO=\"$__paperclip_env_0\"; }\n__paperclip_env_export() { export __paperclip_env_0; }\n__paperclip_env_unset() { unset __paperclip_env_0; }\n__paperclip_env_names='1 FOO'\n");
+    expect(sandbox.files.write).toHaveBeenCalledWith(expect.stringMatching(/^\/tmp\/paperclip-env-/), "__paperclip_env_0='bar'\n__paperclip_env_apply() { export FOO=\"$__paperclip_env_0\"; }\n__paperclip_env_export() { export __paperclip_env_0; }\n__paperclip_env_unset() { unset __paperclip_env_0; }\n__paperclip_env_names='1 FOO'\n__paperclip_env_split='-u __paperclip_env_0 -- FOO=${__paperclip_env_0}'\n");
     expect(stdinCall[0]).not.toContain("bar");
     expect(stdinCall[0]).toMatch(/&& exec \/bin\/sh -c '\. "\$1" \|\| exit 125\n[\s\S]*\nexit 126' paperclip-env '\/tmp\/paperclip-env-[^']+' 'printf' 'hello' < '\/tmp\/paperclip-stdin-/);
     expect(stdinCall[1]).toEqual(expect.objectContaining({ cwd: "/workspace", timeoutMs: 1000 }));
