@@ -1746,3 +1746,67 @@ describe("IssueThreadInteractionCard resolver audience", () => {
     ).not.toBeNull();
   });
 });
+
+describe("IssueThreadInteractionCard summary Markdown", () => {
+  const markdownSummary = [
+    "**Decision needed.** Pick the launch plan.",
+    "",
+    "- First option keeps the current scope",
+    "- Second option adds the [draft brief](/api/attachments/attachment-1/content)",
+    "",
+    "Background is in the [public notes](https://example.com/notes).",
+    "",
+    '<script>window.__summaryScriptRan = true</script><img src="x" onerror="window.__summaryImgRan = true">',
+    "",
+    "Do not follow [this link](javascript:window.__summaryLinkRan=true) or ![remote](https://example.com/pixel.png).",
+  ].join("\n");
+
+  function summaryHost() {
+    const host = renderCard({
+      interaction: { ...pendingAskUserQuestionsInteraction, summary: markdownSummary },
+    });
+    const summary = host.querySelector('[data-testid="interaction-summary"]');
+    expect(summary).not.toBeNull();
+    return summary as HTMLElement;
+  }
+
+  it("renders the summary as Markdown instead of raw text", () => {
+    const summary = summaryHost();
+    expect(summary.textContent).not.toContain("**");
+    expect(summary.querySelector("strong")?.textContent).toBe("Decision needed.");
+    const items = Array.from(summary.querySelectorAll("ul > li"));
+    expect(items.map((item) => item.textContent)).toEqual([
+      "First option keeps the current scope",
+      "Second option adds the draft brief",
+    ]);
+  });
+
+  it("keeps relative and external links as anchors with their href", () => {
+    const summary = summaryHost();
+    const relative = Array.from(summary.querySelectorAll("a")).find((a) => a.textContent?.includes("draft brief"));
+    expect(relative?.getAttribute("href")).toBe("/api/attachments/attachment-1/content");
+    const external = Array.from(summary.querySelectorAll("a")).find((a) => a.textContent?.includes("public notes"));
+    expect(external?.getAttribute("href")).toBe("https://example.com/notes");
+    expect(external?.getAttribute("rel")).toContain("noopener");
+  });
+
+  it("creates no raw HTML elements, keeps images inert and neutralises javascript: links", () => {
+    const summary = summaryHost();
+    const win = window as unknown as Record<string, unknown>;
+    expect(summary.querySelector("script")).toBeNull();
+    expect(summary.querySelector("img")).toBeNull();
+    expect(summary.querySelector("[onerror]")).toBeNull();
+    expect(win.__summaryScriptRan).toBeUndefined();
+    expect(win.__summaryImgRan).toBeUndefined();
+    expect(summary.querySelector("[data-markdown-image-reference]")?.textContent).toContain("remote");
+    const unsafe = Array.from(summary.querySelectorAll("a")).find((a) => a.textContent?.includes("this link"));
+    const href = unsafe?.getAttribute("href") ?? "";
+    expect(href.toLowerCase()).not.toContain("javascript:");
+    expect(Array.from(summary.querySelectorAll("a")).every((a) => !(a.getAttribute("href") ?? "").toLowerCase().startsWith("javascript:"))).toBe(true);
+  });
+
+  it("does not render the summary body for connection authorization cards", () => {
+    const host = renderCard({ interaction: pendingConnectionAuthorizationInteraction });
+    expect(host.querySelector('[data-testid="interaction-summary"]')).toBeNull();
+  });
+});

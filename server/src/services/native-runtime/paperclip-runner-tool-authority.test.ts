@@ -980,6 +980,46 @@ describe("PaperclipRunnerToolAuthority", () => {
     ).rejects.toThrow("paperclip_runner_tool_idempotency_conflict");
   });
 
+  it("passes an explicit resolverPolicy through and leaves an omitted one human_only", async () => {
+    const authority = new PaperclipRunnerToolAuthority(db, {
+      companyId,
+      agentId,
+      issueId,
+      runId,
+    });
+    const base = {
+      interactionKind: "confirmation",
+      title: "Write the welcome note",
+      prompt: "Write the welcome note?",
+      continuationPolicy: "wake_assignee",
+    };
+    const explicit = await authority.execute({
+      tool: "request_human_input",
+      callId: "policy-explicit",
+      arguments: { ...base, idempotencyKey: "policy-explicit", resolverPolicy: "anyone" },
+    }) as { interaction: { requestedResolverPolicy: string; effectiveResolverPolicy: string; resolverPolicyProvenance: string } };
+    expect(explicit.interaction).toMatchObject({
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "anyone",
+      resolverPolicyProvenance: "explicit",
+    });
+    const omitted = await authority.execute({
+      tool: "request_human_input",
+      callId: "policy-omitted",
+      arguments: { ...base, idempotencyKey: "policy-omitted" },
+    }) as { interaction: { requestedResolverPolicy: string; effectiveResolverPolicy: string; resolverPolicyProvenance: string } };
+    expect(omitted.interaction).toMatchObject({
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "inherited",
+    });
+    await expect(authority.execute({
+      tool: "request_human_input",
+      callId: "policy-invalid",
+      arguments: { ...base, idempotencyKey: "policy-invalid", resolverPolicy: "everyone" },
+    })).rejects.toThrow();
+  });
+
   it("writes a real revisioned document and replays the mutation receipt", async () => {
     const body = credentialDocumentBody;
     const authority = new PaperclipRunnerToolAuthority(db, {

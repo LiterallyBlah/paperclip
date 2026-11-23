@@ -26,7 +26,7 @@ import {
   projects,
   projectWorkspaces,
 } from "@paperclipai/db";
-import { deriveProjectUrlKey } from "@paperclipai/shared";
+import { deriveProjectUrlKey, markdownToPlainPreview } from "@paperclipai/shared";
 import type {
   AttentionDecisionVerb,
   AttentionFeed,
@@ -1412,7 +1412,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             kind: "interaction",
             id: interaction.id,
             companyId,
-            title: isPlanTarget && issue ? `Plan approval - ${issue.title}` : interaction.title ?? interaction.summary ?? interactionLabel(interaction.kind),
+            title: isPlanTarget && issue ? `Plan approval - ${issue.title}` : interaction.title ?? (interaction.summary ? markdownToPlainPreview(interaction.summary) || null : null) ?? interactionLabel(interaction.kind),
             identifier: null,
             status: interaction.status,
             href: issue ? `${issueHref(prefix, issue)}#interaction-${interaction.id}` : null,
