@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -104,6 +104,12 @@ if (!support.supported) console.warn(`Managed-account database tests unavailable
       { secretId: key.id, configPath: "credentials.authorization", versionSelector: "latest" },
       { secretId: user.id, configPath: "headers.Arcade-User-ID", versionSelector: "latest" },
     ] }).where(eq(toolConnections.id, f.connection.id));
+    // Production paths write the shared connection's default organization grant together with the row;
+    // invocation now resolves header credentials from that grant and refuses a header it cannot supply.
+    await db.update(connectionGrants).set({ credentialSecretRefs: [
+      { secretId: key.id, configPath: "credentials.authorization", versionSelector: "latest" },
+      { secretId: user.id, configPath: "headers.Arcade-User-ID", versionSelector: "latest" },
+    ] }).where(and(eq(connectionGrants.connectionId, f.connection.id), eq(connectionGrants.kind, "organization"), eq(connectionGrants.isDefault, true)));
     for (const [secretId, configPath] of [[key.id, "credentials.authorization"], [user.id, "headers.Arcade-User-ID"]]) await secretService(db).createBinding({ companyId: f.company.id, secretId, targetType: "tool_connection", targetId: f.connection.id, configPath });
     expect((await f.access.listAggregatorApps(f.connection.id, f.actor)).discovery.availability).toBe("available");
     expect((await sync(f)).apps[0]).toMatchObject({ provider: "arcade", appSlug: "notion" });
