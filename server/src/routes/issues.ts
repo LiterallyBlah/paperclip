@@ -453,6 +453,12 @@ import {
 } from "../services/issue-queued-comment-queue.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+/**
+ * Task statuses a stopped pending-stage recovery may keep: the stage's own
+ * `in_review`, or `blocked` when the source run's automatic no-replay
+ * settlement projected it (BLA-4186; proven inside the recovery).
+ */
+const STOPPED_STAGE_RECOVERY_STATUSES = new Set<string>(["in_review", "blocked"]);
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -7893,6 +7899,10 @@ export function issueRoutes(
    * source run are cleared, and the participant gets one stage wake (post
    * commit) keyed by issue, stage and review round. Every refusal throws
    * before any write, so the transaction leaves no state change.
+   *
+   * BLA-4186: the task may also be `blocked`, but only by this source run's
+   * own automatic no-replay settlement (outcome `blocked`, replay `blocked`,
+   * same run) with no unblock descriptor. The status stays `blocked`.
    */
   async function reconcileStoppedPendingStage(input: {
     req: Request;
@@ -7922,7 +7932,7 @@ export function issueRoutes(
     const stage = state?.currentStageId
       ? policy?.stages.find((candidate) => candidate.id === state.currentStageId) ?? null
       : null;
-    if (issue.status !== "in_review" || state?.status !== "pending" || !participant || !stage ||
+    if (!STOPPED_STAGE_RECOVERY_STATUSES.has(issue.status) || state?.status !== "pending" || !participant || !stage ||
         stage.type !== state.currentStageType) {
       throw refuse("The task has no pending execution stage to resume.", "stage_recovery_stage_not_pending");
     }
@@ -7941,6 +7951,14 @@ export function issueRoutes(
     if (typeof sourceRunId !== "string" || decision.runId !== sourceRunId) {
       throw refuse("The reconciliation does not name this recovery action's source run.",
         "stage_recovery_source_mismatch");
+    }
+    if (issue.status === "blocked") {
+      const automatic = action.evidence.automaticRecovery as { replay?: unknown; runId?: unknown } | undefined;
+      if (action.outcome !== "blocked" || automatic?.replay !== "blocked" || automatic.runId !== sourceRunId ||
+          issue.unblockDescriptor != null) {
+        throw refuse("The task is blocked by something other than this source run's automatic recovery stop.",
+          "stage_recovery_block_unverified", { sourceRunId });
+      }
     }
     const [sourceRun] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sourceRunId),
@@ -8123,7 +8141,8 @@ export function issueRoutes(
         state.currentParticipant?.type !== "agent" || state.currentParticipant.agentId !== owner.agentId ||
         issue.assigneeAgentId !== owner.agentId || !redeliveryOwnerAdmitted(action, owner.agentId, state) ||
         owner.idempotencyKey !== pendingStageRecoveryWakeKey(issue.id, owner) ||
-        issue.checkoutRunId || issue.executionRunId) return null;
+        issue.checkoutRunId || issue.executionRunId ||
+        (issue.status === "blocked" && issue.unblockDescriptor != null)) return null;
     const [delivered] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId),
       eq(agentWakeupRequests.agentId, owner.agentId),
@@ -10949,7 +10968,17 @@ export function issueRoutes(
           eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
           actionId ? eq(issueRecoveryActions.id, actionId) : inArray(issueRecoveryActions.status, ["active", "escalated"]),
         )).limit(1).for("update");
+        // BLA-4186: `restored` at an unchanged `blocked` status, without
+        // workspace repair evidence, is admitted only by the settled
+        // stopped-pending-stage recovery below.
+        const blockedStageRecoveryOnly = outcome === "restored" && sourceIssueStatus === "blocked" &&
+          !executionReconciliation?.workspaceRepairEvidence;
+        const refuseBlockedRestore = () => unprocessable(
+          "Restored recovery actions must move the source issue to todo, done, or in_review",
+          { code: "recovery_restore_status_invalid" },
+        );
         if (workspaceRepairAction && hasRequiredWorkspaceRecovery(workspaceRepairAction.evidence)) {
+          if (blockedStageRecoveryOnly) throw refuseBlockedRestore();
           assertBoard(req);
           await requireRecoveryActionAuthority(req, lockedIssue, issueRecoveryActionReadModel(workspaceRepairAction),
             { source: "recovery_action_resolution" });
@@ -11006,7 +11035,7 @@ export function issueRoutes(
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
               assertBoard(req);
-              if (sourceIssueStatus === "in_review" && lockedIssue.status === "in_review") {
+              if (sourceIssueStatus === lockedIssue.status && STOPPED_STAGE_RECOVERY_STATUSES.has(lockedIssue.status)) {
                 const stageRecovery = await reconcileStoppedPendingStage({
                   req, tx: tx as unknown as Db, issue: lockedIssue, action: settled,
                   decision: executionReconciliation, outcome, resolutionNote: resolutionNote ?? null,
@@ -11033,11 +11062,14 @@ export function issueRoutes(
               activeRecoveryAction = issueRecoveryActionReadModel(reopened!);
             } else {
               const redelivery = executionReconciliation && outcome === "restored" &&
-                sourceIssueStatus === "in_review" && lockedIssue.status === "in_review"
+                sourceIssueStatus === lockedIssue.status && STOPPED_STAGE_RECOVERY_STATUSES.has(lockedIssue.status)
                 ? await redeliverStoppedPendingStage({ req, tx: tx as unknown as Db, issue: lockedIssue,
                   action: settled, decision: executionReconciliation })
                 : null;
               if (redelivery) return { issue: lockedIssue, ...redelivery, stageRecovery: true as const };
+              const stageRecovered = (settled.evidence.continuationDeliveryOwner as
+                PendingStageParticipantDeliveryOwner | undefined)?.kind === "pending_stage_participant";
+              if (blockedStageRecoveryOnly && !stageRecovered) throw refuseBlockedRestore();
               return {
                 issue: lockedIssue,
                 recoveryAction: settled,
@@ -11046,6 +11078,7 @@ export function issueRoutes(
             }
           }
         }
+        if (blockedStageRecoveryOnly) throw refuseBlockedRestore();
         if (
           !activeRecoveryAction ||
           (actionId && activeRecoveryAction.id !== actionId)
