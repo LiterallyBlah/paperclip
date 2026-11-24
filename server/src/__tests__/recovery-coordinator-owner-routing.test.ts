@@ -353,6 +353,47 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
     expect(enqueueWakeup.mock.calls.filter(([agentId]) => agentId === fixture.ceoId)).toHaveLength(1);
   });
 
+  it("resolves a coordinator-routed hold when the source gets a new execution path", async () => {
+    const fixture = await seed();
+    const action = await boardUpsert(fixture);
+    expect(action).toMatchObject({ ownerType: "agent", ownerAgentId: fixture.ceoId });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async (..._args: unknown[]) => null) });
+    expect((await recovery.reconcileActiveRecoveryActions({ companyId: fixture.companyId })).resolved).toBe(0);
+    await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: fixture.workerId,
+      status: "running",
+      contextSnapshot: { taskId: fixture.sourceIssueId },
+    });
+    expect((await recovery.reconcileActiveRecoveryActions({ companyId: fixture.companyId })).resolved).toBe(1);
+    const [resolved] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(resolved).toMatchObject({ status: "resolved", resolutionNote: "new_source_execution_path" });
+  });
+
+  it("resolves a coordinator-routed hold through a healthy child", async () => {
+    const fixture = await seed();
+    const action = await boardUpsert(fixture);
+    expect(action).toMatchObject({ ownerType: "agent", ownerAgentId: fixture.ceoId });
+    const [child] = await db.insert(issues).values({
+      companyId: fixture.companyId,
+      title: "Synthetic child",
+      status: "in_progress",
+      priority: "medium",
+      parentId: fixture.sourceIssueId,
+      assigneeAgentId: fixture.workerId,
+    }).returning();
+    await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: fixture.workerId,
+      status: "running",
+      contextSnapshot: { issueId: child!.id },
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async (..._args: unknown[]) => null) });
+    expect((await recovery.reconcileActiveRecoveryActions({ companyId: fixture.companyId })).resolved).toBe(1);
+    const [resolved] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(resolved).toMatchObject({ status: "resolved", resolutionNote: "durable_path_restored:healthy_child" });
+  });
+
   it("backfills active board-owned routine actions with a dry run first, idempotently", async () => {
     const fixture = await seed();
     const [routine, reserved, unlisted] = await db.insert(issueRecoveryActions).values([

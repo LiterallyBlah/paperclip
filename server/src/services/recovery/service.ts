@@ -3804,7 +3804,8 @@ export function recoveryService(
       if (
         wakePolicyType !== "bounded_recovery_owner" &&
         wakePolicyType !== "bounded_owner_disposition_repair" &&
-        action.ownerType !== "board"
+        action.ownerType !== "board" &&
+        !coordinatorRouted
       ) {
         continue;
       }
