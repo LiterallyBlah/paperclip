@@ -790,6 +790,14 @@ export async function closeRecoveryActionsForTerminalSourceIssue(
   ];
   if (input.actionId) predicates.push(eq(issueRecoveryActions.id, input.actionId));
   if (input.exceptActionId) predicates.push(ne(issueRecoveryActions.id, input.exceptActionId));
+  // Most terminal transitions have no open recovery action. Skip the
+  // execution-control write (and its notifications) when nothing matches.
+  const [candidate] = await dbOrTx
+    .select({ id: issueRecoveryActions.id })
+    .from(issueRecoveryActions)
+    .where(and(...predicates))
+    .limit(1);
+  if (!candidate) return [];
   return writeExecutionControl(
     dbOrTx,
     [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation],

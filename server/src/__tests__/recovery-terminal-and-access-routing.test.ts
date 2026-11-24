@@ -182,7 +182,7 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
         });
         expect(closed.resolvedAt).toBeInstanceOf(Date);
 
-        const enqueueWakeup = vi.fn(async () => null);
+        const enqueueWakeup = vi.fn(async (_agentId: string, _opts?: unknown) => null);
         await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
         expect(enqueueWakeup.mock.calls.some(([agentId]) => agentId === fixture.ceoId)).toBe(false);
         // The source issue is not reopened.
@@ -198,7 +198,7 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
         .where(eq(issues.id, fixture.sourceIssueId));
       expect((await actionRow(action.id)).status).toBe("active");
 
-      const enqueueWakeup = vi.fn(async () => null);
+      const enqueueWakeup = vi.fn(async (_agentId: string, _opts?: unknown) => null);
       await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
 
       expect(enqueueWakeup).not.toHaveBeenCalled();
@@ -245,7 +245,7 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
 
           // A row left open on an already-terminal source, as the reconcile loop sees it.
           await db.update(issues).set({ status: terminal }).where(eq(issues.id, otherSourceId));
-          const enqueueWakeup = vi.fn(async () => null);
+          const enqueueWakeup = vi.fn(async (_agentId: string, _opts?: unknown) => null);
           await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
 
           expect(await actionRow(guarded.id)).toMatchObject({ status: "active", resolvedAt: null });
@@ -271,7 +271,7 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
         coordinatorAgentId: fixture.ceoId,
       });
 
-      const enqueueWakeup = vi.fn(async () => null);
+      const enqueueWakeup = vi.fn(async (_agentId: string, _opts?: unknown) => null);
       await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
       expect(enqueueWakeup.mock.calls.some(([agentId]) => agentId === fixture.ceoId)).toBe(false);
       expect(enqueueWakeup.mock.calls.filter(([agentId]) => agentId === fixture.workerId)).toHaveLength(1);
@@ -310,7 +310,7 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
         reason: "coordinator_no_access",
         coordinatorAgentId: fixture.ceoId,
       });
-      const enqueueWakeup = vi.fn(async () => null);
+      const enqueueWakeup = vi.fn(async (_agentId: string, _opts?: unknown) => null);
       await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
       expect(enqueueWakeup.mock.calls.some(([, opts]) =>
         (opts as { payload?: { recoveryActionId?: string } }).payload?.recoveryActionId === denied.id)).toBe(false);
@@ -388,7 +388,7 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
       await db.update(issues).set({ visibility: "private", privacyRootIssueId: fixture.sourceIssueId, responsibleUserId: fixture.ownerUserId })
         .where(eq(issues.id, fixture.sourceIssueId));
 
-      const enqueueWakeup = vi.fn(async () => null);
+      const enqueueWakeup = vi.fn(async (_agentId: string, _opts?: unknown) => null);
       await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
 
       expect(enqueueWakeup.mock.calls.some(([agentId]) => agentId === fixture.ceoId)).toBe(false);
