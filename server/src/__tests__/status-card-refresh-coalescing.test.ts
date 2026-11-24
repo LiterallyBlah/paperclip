@@ -130,7 +130,8 @@ describeEmbeddedPostgres("status card refresh coalescing", () => {
   async function tickEveryMinute(from: number, to: number) {
     const started: Array<typeof issues.$inferSelect> = [];
     for (let at = from; at <= to; at += MINUTE) {
-      const tick = await statusCardService(db).tickDueStatusCards(new Date(at));
+      // Raw writes bypass the issue-change listener, so pass its "changed" hint as production would.
+      const tick = await statusCardService(db).tickDueStatusCards(new Date(at), "changed");
       started.push(...tick.enqueued.map((entry) => entry.generatingIssue));
     }
     return started;
