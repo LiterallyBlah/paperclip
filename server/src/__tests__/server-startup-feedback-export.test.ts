@@ -1139,7 +1139,9 @@ describe("startServer feedback export wiring", () => {
       const companyReads = () => vi.mocked(db.select).mock.results.filter(({ value }) =>
         vi.mocked(value.from).mock.calls.some(([table]: unknown[]) => table === companies)).length;
       const before = companyReads();
-      expect(before).toBe(0); expect(tick).toBeUndefined();
+      // One startup read: the fork's maintenance re-dispatch (#45) lists company ids once to close a
+      // task drain ended by restart. The invariant here is that ticks add none.
+      expect(before).toBe(1); expect(tick).toBeUndefined();
       await settleStartupHousekeeping();
       expect(companyReads()).toBe(before);
       expect(source.load).toHaveBeenCalledOnce();
