@@ -217,6 +217,8 @@ describe("TaskChatInteractionCard", () => {
     expect(copy).toBeDefined();
     await act(async () => copy!.click());
     expect(writeText).toHaveBeenCalledWith(argumentsHash);
+  });
+
   it("shows a Markdown summary as plain text in the one-line pending request row", () => {
     flushSync(() => {
       root.render(
