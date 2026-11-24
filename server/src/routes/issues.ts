@@ -11036,6 +11036,31 @@ export function issueRoutes(
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
               assertBoard(req);
+              // BLA-4737: a done/cancelled task, or a blocked task with no
+              // pending stage, settles its retained hold as a record only:
+              // no status change, no reopening, no continuation and no wake.
+              const recordOnlyState = parseIssueExecutionState(lockedIssue.executionState);
+              const recordOnly = sourceIssueStatus === lockedIssue.status && (
+                (lockedIssue.status === "blocked" && outcome === "blocked" && settled.outcome === "blocked" &&
+                  recordOnlyState?.status !== "pending") ||
+                ((lockedIssue.status === "done" || lockedIssue.status === "cancelled") && outcome === "restored")
+              );
+              if (recordOnly) {
+                if (activeRecoveryAction) {
+                  throw conflict("Another recovery action is active for this task. Resolve it first.",
+                    { code: "recovery_record_only_competing_action", activeRecoveryActionId: activeRecoveryAction.id });
+                }
+                await validateExecutionReconciliation({ db: tx as unknown as Db,
+                  companyId: lockedIssue.companyId, issueId: lockedIssue.id, agentId: lockedIssue.assigneeAgentId,
+                  sourceRunId: settled.evidence.runId ?? settled.evidence.sourceRunId,
+                  decision: executionReconciliation, recoveryAction: settled, withoutContinuation: true,
+                });
+                await markExecutionReconciliation(tx as unknown as Db, settled, executionReconciliation,
+                  actor.actorId, undefined, { withoutContinuation: true });
+                const [recorded] = await tx.select().from(issueRecoveryActions)
+                  .where(eq(issueRecoveryActions.id, settled.id));
+                return { issue: lockedIssue, recoveryAction: recorded!, recordOnly: true as const };
+              }
               if (sourceIssueStatus === lockedIssue.status && STOPPED_STAGE_RECOVERY_STATUSES.has(lockedIssue.status)) {
                 const stageRecovery = await reconcileStoppedPendingStage({
                   req, tx: tx as unknown as Db, issue: lockedIssue, action: settled,
@@ -11080,6 +11105,8 @@ export function issueRoutes(
           }
         }
         if (blockedStageRecoveryOnly) throw refuseBlockedRestore();
+        // BLA-4737: `restored` at `cancelled` is only the record-only settlement above.
+        if (outcome === "restored" && sourceIssueStatus === "cancelled") throw refuseBlockedRestore();
         if (
           !activeRecoveryAction ||
           (actionId && activeRecoveryAction.id !== actionId)
@@ -11498,6 +11525,32 @@ export function issueRoutes(
 
         return { issue, recoveryAction, chatRetry };
       });
+      if ("recordOnly" in result) {
+        await logActivity(db, {
+          companyId: result.issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.recovery_action_resolved",
+          entityType: "issue",
+          entityId: result.issue.id,
+          details: {
+            identifier: result.issue.identifier,
+            recoveryActionId: result.recoveryAction.id,
+            recoveryActionStatus: result.recoveryAction.status,
+            outcome: result.recoveryAction.outcome,
+            sourceIssueStatus: sourceIssueStatus ?? null,
+            recordOnly: true,
+            runId: executionReconciliation?.runId ?? null,
+            continuationDelivery: "not_requested",
+            resolutionNote: resolutionNote ?? null,
+          },
+        });
+        res.json({ issue: result.issue, recoveryAction: result.recoveryAction, recordOnly: true });
+        return;
+      }
       if ("stageRecovery" in result) {
         const { wake } = result;
         let continuationRunId: string | null = null;
