@@ -32,6 +32,17 @@ export type IsolatedCopyRepoState = {
   unpushed: boolean;
   ignoredNonRegenerable: boolean;
   inspectionFailed: boolean;
+  // Per-clone reclaim needs these. A value that Git could not give is null.
+  worktree: boolean;
+  // Absolute path of the main repository directory (the parent of the common
+  // `.git` directory). For a clone this is the clone itself.
+  mainRepoPath: string | null;
+  // Linked worktrees that a main repository lists, other than itself.
+  linkedWorktrees: { path: string; locked: boolean; prunable: boolean }[];
+  head: string | null;
+  remoteRef: string | null;
+  remoteUrl: string | null;
+  submodules: boolean;
 };
 
 export type IsolatedCopyInspection = {
@@ -39,7 +50,30 @@ export type IsolatedCopyInspection = {
   protectedFiles: { kind: "database" | "mail" | "evidence"; relativePath: string }[];
   unversionedPaths: string[];
   regenerableDirs: string[];
+  // Regenerable-named directories that no repository holds. They are listed
+  // in `unversionedPaths` too, so they never allow an archive.
+  outsideRegenerableDirs: string[];
+  // Outside regenerable directories that hold a protected file or a Git
+  // directory. They are never compacted.
+  outsideRegenerableHeld: string[];
+  // Newest modification time of any inspected entry, or 0 when nothing was read.
+  newestMtimeMs: number;
   truncated: boolean;
+};
+
+export type IsolatedCopyCloneRemoval = {
+  relativePath: string;
+  kind: "clone" | "worktree";
+  mainRepoPath: string;
+  head: string;
+  remoteRef: string;
+  remoteUrl: string | null;
+};
+
+export type IsolatedCopyClonePlan = {
+  remove: IsolatedCopyCloneRemoval[];
+  keep: { relativePath: string; reasons: string[] }[];
+  compactOutside: string[];
 };
 
 export type IsolatedCopyDecision =
@@ -77,7 +111,15 @@ async function git(repoPath: string, args: string[], signal?: AbortSignal): Prom
     const child = execFile(
       "git",
       ["-C", repoPath, ...args],
-      { cwd: repoPath, timeout: GIT_TIMEOUT_MS, signal, maxBuffer: 32 * 1024 * 1024 },
+      {
+        cwd: repoPath,
+        timeout: GIT_TIMEOUT_MS,
+        signal,
+        maxBuffer: 32 * 1024 * 1024,
+        // A read must not refresh the index: that would change the copy's
+        // modification time, which decides whether the copy is idle.
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
+      },
       (error, stdout) => (error ? reject(error) : resolve(stdout)),
     );
     child.stdin?.on("error", () => {});
@@ -121,6 +163,13 @@ async function inspectRepo(
     unpushed: false,
     ignoredNonRegenerable: false,
     inspectionFailed: false,
+    worktree: false,
+    mainRepoPath: null,
+    linkedWorktrees: [],
+    head: null,
+    remoteRef: null,
+    remoteUrl: null,
+    submodules: false,
   };
   try {
     const status = await git(repoPath, ["status", "--porcelain=v1", "-z", "--ignored=matching", "--untracked-files=all"], signal);
@@ -147,8 +196,53 @@ async function inspectRepo(
     state.unpushed = unpushed.trim().length > 0;
   } catch {
     state.inspectionFailed = true;
+    return { state, ignoredPaths };
+  }
+  // Facts for per-clone reclaim. A failure leaves the value null, which keeps the clone.
+  const optional = (args: string[]) => git(repoPath, args, signal).then((out) => out.trim(), () => null);
+  state.worktree = await fs.lstat(path.join(repoPath, ".git")).then((stat) => stat.isFile(), () => false);
+  const commonDir = await optional(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (commonDir) state.mainRepoPath = path.basename(commonDir) === ".git" ? path.dirname(commonDir) : null;
+  state.head = (await optional(["rev-parse", "--verify", "-q", "HEAD"])) || null;
+  state.submodules = await fs.lstat(path.join(repoPath, ".gitmodules")).then(() => true, () => false);
+  if (state.head) {
+    const ref = await optional(["for-each-ref", "--contains", "HEAD", "--count=1", "--format=%(refname)", "refs/remotes"]);
+    if (ref) {
+      state.remoteRef = ref.replace(/^refs\/remotes\//, "");
+      const remotes = ((await optional(["remote"])) ?? "").split("\n").filter(Boolean)
+        .sort((a, b) => b.length - a.length);
+      const remote = remotes.find((name) => state.remoteRef!.startsWith(`${name}/`));
+      const url = remote ? await optional(["remote", "get-url", remote]) : null;
+      state.remoteUrl = url ? redactRemoteUrl(url) : null;
+    }
+  }
+  if (!state.worktree) {
+    const list = await optional(["worktree", "list", "--porcelain"]);
+    if (list === null) state.mainRepoPath = null;
+    else {
+      for (const block of list.split(/\n\s*\n/)) {
+        const lines = block.split("\n");
+        const worktreePath = lines.find((line) => line.startsWith("worktree "))?.slice("worktree ".length);
+        if (!worktreePath || path.resolve(worktreePath) === path.resolve(repoPath)) continue;
+        state.linkedWorktrees.push({
+          path: path.resolve(worktreePath),
+          locked: lines.some((line) => line === "locked" || line.startsWith("locked ")),
+          prunable: lines.some((line) => line === "prunable" || line.startsWith("prunable ")),
+        });
+      }
+    }
   }
   return { state, ignoredPaths };
+}
+
+// Drops the records of worktrees whose directory is gone.
+export async function pruneGitWorktrees(mainRepoPath: string, signal?: AbortSignal) {
+  await git(mainRepoPath, ["worktree", "prune"], signal);
+}
+
+// The undo record names the remote, but never a credential in its URL.
+function redactRemoteUrl(url: string) {
+  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/i, "$1");
 }
 
 // Walks the directory without following symlinks. It finds nested Git
@@ -158,11 +252,23 @@ async function inspectRepo(
 // are really regenerable. Outside any repository nothing vouches for them, so
 // they count as unversioned files.
 export async function inspectIsolatedCopyDir(root: string, options: { signal?: AbortSignal } = {}): Promise<IsolatedCopyInspection> {
-  const result: IsolatedCopyInspection = { repos: [], protectedFiles: [], unversionedPaths: [], regenerableDirs: [], truncated: false };
+  const result: IsolatedCopyInspection = {
+    repos: [],
+    protectedFiles: [],
+    unversionedPaths: [],
+    regenerableDirs: [],
+    outsideRegenerableDirs: [],
+    outsideRegenerableHeld: [],
+    newestMtimeMs: 0,
+    truncated: false,
+  };
   const repoPaths: string[] = [];
   let visited = 0;
+  const rootStat = await fs.lstat(root).catch(() => null);
+  if (rootStat) result.newestMtimeMs = rootStat.mtimeMs;
 
-  async function walk(relativeDir: string, depth: number, insideRepo: boolean): Promise<void> {
+  // `outsideRoot` is set while searching an outside regenerable directory.
+  async function walk(relativeDir: string, depth: number, insideRepo: boolean, outsideRoot: string | null = null): Promise<void> {
     options.signal?.throwIfAborted();
     if (result.truncated) return;
     const absoluteDir = relativeDir ? path.join(root, relativeDir) : root;
@@ -183,16 +289,28 @@ export async function inspectIsolatedCopyDir(root: string, options: { signal?: A
         return;
       }
       const relativePath = relativeDir ? path.posix.join(relativeDir, entry.name) : entry.name;
-      if (entry.name === ".git") continue;
+      const stat = await fs.lstat(path.join(absoluteDir, entry.name)).catch(() => null);
+      if (stat) result.newestMtimeMs = Math.max(result.newestMtimeMs, stat.mtimeMs);
       const isDirectory = entry.isDirectory();
-      const kind = classifyProtected(entry.name, isDirectory);
+      const kind = entry.name === ".git" ? null : classifyProtected(entry.name, isDirectory);
       if (kind) result.protectedFiles.push({ kind, relativePath });
+      if (outsideRoot && (kind || entry.name === ".git") && !result.outsideRegenerableHeld.includes(outsideRoot)) {
+        result.outsideRegenerableHeld.push(outsideRoot);
+      }
+      if (entry.name === ".git") continue;
       if (isDirectory && REGENERABLE_WORKSPACE_DIR_NAMES.has(entry.name)) {
-        if (!repoHere) result.unversionedPaths.push(relativePath);
+        if (outsideRoot) continue;
+        if (!repoHere) {
+          result.unversionedPaths.push(relativePath);
+          result.outsideRegenerableDirs.push(relativePath);
+          // Outside a repository, look inside build output for protected
+          // files before it can be compacted. Dependencies are not searched.
+          if (entry.name !== "node_modules" && depth < PROTECTED_SEARCH_DEPTH) await walk(relativePath, depth + 1, true, relativePath);
+        }
         continue;
       }
       if (!repoHere && !isDirectory) result.unversionedPaths.push(relativePath);
-      if (isDirectory && depth < PROTECTED_SEARCH_DEPTH) await walk(relativePath, depth + 1, repoHere);
+      if (isDirectory && depth < PROTECTED_SEARCH_DEPTH) await walk(relativePath, depth + 1, repoHere, outsideRoot);
       else if (isDirectory && !repoHere) result.unversionedPaths.push(relativePath);
     }
   }
@@ -230,4 +348,73 @@ export function decideIsolatedCopyReclaim(inspection: IsolatedCopyInspection): I
   if (reasons.size === 0) return { action: "archive", reasons: ["clean_pushed"] };
   if (inspection.regenerableDirs.length > 0) return { action: "compact", reasons: [...reasons] };
   return { action: "keep", reasons: [...reasons] };
+}
+
+// For a copy that has been idle long enough, chooses which nested clones and
+// worktrees can go and which outside regenerable directories can be compacted.
+// A clone goes only when Git shows nothing that a fresh clone would lack: no
+// change, untracked or unvouched ignored file, stash or submodule, and HEAD and
+// every local branch on a remote-tracking ref. A worktree goes only when its
+// main repository is in the same copy; a main repository goes only together
+// with all of its linked worktrees. The caller re-checks idleness and use.
+export function planIsolatedCopyCloneReclaim(root: string, inspection: IsolatedCopyInspection): IsolatedCopyClonePlan {
+  const plan: IsolatedCopyClonePlan = { remove: [], keep: [], compactOutside: [] };
+  if (inspection.truncated) {
+    plan.keep.push({ relativePath: "", reasons: ["not_fully_inspected"] });
+    return plan;
+  }
+  const absolute = (relativePath: string) => path.resolve(root, relativePath);
+  const isWithin = (child: string, parent: string) => child === parent || child.startsWith(`${parent}${path.sep}`);
+  const reposByPath = new Map(inspection.repos.map((repo) => [absolute(repo.relativePath), repo]));
+  const ownReasons = new Map<IsolatedCopyRepoState, string[]>();
+  for (const repo of inspection.repos) {
+    const reasons: string[] = [];
+    if (repo.inspectionFailed) reasons.push("git_inspection_failed");
+    if (repo.dirty) reasons.push("dirty");
+    if (!repo.inspectionFailed && !repo.hasRemote) reasons.push("no_remote");
+    if (repo.unpushed) reasons.push("unpushed");
+    if (repo.ignoredNonRegenerable) reasons.push("ignored_files");
+    if (repo.submodules) reasons.push("submodules");
+    if (!repo.inspectionFailed && (!repo.head || !repo.remoteRef)) reasons.push("head_not_on_remote");
+    if (!repo.inspectionFailed && !repo.mainRepoPath) reasons.push("git_inspection_failed");
+    if (repo.relativePath === "") reasons.push("copy_root_is_repository");
+    const repoAbs = absolute(repo.relativePath);
+    for (const kind of new Set(inspection.protectedFiles
+      .filter((file) => isWithin(absolute(file.relativePath), repoAbs)).map((file) => file.kind))) reasons.push(kind);
+    if (repo.worktree && repo.mainRepoPath) {
+      const main = reposByPath.get(path.resolve(repo.mainRepoPath));
+      if (!main || main.worktree) reasons.push("worktree_of_external_repo");
+      else if (main.linkedWorktrees.some((entry) => entry.path === repoAbs && entry.locked)) reasons.push("locked_worktree");
+      else if (!main.linkedWorktrees.some((entry) => entry.path === repoAbs)) reasons.push("worktree_not_listed");
+    }
+    ownReasons.set(repo, reasons);
+  }
+  const removable = new Set(inspection.repos.filter((repo) => repo.worktree && ownReasons.get(repo)!.length === 0)
+    .map((repo) => absolute(repo.relativePath)));
+  for (const repo of inspection.repos) {
+    if (repo.worktree) continue;
+    const reasons = ownReasons.get(repo)!;
+    const live = repo.linkedWorktrees.filter((entry) => !entry.prunable);
+    if (live.some((entry) => !removable.has(entry.path))) reasons.push("has_linked_worktrees");
+  }
+  for (const repo of inspection.repos) {
+    const reasons = ownReasons.get(repo)!;
+    if (reasons.length > 0) {
+      plan.keep.push({ relativePath: repo.relativePath, reasons });
+      continue;
+    }
+    plan.remove.push({
+      relativePath: repo.relativePath,
+      kind: repo.worktree ? "worktree" : "clone",
+      mainRepoPath: repo.mainRepoPath!,
+      head: repo.head!,
+      remoteRef: repo.remoteRef!,
+      remoteUrl: repo.remoteUrl,
+    });
+  }
+  // Worktrees first, so each main repository is still there to prune them.
+  plan.remove.sort((a, b) => (a.kind === b.kind ? 0 : a.kind === "worktree" ? -1 : 1));
+  const held = new Set(inspection.outsideRegenerableHeld);
+  plan.compactOutside = inspection.outsideRegenerableDirs.filter((dir) => !held.has(dir));
+  return plan;
 }
