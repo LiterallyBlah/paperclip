@@ -12,6 +12,7 @@ export async function startOAuthRefreshFixture({
   challengeScope = true,
   resourceScopes = ["mcp:read"],
   accessTokenLifetimeSeconds = 3600,
+  extraTools = [],
 } = {}) {
   const clients = new Map();
   const codes = new Map();
@@ -146,7 +147,7 @@ export async function startOAuthRefreshFixture({
         if (rpc.method === "notifications/initialized") { res.writeHead(202); res.end(); return; }
         let result;
         if (rpc.method === "initialize") result = { protocolVersion: rpc.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "offline-access-fixture", version: "1.0.0" } };
-        else if (rpc.method === "tools/list") result = { tools: [{ name: "read_status", description: "Read the test server status", inputSchema: { type: "object", properties: {} }, annotations: { readOnlyHint: true } }] };
+        else if (rpc.method === "tools/list") result = { tools: [{ name: "read_status", description: "Read the test server status", inputSchema: { type: "object", properties: {} }, annotations: { readOnlyHint: true } }, ...extraTools] };
         else if (rpc.method === "tools/call" && rpc.params.name === "read_status") result = { content: [{ type: "text", text: "Authenticated MCP call succeeded" }] };
         else { json(res, 200, { jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: "Method not found" } }); return; }
         json(res, 200, { jsonrpc: "2.0", id: rpc.id, result });
