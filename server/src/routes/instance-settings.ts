@@ -7,9 +7,7 @@ import {
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
 } from "@paperclipai/shared";
-import { z } from "zod";
-import { conflict, forbidden, notFound } from "../errors.js";
-import { recordAdministrativeStopReconciliation } from "../services/administrative-stop-reconciliation.js";
+import { conflict, forbidden } from "../errors.js";
 import {
   cloudTenantPrimaryCompanyId,
   getCloudStackContext,
@@ -32,6 +30,9 @@ import {
 import { environmentService } from "../services/environments.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
+import { z } from "zod";
+import { HttpError } from "../errors.js";
+import { recordAdministrativeStopReconciliation } from "../services/administrative-stop-reconciliation.js";
 
 function sameJsonValue(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -418,7 +419,7 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
     async (req, res) => {
       assertCanManageInstanceSettings(req);
       const runId = req.params.runId as string;
-      if (!UUID_PATTERN.test(runId)) throw notFound("Run not found");
+      if (!UUID_PATTERN.test(runId)) throw new HttpError(404, "Run not found");
       const runIdLower = runId.toLowerCase();
       const companyId = (req.body.companyId as string).toLowerCase();
       const actor = getActorInfo(req);
@@ -445,7 +446,7 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
         return written;
       });
       if (!result.ok) {
-        if (result.reason === "not_found") throw notFound("Run not found");
+        if (result.reason === "not_found") throw new HttpError(404, "Run not found");
         throw conflict("Run does not meet the administrative stop reconciliation premises", { code: result.reason });
       }
       publishActivitiesBestEffort(publications, "heartbeat_run.administrative_stop_reconciled");
