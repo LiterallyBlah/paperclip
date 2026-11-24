@@ -104,7 +104,11 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
-import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import {
+  closeRecoveryActionsForTerminalSourceIssue,
+  issueRecoveryActionService,
+  survivesTerminalSourceIssue,
+} from "../issue-recovery-actions.js";
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../native-runtime/native-workspace-finalization-recovery-state.js";
 import {
   isSuppressedLegacyDispositionDispatch,
@@ -160,12 +164,14 @@ import {
 import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  canRecoveryOwnerReadIssue,
   carryRecoveryCoordinatorDelivery,
   isAvailableRecoveryCoordinatorStatus,
   isCoordinatorRoutedRecoveryAction,
   isOrphanedCoordinatorRoutedRecoveryAction,
   isOperatorHeldRecoveryAction,
   readRecoveryOwnerRouting,
+  RECOVERY_COORDINATOR_NO_ACCESS_REASON,
   RECOVERY_COORDINATOR_REWAKE_MS,
   RECOVERY_COORDINATOR_WAKE_REASON,
   RECOVERY_OWNER_ROUTING_EVIDENCE_KEY,
@@ -3572,6 +3578,15 @@ export function recoveryService(
     }
     const coordinatorAgent = await getAgent(action.ownerAgentId);
     if (!coordinatorAgent || !isAvailableRecoveryCoordinatorStatus(coordinatorAgent.status)) return null;
+    // Never wake an owner that cannot read the source issue: its run would
+    // only end `setup_failed`. Reconciliation re-routes such actions first.
+    if (!(await canRecoveryOwnerReadIssue(db, {
+      companyId: action.companyId,
+      agentId: action.ownerAgentId,
+      issueId: action.sourceIssueId,
+    }))) {
+      return null;
+    }
     const context = {
       issueId: action.sourceIssueId,
       taskId: action.sourceIssueId,
@@ -3632,25 +3647,49 @@ export function recoveryService(
     const previousCoordinatorAgentId = action.ownerAgentId
       ?? (previousRouting?.coordinator === "assigned" ? previousRouting.agentId : undefined);
     const coordinatorAgent = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
-    if (
+    const ownerAvailable = Boolean(
       !orphaned &&
       coordinatorAgent &&
       coordinatorAgent.companyId === action.companyId &&
-      isAvailableRecoveryCoordinatorStatus(coordinatorAgent.status)
+      isAvailableRecoveryCoordinatorStatus(coordinatorAgent.status),
+    );
+    // An available owner that cannot read the source issue is re-routed the
+    // same way as an unavailable one: the resolver passes over a coordinator
+    // without access to the readable assignee, otherwise the board.
+    if (
+      ownerAvailable &&
+      (await canRecoveryOwnerReadIssue(db, {
+        companyId: action.companyId,
+        agentId: action.ownerAgentId!,
+        issueId: action.sourceIssueId,
+      }))
     ) {
       return action;
     }
-    const unavailableReason = coordinatorAgent && coordinatorAgent.companyId === action.companyId
-      ? `assigned_coordinator_${coordinatorAgent.status}`
-      : "assigned_coordinator_not_found";
+    const unavailableReason = ownerAvailable
+      ? RECOVERY_COORDINATOR_NO_ACCESS_REASON
+      : coordinatorAgent && coordinatorAgent.companyId === action.companyId
+        ? `assigned_coordinator_${coordinatorAgent.status}`
+        : "assigned_coordinator_not_found";
     const resolved = await resolveRecoveryOwner(db, {
       companyId: action.companyId,
       kind: action.kind,
       cause: action.cause,
       requestedOwnerType: "board",
+      sourceIssueId: action.sourceIssueId,
       sourceAgentId: action.returnOwnerAgentId ?? action.previousOwnerAgentId ?? null,
       now,
     });
+    // The resolver can only hand it back to the same owner if that owner
+    // regained access between the checks; then nothing changes.
+    if (
+      resolved.ownerType === "agent" &&
+      resolved.ownerAgentId === action.ownerAgentId &&
+      !orphaned &&
+      ownerAvailable
+    ) {
+      return action;
+    }
     const toCoordinator = resolved.ownerType === "agent" && resolved.routing?.coordinator === "assigned";
     const routing: RecoveryOwnerRoutingEvidence = toCoordinator
       ? resolved.routing!
@@ -3704,6 +3743,25 @@ export function recoveryService(
     };
     for (const row of rows) {
       const { issue } = row;
+      // A terminal source closes its open actions before anything can wake
+      // their owner, whoever owns them. This also settles rows left open by
+      // terminal transitions that predate closing them in the transition.
+      if (
+        (issue.status === "done" || issue.status === "cancelled") &&
+        !survivesTerminalSourceIssue(row.action.cause)
+      ) {
+        const closed = await closeRecoveryActionsForTerminalSourceIssue(db, {
+          companyId: row.action.companyId,
+          sourceIssueId: row.action.sourceIssueId,
+          sourceStatus: issue.status,
+          actionId: row.action.id,
+        });
+        if (closed.length > 0) {
+          result.resolved += 1;
+          result.issueIds.push(issue.id);
+        }
+        continue;
+      }
       const action = await rerouteUnavailableRecoveryCoordinator(row.action);
       const coordinatorRouted = isCoordinatorRoutedRecoveryAction(action);
       // The coordinator wake does not take the source execution lock, so it
@@ -3869,6 +3927,7 @@ export function recoveryService(
       kind: action.kind,
       cause: action.cause,
       requestedOwnerType: "board",
+      sourceIssueId: action.sourceIssueId,
       sourceAgentId: action.returnOwnerAgentId ?? action.previousOwnerAgentId ?? null,
       now,
     });
