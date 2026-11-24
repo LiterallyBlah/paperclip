@@ -198,7 +198,7 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
         await release({ companyId: run.companyId, runId: run.id, now: new Date(), ...options });
       });
       // Leave promoted runs queued; dispatch is outside this boundary.
-      deps.getAgent.mockResolvedValue(null);
+      deps.getAgent.mockResolvedValue(null as never); // runtime returns null for a missing agent; the inferred type omits it
     }
     // The holder ended, then lost its lock without draining the queue: a
     // status change cleared it mid-run, or a sweep terminalized it.
