@@ -3,8 +3,9 @@ import type { PluginTaskCredentialWritebackBinding } from "./plugin-task-credent
 import { OPENROUTER_ATTRIBUTION_HEADERS, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import { createHash } from "node:crypto";
 import { HttpError, unprocessable } from "../errors.js";
-import { mkdtemp, mkdir, writeFile, readFile, realpath, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, realpath } from "node:fs/promises";
 import { AI_HOME_BINDING_MARKER } from "@paperclipai/adapter-utils/agent-isolation";
+import { removeManagedHome } from "./managed-home-removal.js";
 import os from "node:os";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
@@ -476,7 +477,7 @@ export async function prepareManagedAiRuntime(
     let removalOnly = false;
     let deferredWriteback: { cause: unknown } | undefined;
     const removeHome = async () => {
-      if (home) await rm(home, { recursive: true, force: true });
+      if (home) await removeManagedHome(home);
       homeRemoved = true;
       releaseCredentialHome?.();
     };
@@ -667,7 +668,7 @@ export async function prepareManagedAiRuntime(
       cleanup: cleanupRuntime,
     };
   } catch (error) {
-    if (home) await rm(home, { recursive: true, force: true });
+    if (home) await removeManagedHome(home);
     releaseCredentialHome?.();
     throw error;
   }
