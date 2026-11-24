@@ -15,6 +15,7 @@ import {
   activityLog,
   agents,
   companies,
+  companyMemberships,
   companySecretBindings,
   companySecretProposals,
   companySecretProviderConfigs,
@@ -25,6 +26,7 @@ import {
   issueComments,
   issueThreadInteractions,
   issues,
+  principalPermissionGrants,
   userSecretDeclarations,
   userSecretDefinitions,
 } from "@paperclipai/db";
@@ -35,7 +37,9 @@ import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provid
 import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import { accessService } from "../services/access.js";
 import { agentService } from "../services/agents.js";
+import { authorizationService } from "../services/authorization.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { secretService } from "../services/secrets.js";
 import {
@@ -75,6 +79,8 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     await db.delete(userSecretDefinitions);
     await db.delete(companySecretProviderConfigs);
     await db.delete(issues);
+    await db.delete(principalPermissionGrants);
+    await db.delete(companyMemberships);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -824,6 +830,58 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     const history = await db.select().from(activityLog);
     expect(history.filter(row => row.action === "secret.created")).toHaveLength(1);
     expect(history.filter(row => row.action === "secret.proposal.approved")).toHaveLength(2);
+  });
+
+  it("keeps the unrelated binding id and its rotate_bound grant when a binding proposal is approved", async () => {
+    const fixture = await seedRun();
+    const agentApp = createAgentApp(fixture);
+    const boardApp = createBoardApp(fixture);
+    const existingSecret = await secretService(db).create(fixture.companyId, {
+      key: "existing_token",
+      name: "dev/existing/token",
+      provider: "local_encrypted",
+      value: "existing-dummy-value",
+    });
+    await agentService(db).update(fixture.agentId, {
+      adapterConfig: { env: { EXISTING_TOKEN: { type: "secret_ref", secretId: existingSecret.id, version: "latest" } } },
+    });
+    const [existingBinding] = await db.select().from(companySecretBindings)
+      .where(eq(companySecretBindings.configPath, "env.EXISTING_TOKEN"));
+    expect(existingBinding).toBeTruthy();
+    await accessService(db).ensureMembership(fixture.companyId, "agent", fixture.agentId, "member", "active");
+    await accessService(db).setPrincipalPermission(
+      fixture.companyId,
+      "agent",
+      fixture.agentId,
+      "secrets:rotate_bound",
+      true,
+      "board-user",
+      { secretId: existingSecret.id, bindingId: existingBinding.id },
+    );
+
+    const secret = await request(agentApp).post("/api/agents/me/secret-proposals").send({
+      kind: "secret", name: "dev/added/token", value: "added-dummy-value", justification: "Needed by task",
+    });
+    const binding = await request(agentApp).post("/api/agents/me/secret-proposals").send({
+      kind: "binding", secretProposalId: secret.body.id, configPath: "env.ADDED_TOKEN", justification: "Bind it",
+    });
+    expect(binding.status).toBe(201);
+    const approved = await request(boardApp)
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${binding.body.id}/approve`)
+      .send({ cascade: true });
+    expect(approved.status).toBe(200);
+
+    const bindings = await db.select().from(companySecretBindings)
+      .where(eq(companySecretBindings.targetId, fixture.agentId));
+    expect(bindings.map((row) => row.configPath).sort()).toEqual(["env.ADDED_TOKEN", "env.EXISTING_TOKEN"]);
+    expect(bindings.find((row) => row.configPath === "env.EXISTING_TOKEN")?.id).toBe(existingBinding.id);
+    const decision = await authorizationService(db).decideBoundSecretRotation({
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      secretId: existingSecret.id,
+      bindingId: existingBinding.id,
+    });
+    expect(decision).toMatchObject({ allowed: true, reason: "allow_explicit_grant" });
   });
 
   it("approves a binding without cascade after its secret proposal was approved separately", async () => {
