@@ -679,6 +679,9 @@ export const resolveIssueRecoveryActionSchema = z
       // A stopped pending stage that its own automatic no-replay settlement
       // blocked keeps `blocked`; the route proves that projection (BLA-4186).
       if (value.executionReconciliation && value.sourceIssueStatus === "blocked") return;
+      // BLA-4737: a cancelled task's retained no-replay hold settles as a
+      // record only; the route proves the unchanged status and settled hold.
+      if (value.executionReconciliation && value.sourceIssueStatus === "cancelled") return;
       if (
         value.sourceIssueStatus !== "todo" &&
         value.sourceIssueStatus !== "done" &&

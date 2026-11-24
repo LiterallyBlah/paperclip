@@ -1,6 +1,6 @@
 {
-  "inputSha256": "5e2b012b50bb8b198384da4f5427c27acd948af405f89cde15bfa48bb10c0ad4",
-  "outputSha256": "2360d5e93876ce3cb6e810257d92d669ac2b109027b0e01af36f2048861648c0",
-  "patchSha256": "024c83574cedd67700979c11a36eb89a135fe22f90ac9890c28aaa059418e0a6",
-  "basis": "Generated with the trusted master lockfile refresh. Review this offline correction and its hashes with the dependency changes."
+  "inputSha256": "ddd109cc8f2cd19f1433acd330e37e8bc4fe04c36502825bb0a15c61bd0cdd01",
+  "outputSha256": "d2865e7066afd93c35ad9d7785721a4c8b2b25a6ea246df8154d054fb5c99c29",
+  "patchSha256": "42b7549261fa948209898ab0186bbc40c56b5aab2d69d2892bb3374d5f678dae",
+  "basis": "Re-pinned for BLA-4810 to the fork lock from merge e2089bd71 (upstream v2026.1117.0 reviewed lock plus the reviewed Muse Code workspace links). The correction restores upstream's opencode-ai cpu metadata dropped by that merge's conflict resolution."
 }
