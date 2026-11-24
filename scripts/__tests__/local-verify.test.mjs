@@ -22,7 +22,8 @@ function fixture(t) {
     cpSync(path.join(repository, directory), path.join(root, directory), { recursive: true });
   }
   for (const file of ["scripts/local-verify.mjs", "scripts/run-vitest-stable.mjs", "scripts/general-server-shard.mjs",
-    "scripts/test-line-shard.mjs", "scripts/ci-profile/record.mjs", "turbo.json", ".github/ci-task-matrix.json"]) {
+    "scripts/test-line-shard.mjs", "scripts/ci-profile/record.mjs", "tests/helpers/remove-test-home.ts", "turbo.json",
+    ".github/ci-task-matrix.json"]) {
     write(file, readFileSync(path.join(repository, file), "utf8"));
   }
   for (const directory of ["server/src/__tests__", "server/scripts"]) mkdirSync(path.join(root, directory), { recursive: true });
