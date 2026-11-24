@@ -415,9 +415,9 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
   // the receipt and its audit row commit together.
   router.post(
     "/instance/heartbeat-runs/:runId/administrative-stop-reconciliation",
+    (req, _res, next) => { assertCanManageInstanceSettings(req); next(); },
     validate(administrativeStopReconciliationBodySchema),
     async (req, res) => {
-      assertCanManageInstanceSettings(req);
       const runId = req.params.runId as string;
       if (!UUID_PATTERN.test(runId)) throw new HttpError(404, "Run not found");
       const runIdLower = runId.toLowerCase();

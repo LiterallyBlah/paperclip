@@ -10,6 +10,7 @@ import { errorHandler } from "../middleware/error-handler.js";
 import { instanceSettingsRoutes } from "../routes/instance-settings.js";
 import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
 import {
+  createHostProcessCheck,
   defaultHostProcessCheck,
   isAdministrativelyReconciledStop,
   recordAdministrativeStopReconciliation,
@@ -186,6 +187,11 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await defaultHostProcessCheck({ from: STARTED, to: new Date(FINISHED.getTime() + 600_000) })).toBe("clear");
   });
 
+  it("host check fails closed when a live process has no readable start time", async () => {
+    const check = createHostProcessCheck(async () => null);
+    expect(await check({ from: STARTED, to: new Date(FINISHED.getTime() + 600_000) })).toBe("unavailable");
+  });
+
   it.each([
     ["later launch event", async (id: string) => event(id, PROCESS_START_REQUESTED)],
     ["later provider event", async (id: string) => event(id, "lifecycle", randomUUID())],
@@ -260,6 +266,13 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(res.status).toBe(403);
       expect((await read(run.id)).resultJson?.administrativeStopReconciliation).toBeUndefined();
       expect(await agentExecutionsHaveStopped(db, [agentId])).toBe(false);
+    });
+
+    it("checks authorisation before the body, so a non-admin with a bad body gets 403", async () => {
+      const run = await historicalShape();
+      const res = await request(app({ type: "agent", agentId: randomUUID(), companyId: randomUUID(), source: "agent_key" }))
+        .post(path(run.id)).send({});
+      expect(res.status).toBe(403);
     });
 
     it("lets an instance admin reconcile once, with an activity entry", async () => {

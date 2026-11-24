@@ -34,27 +34,36 @@ export type HostProcessCheck = (window: { from: Date; to: Date }) => Promise<"cl
  * Any failure other than a process vanishing mid-scan reports "unavailable",
  * and the writer then refuses.
  */
-export const defaultHostProcessCheck: HostProcessCheck = async ({ from, to }) => {
-  if (process.platform !== "linux" || typeof process.getuid !== "function") return "unavailable";
-  const uid = process.getuid();
-  let entries: string[];
-  try { entries = await readdir("/proc"); } catch { return "unavailable"; }
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry)) continue;
-    const pid = Number(entry);
-    try {
-      if ((await stat(`/proc/${entry}`)).uid !== uid) continue;
-      const startedAt = Date.parse(await readProcessStartedAt(pid));
-      if (!Number.isFinite(startedAt)) return "unavailable";
-      if (startedAt >= from.getTime() && startedAt <= to.getTime()) return "found";
-    } catch {
-      // A process that exited during the scan is not alive; any other failure is.
-      if (!await stat(`/proc/${entry}`).then(() => true, () => false)) continue;
-      return "unavailable";
+export function createHostProcessCheck(
+  readStartedAt: (pid: number) => Promise<string | null> = readProcessStartedAt,
+): HostProcessCheck {
+  return async ({ from, to }) => {
+    if (process.platform !== "linux" || typeof process.getuid !== "function") return "unavailable";
+    const uid = process.getuid();
+    let entries: string[];
+    try { entries = await readdir("/proc"); } catch { return "unavailable"; }
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      try {
+        if ((await stat(`/proc/${entry}`)).uid !== uid) continue;
+        const startedAtText = await readStartedAt(pid);
+        // No start time for a process that still exists: fail closed.
+        if (startedAtText === null) return "unavailable";
+        const startedAt = Date.parse(startedAtText);
+        if (!Number.isFinite(startedAt)) return "unavailable";
+        if (startedAt >= from.getTime() && startedAt <= to.getTime()) return "found";
+      } catch {
+        // A process that exited during the scan is not alive; any other failure is.
+        if (!await stat(`/proc/${entry}`).then(() => true, () => false)) continue;
+        return "unavailable";
+      }
     }
-  }
-  return "clear";
-};
+    return "clear";
+  };
+}
+
+export const defaultHostProcessCheck: HostProcessCheck = createHostProcessCheck();
 
 export type AdministrativeStopReconciliationInput = {
   runId: string;
