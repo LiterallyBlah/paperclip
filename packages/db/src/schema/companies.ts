@@ -16,6 +16,11 @@ export const companies = pgTable(
     spendMonthUtc: text("spend_month_utc"),
     spentMonthlyCents: numeric("spent_monthly_cents", { precision: 24, scale: 7, mode: "number" }).notNull().default(0),
     defaultResponsibleUserId: text("default_responsible_user_id"),
+    // Agent that owns routine recovery actions instead of the board. When null,
+    // the company's single active root CEO agent is used. No foreign key: the
+    // agents table already references companies, and the resolver validates
+    // company membership and status on every read.
+    recoveryCoordinatorAgentId: uuid("recovery_coordinator_agent_id"),
     requireBoardApprovalForNewAgents: boolean("require_board_approval_for_new_agents")
       .notNull()
       .default(false),

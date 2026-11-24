@@ -224,6 +224,7 @@ import { buildIssueChanges } from "./issue-change-receipt.js";
 import { ensurePersonalPrivateProject } from "./projects.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import { isOperatorHeldRecoveryAction } from "./recovery/recovery-owner-routing.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -4119,6 +4120,7 @@ async function listIssueBlockerAttentionMap(
       ownerType: string;
       ownerAgentId: string | null;
       ownerUserId: string | null;
+      evidence: Record<string, unknown> | null;
     }> = await dbOrTx
       .select({
         id: issueRecoveryActions.id,
@@ -4127,6 +4129,7 @@ async function listIssueBlockerAttentionMap(
         ownerType: issueRecoveryActions.ownerType,
         ownerAgentId: issueRecoveryActions.ownerAgentId,
         ownerUserId: issueRecoveryActions.ownerUserId,
+        evidence: issueRecoveryActions.evidence,
       })
       .from(issueRecoveryActions)
       .where(
@@ -4191,7 +4194,7 @@ async function listIssueBlockerAttentionMap(
     }
     for (const row of recoveryActionRows) {
       const healthy =
-        (row.status === "escalated" && row.ownerType === "board") ||
+        (row.status === "escalated" && isOperatorHeldRecoveryAction(row)) ||
         Boolean(row.ownerUserId) ||
         (Boolean(row.ownerAgentId) && liveRecoveryActionIds.has(row.id));
       if (healthy) explicitWaitingIssueIds.add(row.sourceIssueId);

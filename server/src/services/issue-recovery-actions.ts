@@ -13,6 +13,13 @@ import type {
 } from "@paperclipai/shared";
 
 import { isNativeWorkspaceFinalizationOperationActive } from "./workspace-operations.js";
+import {
+  carryRecoveryCoordinatorDelivery,
+  isCoordinatorRoutedRecoveryAction,
+  RECOVERY_OWNER_ROUTING_EVIDENCE_KEY,
+  resolveRecoveryOwner,
+  type ResolvedRecoveryOwner,
+} from "./recovery/recovery-owner-routing.js";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
@@ -275,9 +282,47 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     return upsertSourceScopedUnlocked(input, retryCount + 1);
   }
 
+  function routingEvidence(
+    owner: ResolvedRecoveryOwner,
+    previousEvidence?: Record<string, unknown> | null,
+  ) {
+    return owner.routing
+      ? { [RECOVERY_OWNER_ROUTING_EVIDENCE_KEY]: carryRecoveryCoordinatorDelivery(previousEvidence, owner.routing) }
+      : {};
+  }
+
+  // The single routing point for every source-scoped creation, in-place
+  // update and budget exhaustion. Sites keep writing their historical owner
+  // (usually "board"); the resolver decides whether a routine kind goes to the
+  // company's recovery coordinator agent instead.
+  function routeOwner(
+    input: {
+      companyId: string;
+      kind: string;
+      cause: string;
+      returnOwnerAgentId?: string | null;
+      previousOwnerAgentId?: string | null;
+    },
+    ownerType: IssueRecoveryActionOwnerType,
+    ownerAgentId: string | null | undefined,
+    ownerUserId: string | null | undefined,
+    now: Date,
+  ) {
+    return resolveRecoveryOwner(db, {
+      companyId: input.companyId,
+      kind: input.kind,
+      cause: input.cause,
+      requestedOwnerType: ownerType,
+      requestedOwnerAgentId: ownerAgentId ?? null,
+      requestedOwnerUserId: ownerUserId ?? null,
+      sourceAgentId: input.returnOwnerAgentId ?? input.previousOwnerAgentId ?? null,
+      now,
+    });
+  }
+
   function buildInsertValues(
     input: UpsertIssueRecoveryActionInput,
-    ownerType: IssueRecoveryActionOwnerType,
+    owner: ResolvedRecoveryOwner,
     now: Date,
   ) {
     return {
@@ -286,9 +331,9 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       recoveryIssueId: input.recoveryIssueId ?? null,
       kind: input.kind,
       status: "active" as const,
-      ownerType,
-      ownerAgentId: input.ownerAgentId ?? null,
-      ownerUserId: input.ownerUserId ?? null,
+      ownerType: owner.ownerType,
+      ownerAgentId: owner.ownerAgentId,
+      ownerUserId: owner.ownerUserId,
       previousOwnerAgentId: input.previousOwnerAgentId ?? null,
       returnOwnerAgentId: input.returnOwnerAgentId ?? null,
       cause: input.cause,
@@ -296,6 +341,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       evidence: {
         ...(input.evidence ?? {}),
         ...(input.evidenceOnCreate ?? {}),
+        ...routingEvidence(owner),
       },
       nextAction: input.nextAction,
       wakePolicy: input.wakePolicy ?? null,
@@ -314,7 +360,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   async function supersedePriorAndInsert(
     input: UpsertIssueRecoveryActionInput,
     priorActionId: string,
-    ownerType: IssueRecoveryActionOwnerType,
+    owner: ResolvedRecoveryOwner,
     now: Date,
     retryCount: number,
   ): Promise<IssueRecoveryAction> {
@@ -343,7 +389,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         if (!superseded) return null;
         const [row] = await tx
           .insert(issueRecoveryActions)
-          .values(buildInsertValues(input, ownerType, now))
+          .values(buildInsertValues(input, owner, now))
           .returning();
         return row ?? null;
       });
@@ -370,7 +416,8 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         input.supersedeOnIdentityChange &&
         (existing.cause !== input.cause || existing.fingerprint !== input.fingerprint)
       ) {
-        return supersedePriorAndInsert(input, existing.id, ownerType, now, retryCount);
+        const owner = await routeOwner(input, ownerType, input.ownerAgentId, input.ownerUserId, now);
+        return supersedePriorAndInsert(input, existing.id, owner, now, retryCount);
       }
       // `maxAttempts` is an execution budget, not display metadata. Once the
       // same recovery identity consumes it, retain one inspectable board-owned
@@ -408,22 +455,35 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           existing.attemptCount,
           Math.min(nextAttemptCount, effectiveMaxAttempts),
         );
+        const exhaustedOwner = await routeOwner(
+          existing,
+          existing.ownerType === "system" || input.ownerType === "system" ? "system" : "board",
+          null,
+          null,
+          now,
+        );
+        // The coordinator is the recovery owner, never the source owner. Keep
+        // the source assignee recorded before coordinator routing.
+        const existingSourceOwnerAgentId = isCoordinatorRoutedRecoveryAction(existing)
+          ? null
+          : existing.ownerAgentId;
         const [exhausted] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx
           .update(issueRecoveryActions)
           .set({
             status: "escalated",
-            ownerType: existing.ownerType === "system" || input.ownerType === "system" ? "system" : "board",
-            ownerAgentId: null,
-            ownerUserId: null,
+            ownerType: exhaustedOwner.ownerType,
+            ownerAgentId: exhaustedOwner.ownerAgentId,
+            ownerUserId: exhaustedOwner.ownerUserId,
             previousOwnerAgentId:
-              existing.ownerAgentId ?? existing.previousOwnerAgentId,
+              existingSourceOwnerAgentId ?? existing.previousOwnerAgentId,
             returnOwnerAgentId:
               input.returnOwnerAgentId ??
               existing.returnOwnerAgentId ??
-              existing.ownerAgentId,
+              existingSourceOwnerAgentId,
             evidence: {
               ...(existing.evidence ?? {}),
               ...(input.evidence ?? {}),
+              ...routingEvidence(exhaustedOwner, existing.evidence),
               recoveryBudget: {
                 state: "exhausted",
                 attemptsUsed,
@@ -462,6 +522,9 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         }
         return toReadModel(exhausted);
       }
+      const updatedOwner = input.preserveExistingOwner
+        ? null
+        : await routeOwner(input, ownerType, input.ownerAgentId, input.ownerUserId, now);
       const [updated] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx
         .update(issueRecoveryActions)
         .set({
@@ -470,13 +533,9 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
             : input.recoveryIssueId ?? null,
           kind: input.preserveExistingOwner ? existing.kind : input.kind,
           status: input.preserveExistingOwner ? existing.status : "active",
-          ownerType: input.preserveExistingOwner ? existing.ownerType : ownerType,
-          ownerAgentId: input.preserveExistingOwner
-            ? existing.ownerAgentId
-            : input.ownerAgentId ?? null,
-          ownerUserId: input.preserveExistingOwner
-            ? existing.ownerUserId
-            : input.ownerUserId ?? null,
+          ownerType: updatedOwner ? updatedOwner.ownerType : existing.ownerType,
+          ownerAgentId: updatedOwner ? updatedOwner.ownerAgentId : existing.ownerAgentId,
+          ownerUserId: updatedOwner ? updatedOwner.ownerUserId : existing.ownerUserId,
           previousOwnerAgentId: input.preserveExistingOwner
             ? existing.previousOwnerAgentId
             : input.previousOwnerAgentId ?? existing.previousOwnerAgentId,
@@ -490,7 +549,12 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
               ...(existing.evidence ?? {}),
               ...(input.evidence ?? {}),
             }
-            : input.evidence ?? existing.evidence,
+            : updatedOwner?.routing
+              ? {
+                ...(input.evidence ?? existing.evidence ?? {}),
+                ...routingEvidence(updatedOwner, existing.evidence),
+              }
+              : input.evidence ?? existing.evidence,
           nextAction: input.preserveExistingOwner ? existing.nextAction : input.nextAction,
           wakePolicy: input.preserveExistingOwner
             ? existing.wakePolicy
@@ -528,10 +592,11 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       return toReadModel(updated!);
     }
 
+    const createdOwner = await routeOwner(input, ownerType, input.ownerAgentId, input.ownerUserId, now);
     try {
       const [created] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx
         .insert(issueRecoveryActions)
-        .values(buildInsertValues(input, ownerType, now))
+        .values(buildInsertValues(input, createdOwner, now))
         .returning());
       return toReadModel(created!);
     } catch (error) {

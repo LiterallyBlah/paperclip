@@ -160,6 +160,19 @@ import {
 import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  carryRecoveryCoordinatorDelivery,
+  isAvailableRecoveryCoordinatorStatus,
+  isCoordinatorRoutedRecoveryAction,
+  isOrphanedCoordinatorRoutedRecoveryAction,
+  isOperatorHeldRecoveryAction,
+  readRecoveryOwnerRouting,
+  RECOVERY_COORDINATOR_REWAKE_MS,
+  RECOVERY_COORDINATOR_WAKE_REASON,
+  RECOVERY_OWNER_ROUTING_EVIDENCE_KEY,
+  resolveRecoveryOwner,
+  type RecoveryOwnerRoutingEvidence,
+} from "./recovery-owner-routing.js";
+import {
   collectDispositionRepairSourceState,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
@@ -3530,6 +3543,145 @@ export function recoveryService(
     return Boolean(run || wake);
   }
 
+  /**
+   * Give a coordinator-owned recovery action an accountable next step: one
+   * source-scoped recovery wake for the coordinator agent. The wake uses the
+   * existing `source_scoped_recovery_action` path, which admits only the
+   * action's own owner agent and never takes the source execution lock. At
+   * most one wake is outstanding per action; a finished wake is repeated no
+   * more often than {@link RECOVERY_COORDINATOR_REWAKE_MS}.
+   */
+  async function ensureRecoveryCoordinatorWake(
+    action: typeof issueRecoveryActions.$inferSelect,
+    now = new Date(),
+  ) {
+    if (!isCoordinatorRoutedRecoveryAction(action) || !action.ownerAgentId) return null;
+    const routing = readRecoveryOwnerRouting(action.evidence);
+    if (routing?.coordinator !== "assigned") return null;
+    const latest = await latestRecoveryActionRun(action);
+    if (
+      latest &&
+      latest.agentId === action.ownerAgentId &&
+      (EXECUTION_PATH_HEARTBEAT_RUN_STATUSES as readonly string[]).includes(latest.status)
+    ) {
+      return null;
+    }
+    const lastQueuedAt = typeof routing.wakeQueuedAt === "string" ? Date.parse(routing.wakeQueuedAt) : NaN;
+    if (Number.isFinite(lastQueuedAt) && now.getTime() - lastQueuedAt < RECOVERY_COORDINATOR_REWAKE_MS) {
+      return null;
+    }
+    const coordinatorAgent = await getAgent(action.ownerAgentId);
+    if (!coordinatorAgent || !isAvailableRecoveryCoordinatorStatus(coordinatorAgent.status)) return null;
+    const context = {
+      issueId: action.sourceIssueId,
+      taskId: action.sourceIssueId,
+      wakeReason: "source_scoped_recovery_action",
+      recoveryActionId: action.id,
+      recoveryCause: action.cause,
+      recoveryKind: action.kind,
+      recoveryOwnerRole: "coordinator",
+      source: RECOVERY_COORDINATOR_WAKE_REASON,
+    };
+    const queued = await deps.enqueueWakeup(action.ownerAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "source_scoped_recovery_action",
+      payload: withRecoveryContext({ ...context }, "normal_model"),
+      idempotencyKey: `${RECOVERY_COORDINATOR_WAKE_REASON}:${action.id}:${action.attemptCount}:${Math.floor(now.getTime() / RECOVERY_COORDINATOR_REWAKE_MS)}`,
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      contextSnapshot: withRecoveryContext({ ...context }, "normal_model"),
+    });
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        evidence: {
+          ...(action.evidence ?? {}),
+          [RECOVERY_OWNER_ROUTING_EVIDENCE_KEY]: {
+            ...routing,
+            wakeQueuedAt: now.toISOString(),
+            wakeRunId: queued?.id ?? null,
+          },
+        },
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueRecoveryActions.id, action.id),
+        eq(issueRecoveryActions.companyId, action.companyId),
+        eq(issueRecoveryActions.ownerAgentId, action.ownerAgentId),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      ));
+    return queued;
+  }
+
+  /**
+   * A coordinator-routed action whose coordinator has since been paused,
+   * terminated or removed must not stay with that agent. Re-resolve it
+   * through the shared resolver: another available coordinator takes it,
+   * otherwise the board takes it back with `coordinator: "unavailable"`
+   * evidence. Only the owner and routing evidence change; the source
+   * assignee, counters, wake and monitor policies are kept.
+   */
+  async function rerouteUnavailableRecoveryCoordinator(
+    action: typeof issueRecoveryActions.$inferSelect,
+    now = new Date(),
+  ) {
+    const orphaned = isOrphanedCoordinatorRoutedRecoveryAction(action);
+    if (!orphaned && (!isCoordinatorRoutedRecoveryAction(action) || !action.ownerAgentId)) return action;
+    const previousRouting = readRecoveryOwnerRouting(action.evidence);
+    const previousCoordinatorAgentId = action.ownerAgentId
+      ?? (previousRouting?.coordinator === "assigned" ? previousRouting.agentId : undefined);
+    const coordinatorAgent = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
+    if (
+      !orphaned &&
+      coordinatorAgent &&
+      coordinatorAgent.companyId === action.companyId &&
+      isAvailableRecoveryCoordinatorStatus(coordinatorAgent.status)
+    ) {
+      return action;
+    }
+    const unavailableReason = coordinatorAgent && coordinatorAgent.companyId === action.companyId
+      ? `assigned_coordinator_${coordinatorAgent.status}`
+      : "assigned_coordinator_not_found";
+    const resolved = await resolveRecoveryOwner(db, {
+      companyId: action.companyId,
+      kind: action.kind,
+      cause: action.cause,
+      requestedOwnerType: "board",
+      sourceAgentId: action.returnOwnerAgentId ?? action.previousOwnerAgentId ?? null,
+      now,
+    });
+    const toCoordinator = resolved.ownerType === "agent" && resolved.routing?.coordinator === "assigned";
+    const routing: RecoveryOwnerRoutingEvidence = toCoordinator
+      ? resolved.routing!
+      : {
+        coordinator: "unavailable",
+        reason: resolved.routing?.coordinator === "unavailable" ? resolved.routing.reason : unavailableReason,
+        routedAt: now.toISOString(),
+        previousCoordinatorAgentId,
+      };
+    const [updated] = await db
+      .update(issueRecoveryActions)
+      .set({
+        ownerType: toCoordinator ? "agent" : "board",
+        ownerAgentId: toCoordinator ? resolved.ownerAgentId : null,
+        ownerUserId: null,
+        evidence: { ...(action.evidence ?? {}), [RECOVERY_OWNER_ROUTING_EVIDENCE_KEY]: routing },
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueRecoveryActions.id, action.id),
+        eq(issueRecoveryActions.companyId, action.companyId),
+        eq(issueRecoveryActions.ownerType, "agent"),
+        action.ownerAgentId
+          ? eq(issueRecoveryActions.ownerAgentId, action.ownerAgentId)
+          : isNull(issueRecoveryActions.ownerAgentId),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      ))
+      .returning();
+    return updated ?? action;
+  }
+
   async function reconcileActiveRecoveryActions() {
     const rows = await db
       .select({ action: issueRecoveryActions, issue: issues })
@@ -3550,7 +3702,15 @@ export function recoveryService(
       skipped: 0,
       issueIds: [] as string[],
     };
-    for (const { action, issue } of rows) {
+    for (const row of rows) {
+      const { issue } = row;
+      const action = await rerouteUnavailableRecoveryCoordinator(row.action);
+      const coordinatorRouted = isCoordinatorRoutedRecoveryAction(action);
+      // The coordinator wake does not take the source execution lock, so it
+      // is safe even while a native finalization owner is still unverified.
+      if (coordinatorRouted && issue.status !== "done" && issue.status !== "cancelled") {
+        await ensureRecoveryCoordinatorWake(action);
+      }
       if (await hasUnverifiedNativeWorkspaceFinalizationOwner(db, action)) {
         result.skipped += 1;
         continue;
@@ -3560,7 +3720,8 @@ export function recoveryService(
       if (
         wakePolicyType !== "bounded_recovery_owner" &&
         wakePolicyType !== "bounded_owner_disposition_repair" &&
-        action.ownerType !== "board"
+        action.ownerType !== "board" &&
+        !coordinatorRouted
       ) {
         continue;
       }
@@ -3599,8 +3760,10 @@ export function recoveryService(
           healthyOpenChildIssues(issue),
           sourceHasNewPathOutsideRecoveryAction(action),
         ]);
+      // A coordinator-routed hold keeps board-hold semantics: a durable waiting
+      // path alone does not settle it.
       const durablePathRestored =
-        action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
+        action.ownerType !== "board" && !coordinatorRouted && sourceState.hasDurableWaitingPath;
       if (
         durablePathRestored ||
         healthyChildren.length > 0 ||
@@ -3676,7 +3839,7 @@ export function recoveryService(
         continue;
       }
 
-      if (action.ownerType === "board") continue;
+      if (action.ownerType === "board" || coordinatorRouted) continue;
 
       // Legacy takeover actions remain readable and resolvable, but recovery no
       // longer schedules another agent-owned wake for them.
@@ -3701,16 +3864,32 @@ export function recoveryService(
       legacyEpisode: input.legacyEpisode,
     });
     const now = new Date();
+    const escalationOwner = await resolveRecoveryOwner(db, {
+      companyId: input.issue.companyId,
+      kind: action.kind,
+      cause: action.cause,
+      requestedOwnerType: "board",
+      sourceAgentId: action.returnOwnerAgentId ?? action.previousOwnerAgentId ?? null,
+      now,
+    });
     await db
       .update(issueRecoveryActions)
       .set({
         status: "active",
-        ownerType: "board",
-        ownerAgentId: null,
-        ownerUserId: null,
+        ownerType: escalationOwner.ownerType,
+        ownerAgentId: escalationOwner.ownerAgentId,
+        ownerUserId: escalationOwner.ownerUserId,
         maxAttempts: null,
         evidence: {
           ...action.evidence,
+          ...(escalationOwner.routing
+            ? {
+              [RECOVERY_OWNER_ROUTING_EVIDENCE_KEY]: carryRecoveryCoordinatorDelivery(
+                action.evidence,
+                escalationOwner.routing,
+              ),
+            }
+            : {}),
           latestRunId: input.latestRun?.id ?? null,
           latestRunStatus: input.latestRun?.status ?? null,
           latestRunErrorCode: input.latestRun?.errorCode ?? null,
@@ -3752,7 +3931,7 @@ export function recoveryService(
         "",
         `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
         `- Terminal reason: \`${input.terminalReason}\``,
-        "- Recovery owner: board",
+        `- Recovery owner: ${escalationOwner.ownerType === "agent" ? "recovery coordinator agent" : "board"}`,
         "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
         "",
         "Next action: repair the liveness disposition or request an explicit source-owner decision.",
@@ -3802,8 +3981,8 @@ export function recoveryService(
         maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
         terminalReason: input.terminalReason,
         recoveryActionId: action.id,
-        recoveryOwnerAgentId: null,
-        recoveryOwnerType: "board",
+        recoveryOwnerAgentId: escalationOwner.ownerAgentId,
+        recoveryOwnerType: escalationOwner.ownerType,
         routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
         sourceAssigneeBefore: {
           agentId: input.issue.assigneeAgentId,
@@ -4844,7 +5023,7 @@ export function recoveryService(
         issue.companyId,
         issue.id,
       );
-      if (activeRecoveryAction?.ownerType === "board") {
+      if (activeRecoveryAction && isOperatorHeldRecoveryAction(activeRecoveryAction)) {
         result.skipped += 1;
         continue;
       }

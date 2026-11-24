@@ -1488,6 +1488,10 @@ async function startServerWithDatabaseTeardown(
         keyDurable: config.storageProvider !== "s3" || Boolean(process.env.PAPERCLIP_SECRETS_MASTER_KEY?.trim()),
       } : undefined,
       workspaceReaperCooldownDays: config.workspaceReaperCooldownDays,
+      isolatedCopyReclaim: {
+        enabled: config.isolatedCopyReclaimEnabled,
+        dryRun: config.isolatedCopyReclaimDryRun,
+      },
       workspaceCompactionDelayMs: config.workspaceCompactionDelayHours === null
         ? null
         : config.workspaceCompactionDelayHours * 60 * 60 * 1000,
