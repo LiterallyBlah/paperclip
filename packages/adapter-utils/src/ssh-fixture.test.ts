@@ -729,23 +729,27 @@ describe("ssh env-lab fixture", () => {
   it("clears stale files when plain SSH preparation is retried", async () => {
     const rootDir = await createFixtureRootDir();
     const localDir = path.join(rootDir, "plain-local");
+    await mkdir(path.join(localDir, "ignored-cache"), { recursive: true });
     await mkdir(path.join(localDir, "node_modules"), { recursive: true });
     await git(localDir, ["init"]);
-    await writeFile(path.join(localDir, ".gitignore"), "node_modules/\n");
+    await writeFile(path.join(localDir, ".gitignore"), "ignored-cache/\nnode_modules/\n");
     await writeFile(path.join(localDir, "removed.txt"), "remove on retry");
     const binary = Buffer.from([0, 255, 1]);
-    await writeFile(path.join(localDir, "node_modules", "personal.bin"), binary);
+    await writeFile(path.join(localDir, "ignored-cache", "personal.bin"), binary);
+    await writeFile(path.join(localDir, "node_modules", "dep.js"), "local only");
     const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH plain retry");
     if (!started) return;
     const config = await buildSshEnvLabFixtureConfig(started);
     const input = { spec: { ...config, remoteCwd: started.workspaceDir }, localDir,
       remoteDir: started.workspaceDir, workspaceFileMode: "all" as const };
     expect(await prepareWorkspaceForSshExecution(input)).toEqual({ gitBacked: false });
-    expect(await readFile(path.join(started.workspaceDir, "node_modules", "personal.bin"))).toEqual(binary);
+    expect(await readFile(path.join(started.workspaceDir, "ignored-cache", "personal.bin"))).toEqual(binary);
+    await expect(stat(path.join(started.workspaceDir, "node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
     await rm(path.join(localDir, "removed.txt"));
     await prepareWorkspaceForSshExecution(input);
     await expect(stat(path.join(started.workspaceDir, "removed.txt"))).rejects.toMatchObject({ code: "ENOENT" });
-    expect(await readFile(path.join(started.workspaceDir, "node_modules", "personal.bin"))).toEqual(binary);
+    expect(await readFile(path.join(started.workspaceDir, "ignored-cache", "personal.bin"))).toEqual(binary);
+    await expect(stat(path.join(started.workspaceDir, "node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("round-trips a git workspace through the SSH fixture", async () => {
