@@ -8176,6 +8176,83 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("routes exhausted source-owner repair to the recovery coordinator with a coordinator wake", async () => {
+    const { companyId, agentId, runId, issueId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+      });
+    const coordinatorId = randomUUID();
+    await db.insert(agents).values(recoveryAgentRow(coordinatorId, companyId, "Coordinator", "ceo", "idle"));
+    await db.update(agents).set({ reportsTo: coordinatorId }).where(eq(agents.id, agentId));
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    const state = await collectDispositionRepairSourceState(db, { issue: sourceIssue });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_disposition_repair",
+          retryReason: "issue_disposition_repair",
+          dispositionRepairFingerprint: state.fingerprint,
+          dispositionRepairAttempt: 5,
+          dispositionRepairMaxAttempts: 5,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(result).toMatchObject({ dispositionRepairRequeued: 0, escalated: 1 });
+
+    const [sourceAfter, action, coordinatorWakes, sourceAttemptSix] = await Promise.all([
+      selectRecoveryIssueById(issueId),
+      selectRecoveryActionForIssue(companyId, issueId),
+      db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.agentId, coordinatorId),
+      )),
+      db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.agentId, agentId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'dispositionRepairAttempt' = '6'`,
+      )),
+    ]);
+    expect(sourceAfter).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+    expect(action).toMatchObject({
+      kind: "deliberate_wait_without_target",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: coordinatorId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      maxAttempts: null,
+      resolutionNote: "unchanged_source_state_exhausted",
+      evidence: expect.objectContaining({
+        recoveryOwnerRouting: expect.objectContaining({ coordinator: "assigned", agentId: coordinatorId }),
+      }),
+    });
+    expect(coordinatorWakes).toHaveLength(1);
+    expect(coordinatorWakes[0]).toMatchObject({
+      reason: "source_scoped_recovery_action",
+      payload: expect.objectContaining({ issueId, recoveryActionId: action!.id }),
+    });
+    expect(sourceAttemptSix).toHaveLength(0);
+    const notices = await selectRecoveryCommentsForIssue(issueId);
+    const notice = notices.find(comment => comment.metadata?.recovery?.kind === "disposition_repair_escalated");
+    expect(notice?.body).toContain("Recovery owner: recovery coordinator agent");
+    const escalationActivity = await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, issueId),
+      eq(activityLog.action, "issue.disposition_repair_escalated"),
+    ));
+    expect(escalationActivity[0]!.details).toMatchObject({
+      recoveryOwnerType: "agent",
+      recoveryOwnerAgentId: coordinatorId,
+    });
+  });
+
   it("routes a non-invokable source owner to recovery without reassigning the source", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
