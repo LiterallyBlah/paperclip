@@ -1675,6 +1675,71 @@ describe("claude execute", () => {
     }
   });
 
+  it("classifies the structured five-hour usage-limit envelope (subtype=success, is_error=true) as provider quota", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-five-hour-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    // Sanitised shape of a recorded terminal result.
+    await writeFailingClaudeCommand(commandPath, {
+      resultEvent: {
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        num_turns: 1,
+        terminal_reason: "api_error",
+        api_error_status: 429,
+        api_error_origin: "first_party",
+        api_error: "usage_limit_reached",
+        result: "You've hit your 5-hour limit · resets 6:50pm (UTC)",
+        session_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+        modelUsage: {},
+      },
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-20T18:49:23.000Z"));
+
+    try {
+      const result = await execute({
+        runId: "run-claude-five-hour",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      const expectedRetryNotBefore = "2026-11-20T18:50:00.000Z";
+      expect(result.errorCode).toBe("provider_quota");
+      expect(result.errorFamily).toBe("provider_quota");
+      expect(result.retryNotBefore).toBe(expectedRetryNotBefore);
+      expect(result.resultJson?.errorFamily).toBe("provider_quota");
+      expect(result.resultJson?.retryNotBefore).toBe(expectedRetryNotBefore);
+      expect(result.resultJson?.providerQuotaRetryNotBefore).toBe(expectedRetryNotBefore);
+    } finally {
+      vi.useRealTimers();
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("treats subtype=success results as successful even when the process exits nonzero", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-success-subtype-"));
     const workspace = path.join(root, "workspace");
