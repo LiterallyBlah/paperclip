@@ -34,6 +34,9 @@ import {
 import { environmentService } from "../services/environments.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { assertBoard, assertBoardOrgAccess, getActorInfo } from "./authz.js";
+import { z } from "zod";
+import { HttpError } from "../errors.js";
+import { recordAdministrativeStopReconciliation } from "../services/administrative-stop-reconciliation.js";
 
 function sameJsonValue(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -121,6 +124,13 @@ function assertCanManageExperimentalSettings(req: Request) {
 // agree, and each response reports exactly the state its own request
 // produced.
 let taskDrainTransitionQueue: Promise<void> = Promise.resolve();
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const administrativeStopReconciliationBodySchema = z.object({
+  companyId: z.string().regex(UUID_PATTERN),
+  decisionRef: z.string().trim().min(1).max(200),
+  reason: z.string().trim().min(1).max(2000),
+}).strict();
 
 function withTaskDrainTransition<T>(run: () => Promise<T>): Promise<T> {
   const turn = trackIdleWork(taskDrainTransitionQueue.then(run));
@@ -415,6 +425,51 @@ export function instanceSettingsRoutes(
         return computed;
       });
       res.json(drain);
+    },
+  );
+
+  // Fork feature (BLA-4475): instance admins record an administrative stop
+  // reconciliation for one historical cancelled legacy run whose controller
+  // boot is gone. The service rechecks every premise in one guarded UPDATE;
+  // the receipt and its audit row commit together.
+  router.post(
+    "/instance/heartbeat-runs/:runId/administrative-stop-reconciliation",
+    (req, _res, next) => { assertCanManageInstanceSettings(req); next(); },
+    validate(administrativeStopReconciliationBodySchema),
+    async (req, res) => {
+      const runId = req.params.runId as string;
+      if (!UUID_PATTERN.test(runId)) throw new HttpError(404, "Run not found");
+      const runIdLower = runId.toLowerCase();
+      const companyId = (req.body.companyId as string).toLowerCase();
+      const actor = getActorInfo(req);
+      const publications: ActivityPublication[] = [];
+      const result = await db.transaction(async (tx) => {
+        const written = await recordAdministrativeStopReconciliation(tx as unknown as Db, {
+          runId: runIdLower, companyId,
+          reconciledByActor: { type: actor.actorType, id: actor.actorId },
+          decisionRef: req.body.decisionRef, reason: req.body.reason,
+        });
+        if (!written.ok) return written;
+        await logActivity(tx as unknown as Db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "heartbeat_run.administrative_stop_reconciled",
+          entityType: "heartbeat_run",
+          entityId: runIdLower,
+          details: { decisionRef: req.body.decisionRef, reason: req.body.reason, receipt: written.receipt },
+        }, publications);
+        return written;
+      });
+      if (!result.ok) {
+        if (result.reason === "not_found") throw new HttpError(404, "Run not found");
+        throw conflict("Run does not meet the administrative stop reconciliation premises", { code: result.reason });
+      }
+      publishActivitiesBestEffort(publications, "heartbeat_run.administrative_stop_reconciled");
+      res.json({ runId: runIdLower, receipt: result.receipt });
     },
   );
 

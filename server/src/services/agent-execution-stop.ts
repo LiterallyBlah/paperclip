@@ -6,6 +6,7 @@ import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { isSettledLegacyStartupCancellation } from "./legacy-startup-cancellation.js";
+import { isAdministrativelyReconciledStop } from "./administrative-stop-reconciliation.js";
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
@@ -60,7 +61,9 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
         !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id)) &&
         // Its own executor recorded that Stop won before adapter entry.
-        !await isSettledLegacyStartupCancellation(db, run)) return false;
+        !await isSettledLegacyStartupCancellation(db, run) &&
+        // An instance admin reconciled this one run; its controller boot is gone (BLA-4475).
+        !await isAdministrativelyReconciledStop(db, run)) return false;
   }
   // Release an expired owner only after its cancelled execution has stop proof.
   for (const coordinator of abandoned) {
