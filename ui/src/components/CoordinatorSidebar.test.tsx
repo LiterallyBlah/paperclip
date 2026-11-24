@@ -11,7 +11,7 @@ import { queryKeys } from "@/lib/queryKeys";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const fixture = vi.hoisted(() => ({ attention: vi.fn(), summary: vi.fn(), openNewIssue: vi.fn(), pathname: "/COO/issues", collapsed: false, userId: "reviewer", chats: [] as Array<{ isUnreadForMe: boolean }>,
-  recentTasks: [] as Array<Record<string, unknown>>, projects: [] as Array<Record<string, unknown>>, projectTasks: vi.fn(), enableCases: false, agents: [] as Agent[] }));
+  recentTasks: [] as Array<Record<string, unknown>>, projects: [] as Array<Record<string, unknown>>, projectTasks: vi.fn(), enableCases: false, enableStatusCards: false, enableGoalsSidebarLink: false, agents: [] as Agent[] }));
 vi.mock("@/hooks/useAgentChatNavigation", () => ({ useAgentChatNavigation: () => ({
   companyId: "company", userId: fixture.userId, agents: { data: fixture.agents }, chats: { data: fixture.chats }, session: { isSuccess: true },
 }) }));
@@ -20,7 +20,12 @@ vi.mock("@/api/issues", () => ({ issuesApi: { listCompact: fixture.projectTasks 
 vi.mock("@/context/DialogContext", () => ({ useDialogActions: () => ({ openNewIssue: fixture.openNewIssue }) }));
 vi.mock("@/context/SidebarContext", () => ({ useSidebar: () => ({ collapsed: fixture.collapsed, peeking: false, isMobile: false, setSidebarOpen: vi.fn() }) }));
 vi.mock("@/api/attention", () => ({ attentionApi: { list: fixture.attention, summary: fixture.summary } }));
-vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: async () => ({ enableCases: fixture.enableCases }) } }));
+vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: async () => ({ enableCases: fixture.enableCases, enableStatusCards: fixture.enableStatusCards, enableGoalsSidebarLink: fixture.enableGoalsSidebarLink }) } }));
+vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: "company", selectedCompany: { id: "company", issuePrefix: "COO" } }) }));
+vi.mock("@/plugins/slots", () => ({ PluginSlotOutlet: ({ slotTypes, context }: { slotTypes: string[]; context: Record<string, unknown> }) =>
+  <div data-testid="plugin-slot-outlet" data-slot-types={slotTypes.join(",")} data-context={JSON.stringify(context)} /> }));
+vi.mock("@/plugins/launchers", () => ({ PluginLauncherOutlet: ({ placementZones, context }: { placementZones: string[]; context: Record<string, unknown> }) =>
+  <div data-testid="plugin-launcher-outlet" data-placement-zones={placementZones.join(",")} data-context={JSON.stringify(context)} /> }));
 vi.mock("@/api/projects", () => ({ projectsApi: { list: async () => fixture.projects } }));
 vi.mock("./SidebarCompanyMenu", () => ({ SidebarCompanyMenu: () => null }));
 vi.mock("@/lib/router", () => ({
@@ -46,7 +51,7 @@ function summary(items: AttentionItem[]) {
 let root: Root, container: HTMLDivElement, client: QueryClient;
 beforeEach(() => {
   vi.clearAllMocks(); localStorage.clear(); fixture.collapsed = false; fixture.userId = "reviewer"; fixture.pathname = "/COO/issues";
-  fixture.chats = []; fixture.recentTasks = []; fixture.projects = []; fixture.enableCases = false; fixture.agents = [];
+  fixture.chats = []; fixture.recentTasks = []; fixture.projects = []; fixture.enableCases = false; fixture.enableStatusCards = false; fixture.enableGoalsSidebarLink = false; fixture.agents = [];
   fixture.summary.mockResolvedValue(summary([pending("question"), pending("review")]));
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -122,6 +127,28 @@ describe("Coordinator pinned pages", () => {
     await renderSidebar();
     await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="More workspace pages"]')!.click());
     expect(document.querySelector('a[href="/cases"]') !== null).toBe(enabled);
+  });
+  it("renders plugin sidebar pages and launchers in the workspace navigation", async () => {
+    await renderSidebar();
+    const outlet = navigation().querySelector('[data-testid="plugin-slot-outlet"]');
+    expect(outlet?.getAttribute("data-slot-types")).toBe("sidebar");
+    expect(JSON.parse(outlet!.getAttribute("data-context")!)).toEqual({ companyId: "company", companyPrefix: "COO" });
+    const launchers = navigation().querySelector('[data-testid="plugin-launcher-outlet"]');
+    expect(launchers?.getAttribute("data-placement-zones")).toBe("sidebar");
+    expect(JSON.parse(launchers!.getAttribute("data-context")!)).toEqual({ companyId: "company", companyPrefix: "COO" });
+  });
+  it.each([false, true])("shows Status and Goals only when their flags are enabled (%s)", async enabled => {
+    fixture.enableStatusCards = enabled;
+    fixture.enableGoalsSidebarLink = enabled;
+    await renderSidebar();
+    expect(navigation().querySelector('a[href="/status"]') !== null).toBe(enabled);
+    expect(navigation().querySelector('a[href="/goals"]') !== null).toBe(enabled);
+  });
+  it("controls Status and Goals independently", async () => {
+    fixture.enableStatusCards = true;
+    await renderSidebar();
+    expect(navigation().querySelector('a[href="/status"]')?.textContent).toContain("Status");
+    expect(navigation().querySelector('a[href="/goals"]')).toBeNull();
   });
   it("announces unread chat totals in expanded and collapsed navigation", async () => {
     fixture.chats = [{ isUnreadForMe: true }, { isUnreadForMe: false }, { isUnreadForMe: true }];
