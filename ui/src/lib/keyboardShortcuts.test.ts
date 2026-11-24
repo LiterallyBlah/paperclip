@@ -45,7 +45,7 @@ describe("keyboardShortcuts helpers", () => {
       expect(resolveAttentionQueueKeyAction({ ...baseArgs, key: "Enter", hasSelection: false })).toBe("ignore");
     });
 
-    it("leaves Enter to a focused control inside the selected row (BLA-180)", () => {
+    it("leaves Enter to a focused control inside the selected row", () => {
       // At 6f18750d Enter on a focused in-row Approve button toggled (collapsed)
       // the selected row instead of activating the button.
       const button = document.createElement("button");

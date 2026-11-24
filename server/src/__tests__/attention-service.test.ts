@@ -269,7 +269,7 @@ describeEmbeddedPostgres("attention service", () => {
     expect(feed.items.flatMap((item) => item.queues).some((queue) => queue.key === "internal-review")).toBe(false);
   });
 
-  it("resolves a user-held native review stage in place and names the participant on drifted stages (BLA-180)", async () => {
+  it("resolves a user-held native review stage in place and names the participant on drifted stages", async () => {
     const { companyId, workerId, reviewerId } = await seedCompany("ATR");
     // The review-round cap handed the pending stage to the responsible user.
     const escalatedId = await insertIssue({
