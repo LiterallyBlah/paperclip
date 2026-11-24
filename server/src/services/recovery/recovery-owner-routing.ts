@@ -1,9 +1,11 @@
 import { and, eq, isNull, ne } from "drizzle-orm";
-import { agents, companies, type Db } from "@paperclipai/db";
+import { agents, companies, issues, type Db } from "@paperclipai/db";
 import type {
   IssueRecoveryActionKind,
   IssueRecoveryActionOwnerType,
 } from "@paperclipai/shared";
+
+import { authorizationService } from "../authorization.js";
 
 type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -26,6 +28,8 @@ export const RECOVERY_OWNER_ROUTING_EVIDENCE_KEY = "recoveryOwnerRouting";
 export const RECOVERY_COORDINATOR_WAKE_REASON = "recovery_action_owner_assigned";
 /** Minimum gap before a finished coordinator wake is repeated for the same action. */
 export const RECOVERY_COORDINATOR_REWAKE_MS = 60 * 60 * 1000;
+/** Routing reason recorded when the coordinator cannot read the source issue. */
+export const RECOVERY_COORDINATOR_NO_ACCESS_REASON = "coordinator_no_access";
 
 /** Recovery action kinds whose board-owned actions route to the coordinator. */
 export const COORDINATOR_ROUTED_RECOVERY_KINDS: ReadonlySet<IssueRecoveryActionKind> = new Set<IssueRecoveryActionKind>([
@@ -152,8 +156,16 @@ export type RecoveryOwnerRoutingEvidence =
   | {
     coordinator: "assigned";
     agentId: string;
-    source: "configured" | "root_ceo";
+    /**
+     * `source_assignee`: the coordinator cannot read the source issue, so the
+     * source issue's own assignee (who can) owns the recovery instead.
+     */
+    source: "configured" | "root_ceo" | "source_assignee";
     routedAt: string;
+    /** Set with `source_assignee`: why the coordinator was passed over. */
+    reason?: typeof RECOVERY_COORDINATOR_NO_ACCESS_REASON;
+    /** Set with `source_assignee`: the coordinator that cannot read the issue. */
+    coordinatorAgentId?: string;
     backfilledAt?: string;
     wakeQueuedAt?: string;
     wakeRunId?: string | null;
@@ -164,6 +176,8 @@ export type RecoveryOwnerRoutingEvidence =
     routedAt: string;
     /** Set when an already routed action went back to the board. */
     previousCoordinatorAgentId?: string;
+    /** Set with `coordinator_no_access`: the coordinator that cannot read the issue. */
+    coordinatorAgentId?: string;
   };
 
 /**
@@ -177,7 +191,11 @@ export function carryRecoveryCoordinatorDelivery(
 ): RecoveryOwnerRoutingEvidence {
   if (routing.coordinator !== "assigned") return routing;
   const previous = readRecoveryOwnerRouting(previousEvidence);
-  if (previous?.coordinator !== "assigned" || previous.agentId !== routing.agentId) return routing;
+  if (
+    previous?.coordinator !== "assigned" ||
+    previous.agentId !== routing.agentId ||
+    previous.source !== routing.source
+  ) return routing;
   return {
     ...routing,
     routedAt: previous.routedAt ?? routing.routedAt,
@@ -210,6 +228,12 @@ export async function resolveRecoveryOwner(
     requestedOwnerAgentId?: string | null;
     requestedOwnerUserId?: string | null;
     /**
+     * The action's source issue. A coordinator (or assignee fallback) that
+     * cannot read it is never made the owner. Every caller passes it; `null`
+     * only for synthetic classification checks.
+     */
+    sourceIssueId: string | null;
+    /**
      * The source work's own agent. When a person paused that agent, the
      * pause is a human decision and the board keeps the action.
      */
@@ -238,12 +262,103 @@ export async function resolveRecoveryOwner(
       routing: { coordinator: "unavailable", reason: coordinator.reason, routedAt },
     };
   }
+  if (
+    input.sourceIssueId &&
+    !(await canRecoveryOwnerReadIssue(db, {
+      companyId: input.companyId,
+      agentId: coordinator.agentId,
+      issueId: input.sourceIssueId,
+    }))
+  ) {
+    const assigneeAgentId = await readableInvokableSourceAssignee(db, input.companyId, input.sourceIssueId);
+    if (assigneeAgentId) {
+      return {
+        ownerType: "agent",
+        ownerAgentId: assigneeAgentId,
+        ownerUserId: null,
+        routing: {
+          coordinator: "assigned",
+          agentId: assigneeAgentId,
+          source: "source_assignee",
+          reason: RECOVERY_COORDINATOR_NO_ACCESS_REASON,
+          coordinatorAgentId: coordinator.agentId,
+          routedAt,
+        },
+      };
+    }
+    return {
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+      routing: {
+        coordinator: "unavailable",
+        reason: RECOVERY_COORDINATOR_NO_ACCESS_REASON,
+        coordinatorAgentId: coordinator.agentId,
+        routedAt,
+      },
+    };
+  }
   return {
     ownerType: "agent",
     ownerAgentId: coordinator.agentId,
     ownerUserId: null,
     routing: { coordinator: "assigned", agentId: coordinator.agentId, source: coordinator.source, routedAt },
   };
+}
+
+/**
+ * The existing `issue:read` access decision for an agent acting on the
+ * source issue, the same decision the woken run meets when it reads the
+ * task. The actor is built the way a run builds it: on behalf of the
+ * issue's responsible user. A missing issue is unreadable.
+ */
+export async function canRecoveryOwnerReadIssue(
+  db: DbOrTransaction,
+  input: { companyId: string; agentId: string; issueId: string },
+): Promise<boolean> {
+  const issue = await db
+    .select({ id: issues.id, responsibleUserId: issues.responsibleUserId })
+    .from(issues)
+    .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!issue) return false;
+  const responsibleUserId = issue.responsibleUserId && issue.responsibleUserId !== "local-board"
+    ? issue.responsibleUserId
+    : null;
+  const decision = await authorizationService(db).decide({
+    actor: {
+      type: "agent",
+      agentId: input.agentId,
+      companyId: input.companyId,
+      source: "agent_jwt",
+      onBehalfOfUserId: responsibleUserId,
+    },
+    action: "issue:read",
+    resource: { type: "issue", companyId: input.companyId, issueId: issue.id },
+  });
+  return decision.allowed;
+}
+
+/**
+ * The source issue's assignee agent when it can take the recovery: same
+ * company, invokable (not paused, terminated or pending) and able to read
+ * the issue. Otherwise null.
+ */
+async function readableInvokableSourceAssignee(
+  db: DbOrTransaction,
+  companyId: string,
+  sourceIssueId: string,
+): Promise<string | null> {
+  const row = await db
+    .select({ agentId: agents.id, status: agents.status })
+    .from(issues)
+    .innerJoin(agents, and(eq(agents.id, issues.assigneeAgentId), eq(agents.companyId, issues.companyId)))
+    .where(and(eq(issues.id, sourceIssueId), eq(issues.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!row || !AVAILABLE_COORDINATOR_STATUSES.has(row.status)) return null;
+  return (await canRecoveryOwnerReadIssue(db, { companyId, agentId: row.agentId, issueId: sourceIssueId }))
+    ? row.agentId
+    : null;
 }
 
 async function isPausedAgent(db: DbOrTransaction, companyId: string, agentId: string) {

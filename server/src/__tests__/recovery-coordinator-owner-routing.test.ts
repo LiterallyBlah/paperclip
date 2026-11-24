@@ -258,6 +258,7 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
       kind: "active_run_watchdog",
       cause: "process_lost",
       requestedOwnerType: "board",
+      sourceIssueId: fixture.sourceIssueId,
     });
     expect(owner).toMatchObject({
       ownerType: "board",
@@ -595,6 +596,7 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
       kind: held!.kind,
       cause: held!.cause,
       requestedOwnerType: "board",
+      sourceIssueId: fixture.sourceIssueId,
       sourceAgentId: fixture.workerId,
     });
     expect(resolved.ownerType).toBe("board");

@@ -1,6 +1,8 @@
 /**
  * Move active board-owned routine recovery actions to the recovery
- * coordinator agent. Dry-run is the default; pass `--apply` to write.
+ * coordinator agent, close open actions on done/cancelled source issues and
+ * re-route coordinator-routed actions whose owner cannot read the source
+ * issue. Dry-run is the default; pass `--apply` to write.
  *
  *   node dist/services/recovery/recovery-owner-backfill-cli.js [--company <id>] [--apply]
  *

@@ -10118,6 +10118,7 @@ export function issueRoutes(
                   tx,
                   postCommitActivityPublications,
                   postCommitIssueActions,
+                  { callerResolvedRecoveryActionId: activeRecoveryAction.id },
                 )
               : await svc.update(
                   id,
