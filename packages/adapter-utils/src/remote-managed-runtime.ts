@@ -3,7 +3,9 @@ import { GIT_ARCHIVE_EXCLUDES, PROJECT_REPOSITORIES_DIR } from "./git-workspace-
 import {
   type SshRemoteExecutionSpec,
   prepareWorkspaceForSshExecution,
+  pruneSshRunCopies,
   runSshCommand,
+  SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES,
   restoreWorkspaceFromSshExecution,
   syncDirectoryToSsh,
 } from "./ssh.js";
@@ -152,9 +154,15 @@ export async function prepareRemoteManagedRuntime(input: {
           ? [
               ...GIT_ARCHIVE_EXCLUDES,
               ".paperclip-runtime",
+              ...SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES,
               ...(projectRepositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : preparedWorkspace.excludedPaths ?? []),
             ]
-          : [".paperclip-runtime", ...(preparedWorkspace.excludedPaths ?? []), ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+          : [
+              ".paperclip-runtime",
+              ...SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES,
+              ...(preparedWorkspace.excludedPaths ?? []),
+              ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : []),
+            ],
       })
     : null;
   const repositoryBaselines: Array<{ path: string; baselineSnapshot: DirectorySnapshot }> = [];
@@ -162,7 +170,7 @@ export async function prepareRemoteManagedRuntime(input: {
     repositoryBaselines.push({
       path: repository,
       baselineSnapshot: await captureDirectorySnapshot(path.join(input.workspaceLocalDir, repository), {
-        exclude: [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"],
+        exclude: [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime", ...SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES],
       }),
     });
   }
@@ -251,23 +259,35 @@ export async function prepareRemoteManagedRuntime(input: {
     assetDirs,
     additionalSourceDirs,
     restoreWorkspace: async (onProgress?: RuntimeProgressSink) => {
-      if (preparedWorkspace && baselineSnapshot) {
-        await restoreWorkspaceFromSshExecution({
-          spec: input.spec,
-          localDir: input.workspaceLocalDir,
-          remoteDir: workspaceRemoteDir,
-          baselineSnapshot,
-          restoreGitHistory: preparedWorkspace.gitBacked,
-          onProgress,
-          repositories: repositoryBaselines,
-        });
-      }
-      for (const asset of input.assets ?? []) {
-        if (!asset.restore) continue;
-        await asset.restore({
-          assetDir: path.posix.join(runtimeRootDir, asset.key),
-          readFile: (remotePath) => readRemoteFile(input.spec, remotePath),
-        });
+      try {
+        if (preparedWorkspace && baselineSnapshot) {
+          await restoreWorkspaceFromSshExecution({
+            spec: input.spec,
+            localDir: input.workspaceLocalDir,
+            remoteDir: workspaceRemoteDir,
+            baselineSnapshot,
+            restoreGitHistory: preparedWorkspace.gitBacked,
+            onProgress,
+            repositories: repositoryBaselines,
+          });
+        }
+        for (const asset of input.assets ?? []) {
+          if (!asset.restore) continue;
+          await asset.restore({
+            assetDir: path.posix.join(runtimeRootDir, asset.key),
+            readFile: (remotePath) => readRemoteFile(input.spec, remotePath),
+          });
+        }
+      } finally {
+        // Post-run retention: drop run copies older than 48 h (never this run).
+        // Best effort; pruneSshRunCopies only warns on failure.
+        if (syncWorkspace) {
+          await pruneSshRunCopies({
+            spec: input.spec,
+            runsDir: path.posix.join(baseWorkspaceRemoteDir, ".paperclip-runtime", "runs"),
+            currentRunId: input.runId,
+          });
+        }
       }
     },
   };

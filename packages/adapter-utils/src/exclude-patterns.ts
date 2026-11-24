@@ -2,7 +2,19 @@ export function isRelativePathOrDescendant(relative: string, candidate: string):
   return relative === candidate || relative.startsWith(`${candidate}/`);
 }
 
+function segmentGlobToRegExp(segment: string): RegExp {
+  const escaped = segment
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\?/g, "[^/]");
+  return new RegExp(`^${escaped}$`);
+}
+
 function pathContainsSegmentOrDescendant(relative: string, segment: string): boolean {
+  if (/[*?]/.test(segment) && !segment.includes("/")) {
+    const regex = segmentGlobToRegExp(segment);
+    return relative.split("/").some((part) => regex.test(part));
+  }
   return relative === segment ||
     relative.startsWith(`${segment}/`) ||
     relative.endsWith(`/${segment}`) ||
