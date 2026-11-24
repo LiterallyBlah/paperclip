@@ -472,8 +472,15 @@ export function planIsolatedCopyCloneReclaim(root: string, inspection: IsolatedC
     if (!repo.inspectionFailed && !repo.mainRepoPath) reasons.push("git_inspection_failed");
     if (repo.relativePath === "") reasons.push("copy_root_is_repository");
     const repoAbs = absolute(repo.relativePath);
+    // A database, mail or evidence file in a clone that passes the checks
+    // above is either tracked (so the remote or main repository holds it at
+    // HEAD) or untracked/ignored (so it moves with the evidence). Only one
+    // inside a vouched regenerable directory, which is deleted, keeps the clone.
+    const vouched = inspection.regenerableDirs.map(absolute).filter((dir) => isWithin(dir, repoAbs));
     for (const kind of new Set(inspection.protectedFiles
-      .filter((file) => isWithin(absolute(file.relativePath), repoAbs)).map((file) => file.kind))) reasons.push(kind);
+      .filter((file) => isWithin(absolute(file.relativePath), repoAbs)
+        && vouched.some((dir) => isWithin(absolute(file.relativePath), dir)))
+      .map((file) => file.kind))) reasons.push(kind);
     if (inspection.nestedRepoPaths.some((nested) => isWithin(absolute(nested), repoAbs))) reasons.push("nested_repository");
     if (repo.worktree && repo.mainRepoPath && !external) {
       const main = reposByPath.get(path.resolve(repo.mainRepoPath))!;

@@ -364,8 +364,6 @@ describe("isolated copy per-clone reclaim plan", () => {
     await git(sub, ["add", "."]);
     await git(sub, ["commit", "-m", "sub"]);
     await git(sub, ["push"]);
-    const db = await cloneInto(copy, "db", "pushed");
-    await writeFile(path.join(db, ".scratch", "state.sqlite"), "db\n");
     const plan = planIsolatedCopyCloneReclaim(copy, await inspectIsolatedCopyDir(copy));
     expect(plan.remove).toEqual([]);
     expect(Object.fromEntries(plan.keep.map((entry) => [entry.relativePath, entry.reasons]))).toEqual({
@@ -373,8 +371,24 @@ describe("isolated copy per-clone reclaim plan", () => {
       unpushed: expect.arrayContaining(["unpushed"]),
       no_remote: expect.arrayContaining(["no_remote"]),
       sub: ["submodules"],
-      db: ["database"],
     });
+  });
+
+  it("removes a clone whose protected files are tracked and pushed or move with the evidence", async () => {
+    const root = await tempRoot();
+    const copy = path.join(root, "isolated-workspaces", "c", "i");
+    const repo = await cloneInto(copy, "a", "pushed");
+    await writeFile(path.join(repo, "ui", "fixtures", "evidence", "sample.json"), "{}\n");
+    await git(repo, ["add", "."]);
+    await git(repo, ["commit", "-m", "fixture"]);
+    await git(repo, ["push"]);
+    await writeFile(path.join(repo, ".scratch", "state.sqlite"), "db\n");
+    const inspection = await inspectIsolatedCopyDir(copy);
+    const plan = planIsolatedCopyCloneReclaim(copy, inspection);
+    expect(plan.keep).toEqual([]);
+    expect(plan.remove).toEqual([expect.objectContaining({ relativePath: "a", evidence: [".scratch"] })]);
+    // Whole-copy archive still keeps any protected file.
+    expect(decideIsolatedCopyReclaim(inspection).reasons).toEqual(expect.arrayContaining(["evidence", "database"]));
   });
 
   it("keeps files outside repositories and compacts only outside regenerable directories without protected files", async () => {
