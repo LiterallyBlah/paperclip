@@ -346,10 +346,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   })();
   const autoTrustEnabled = !hasCursorTrustBypassArg(extraArgs);
   let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
+  let releaseRemoteWorkspaceSnapshot: (() => Promise<void>) | null = null;
   let localSkillsDir: string | null = null;
   let remoteRuntimeRootDir: string | null = null;
   let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
 
+  try {
   if (executionTargetIsRemote) {
     try {
       localSkillsDir = await buildCursorSkillsDir(config);
@@ -375,6 +377,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       restoreRemoteWorkspace = () =>
         preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line));
+      releaseRemoteWorkspaceSnapshot = async () => { await preparedExecutionTargetRuntime.cleanupWorkspaceSnapshot?.(); };
       effectiveExecutionCwd = preparedExecutionTargetRuntime.workspaceRemoteDir ?? effectiveExecutionCwd;
       refreshPaperclipWorkspaceEnvForExecution({
         env,
@@ -821,5 +824,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await fs.rm(localSkillsDir, { recursive: true, force: true }).catch(() => undefined);
       }
     }
+  }
+  } catch (error) {
+    await releaseRemoteWorkspaceSnapshot?.().catch(() => {});
+    throw error;
   }
 }

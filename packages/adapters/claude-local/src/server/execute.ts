@@ -667,6 +667,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       })()
     : null;
+  try {
   if (preparedExecutionTargetRuntime?.workspaceRemoteDir) {
     effectiveExecutionCwd = preparedExecutionTargetRuntime.workspaceRemoteDir;
   }
@@ -1469,5 +1470,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await restoreRemoteWorkspace();
       }
     }
+  }
+  } catch (error) {
+    await preparedExecutionTargetRuntime?.cleanupWorkspaceSnapshot?.().catch(() => {});
+    throw error;
   }
 }
