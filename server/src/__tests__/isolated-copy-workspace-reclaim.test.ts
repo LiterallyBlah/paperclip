@@ -301,6 +301,11 @@ describe("isolated copy per-clone reclaim plan", () => {
     await cloneInto(copy, "a", "pushed");
     await age(copy, 72 * HOUR_MS);
     expect((await inspectIsolatedCopyDir(copy)).newestMtimeMs).toBeLessThan(Date.now() - 71 * HOUR_MS);
+    // Directory changes (compaction moving node_modules out, Git index
+    // refresh) do not count as use.
+    await fs.rm(path.join(copy, "a", "node_modules"), { recursive: true });
+    await fs.mkdir(path.join(copy, "a", ".git", "probe"));
+    expect((await inspectIsolatedCopyDir(copy)).newestMtimeMs).toBeLessThan(Date.now() - 71 * HOUR_MS);
     await writeFile(path.join(copy, "a", "src", "new.ts"), "x\n");
     expect((await inspectIsolatedCopyDir(copy)).newestMtimeMs).toBeGreaterThan(Date.now() - HOUR_MS);
   });

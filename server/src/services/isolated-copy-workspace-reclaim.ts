@@ -56,7 +56,9 @@ export type IsolatedCopyInspection = {
   // Outside regenerable directories that hold a protected file or a Git
   // directory. They are never compacted.
   outsideRegenerableHeld: string[];
-  // Newest modification time of any inspected entry, or 0 when nothing was read.
+  // Newest modification time of any inspected file, or 0 when none was read.
+  // Directory times are left out: the sweep's own compaction and Git's index
+  // refresh change them, which would keep a copy from ever looking idle.
   newestMtimeMs: number;
   truncated: boolean;
 };
@@ -264,8 +266,6 @@ export async function inspectIsolatedCopyDir(root: string, options: { signal?: A
   };
   const repoPaths: string[] = [];
   let visited = 0;
-  const rootStat = await fs.lstat(root).catch(() => null);
-  if (rootStat) result.newestMtimeMs = rootStat.mtimeMs;
 
   // `outsideRoot` is set while searching an outside regenerable directory.
   async function walk(relativeDir: string, depth: number, insideRepo: boolean, outsideRoot: string | null = null): Promise<void> {
@@ -289,9 +289,11 @@ export async function inspectIsolatedCopyDir(root: string, options: { signal?: A
         return;
       }
       const relativePath = relativeDir ? path.posix.join(relativeDir, entry.name) : entry.name;
-      const stat = await fs.lstat(path.join(absoluteDir, entry.name)).catch(() => null);
-      if (stat) result.newestMtimeMs = Math.max(result.newestMtimeMs, stat.mtimeMs);
       const isDirectory = entry.isDirectory();
+      if (!isDirectory) {
+        const stat = await fs.lstat(path.join(absoluteDir, entry.name)).catch(() => null);
+        if (stat) result.newestMtimeMs = Math.max(result.newestMtimeMs, stat.mtimeMs);
+      }
       const kind = entry.name === ".git" ? null : classifyProtected(entry.name, isDirectory);
       if (kind) result.protectedFiles.push({ kind, relativePath });
       if (outsideRoot && (kind || entry.name === ".git") && !result.outsideRegenerableHeld.includes(outsideRoot)) {
