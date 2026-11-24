@@ -435,7 +435,7 @@ async function runVitest(args, label, testShard = null, exactFiles = false) {
   // /tmp is /private/tmp on macOS, so fixture roots must use the canonical path.
   const testRoot = realpathSync(mkdtempSync(path.join(tempRootParent, "pv-")));
   try {
-    await runVitestInRoot(args, label, testShard, testRoot);
+    await runVitestInRoot(args, label, testShard, testRoot, exactFiles);
   } finally {
     // Worker homes inside it can hold 0555 runtime-context bundles that a
     // plain recursive rm cannot delete, and the workers' own exit cleanup
@@ -448,7 +448,7 @@ async function runVitest(args, label, testShard = null, exactFiles = false) {
   }
 }
 
-async function runVitestInRoot(args, label, testShard, testRoot) {
+async function runVitestInRoot(args, label, testShard, testRoot, exactFiles = false) {
   // Keep per-run paths compact so Unix socket fixtures stay under macOS path limits.
   const env = {
     ...process.env,
