@@ -98,8 +98,11 @@ describe("issueRecoveryActionService", () => {
     const error: Error & { cause?: unknown } = new Error("Wrapped database failure");
     error.cause = kind === "unrelated unique constraint" ? { code: "23505", constraint_name: "other_unique_constraint" }
       : kind === "other SQLSTATE" ? { code: "23503", constraint_name: constraint } : error;
+    // Fork (#76): a routine board-owned kind first asks the recovery-owner router for the
+    // company's coordinator (awaited select...where with no limit), so the query is thenable.
     const query = { from() { return this; }, where() { return this; }, orderBy() { return this; },
-      limit() { return Promise.resolve([]); } };
+      limit() { return Promise.resolve([]); },
+      then<T>(resolve: (rows: unknown[]) => T, reject?: (error: unknown) => T) { return Promise.resolve([]).then(resolve, reject); } };
     const fakeDb = {
       async transaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> { return fn(fakeDb); },
       execute: vi.fn(async () => [{ pendingPreparationContinuation: false }]),
@@ -109,7 +112,8 @@ describe("issueRecoveryActionService", () => {
     await expect(issueRecoveryActionService(fakeDb as never).upsertSourceScoped({ companyId: "company", sourceIssueId: "issue",
       kind: "missing_disposition", cause: "saved-debt", fingerprint: "same-source", nextAction: "Restore existing work." }))
       .rejects.toBe(error);
-    expect(fakeDb.select).toHaveBeenCalledOnce();
+    // The active read plus #76's one coordinator lookup; no retry repeats either.
+    expect(fakeDb.select).toHaveBeenCalledTimes(2);
     expect(fakeDb.insert).toHaveBeenCalledOnce();
   });
   it("does not reactivate an action resolved between the active read and update", async () => {

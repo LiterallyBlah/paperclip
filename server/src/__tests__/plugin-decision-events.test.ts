@@ -64,11 +64,11 @@ describe("registration", () => {
 });
 
 describe("interaction call sites", () => {
-  it("all 5 call sites await the publish and pass the handle that inserted the row", async () => {
+  it("all 6 call sites await the publish and pass the handle that inserted the row", async () => {
     const sites: Record<string, string[]> = {
       "issue-thread-interactions.ts": ["db", "db"],
       "tool-gateway.ts": ["db"],
-      "secret-proposals.ts": ["txDb"],
+      "secret-proposals.ts": ["txDb", "txDb"],
       "tool-access/oauth/authorization-start.ts": ["db"],
     };
     let total = 0;
@@ -83,7 +83,7 @@ describe("interaction call sites", () => {
       });
       total += calls.length;
     }
-    assert.equal(total, 5);
+    assert.equal(total, 6);
   });
 });
 

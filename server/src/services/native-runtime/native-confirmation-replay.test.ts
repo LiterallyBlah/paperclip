@@ -124,7 +124,9 @@ describe("native accepted confirmation replay", () => {
     ["title", { title: "Different work" }],
     ["payload", { payload: { acceptLabel: "Approve different work" } }],
     ["target", { payload: { target: { type: "custom", key: "different-work", label: "Different work" } } }],
-    ["resolver policy", { resolverPolicy: "human_only" }],
+    // Fork (#60): the fixture card omits resolverPolicy and so already inherits human_only;
+    // `anyone` is the changed policy.
+    ["resolver policy", { resolverPolicy: "anyone" }],
     ["continuation policy", { continuationPolicy: "none" }],
   ])("rejects same-key replay with changed %s", async (_label, change) => {
     const f = await fixture();

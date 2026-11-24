@@ -1946,7 +1946,10 @@ describe("agent issue mutation checkout ownership", () => {
   it.each(["bare blocked update", "human-owned inbox fixture"] as const)(
     "applies the production blocked contract to the %s", async kind => {
       const actor = boardActor();
-      const existing = makeIssue({ status: "in_progress", assigneeAgentId: null, assigneeUserId: actor.userId });
+      // Fork (#42 blocked-wait honesty, 2cdb8d0ae): a task a person owns is itself a real wait,
+      // so the bare update starts from a task with no person owner to keep the 422 contract.
+      const existing = makeIssue({ status: "in_progress", assigneeAgentId: null,
+        assigneeUserId: kind === "bare blocked update" ? null : actor.userId });
       mockIssueService.getById.mockResolvedValue(existing);
       mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...existing, ...patch }));
       const db = createRunContextDb({}, ownerAgentId, ownerRunId, [], false, { userId: actor.userId });

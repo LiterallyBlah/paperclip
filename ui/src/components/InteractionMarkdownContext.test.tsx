@@ -272,7 +272,9 @@ describe("Markdown decision context in the thread card", () => {
       payload: { ...pendingRequestConfirmationInteraction.payload, prompt: MARKDOWN_CONTEXT },
     };
     const host = mount(<IssueThreadInteractionCard interaction={confirmation} onAcceptInteraction={vi.fn()} />);
-    expectRenderedContext(host.querySelector<HTMLElement>(".paperclip-markdown")!);
+    // Fork (#60): the card summary renders through MarkdownBody too, ahead of the prompt.
+    expectRenderedContext([...host.querySelectorAll<HTMLElement>(".paperclip-markdown")]
+      .find((el) => !el.closest('[data-testid="interaction-summary"]'))!);
 
     const checkbox = {
       ...pendingRequestCheckboxConfirmationInteraction,
