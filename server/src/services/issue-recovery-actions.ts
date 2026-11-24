@@ -8,7 +8,6 @@ import { and, desc, eq, inArray, isNull, isNotNull, ne, or, sql } from "drizzle-
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issueRecoveryActions, workspaceOperations } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
-import { OWNER_UNPROVABLE_CAUSE } from "./recovery/owner-gone-attestation.js";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -726,13 +725,22 @@ export const SOURCE_ISSUE_TERMINAL_RESOLUTION_NOTE = "source_issue_terminal";
  *
  * - A native workspace finalization whose owner is still unverified settles
  *   an accepted result after the source closed; its native finalizer owns it.
+ * - A native workspace export failure (unsafe archive, unrecoverable or
+ *   retry-exhausted export): the native export recovery and recovery-notice
+ *   settlers own it and resolve it themselves once the source is terminal.
  * - An owner-unprovable hold: the reserved resource stays reserved however
  *   the task ends. Only the board's stop confirmation, or the resource's own
  *   release, settles it.
+ *
+ * Causes are literals: importing `OWNER_UNPROVABLE_CAUSE` here forms an import
+ * cycle that leaves it undefined when this module loads.
  */
 const TERMINAL_SURVIVING_RECOVERY_CAUSES: ReadonlySet<string> = new Set([
   "native_workspace_finalization_owner_unverified",
-  OWNER_UNPROVABLE_CAUSE,
+  "native_workspace_sync_out_unsafe_archive",
+  "native_workspace_sync_out_unrecoverable",
+  "native_workspace_sync_out_retry_exhausted",
+  "ownership_owner_unprovable",
 ]);
 
 /** System recovery still in flight keeps its action open past a terminal source. */

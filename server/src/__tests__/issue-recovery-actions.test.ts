@@ -41,7 +41,8 @@ import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions, markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
-import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { issueRecoveryActionService, survivesTerminalSourceIssue } from "../services/issue-recovery-actions.js";
+import { OWNER_UNPROVABLE_CAUSE } from "../services/recovery/owner-gone-attestation.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { issueService } from "../services/issues.js";
 import { setPluginEventBus } from "../services/activity-log.js";
@@ -91,6 +92,26 @@ function makeRecoveryActionRow(overrides: Record<string, unknown> = {}) {
 
 // Stranded-run fixtures began before anything the test later records.
 const LATEST_RUN_TIMES = { startedAt: new Date(), createdAt: new Date() };
+
+describe("survivesTerminalSourceIssue", () => {
+  it.each([
+    OWNER_UNPROVABLE_CAUSE,
+    "native_workspace_finalization_owner_unverified",
+    "native_workspace_sync_out_unsafe_archive",
+    "native_workspace_sync_out_unrecoverable",
+    "native_workspace_sync_out_retry_exhausted",
+  ])("keeps %s open past a terminal source", cause => {
+    expect(cause).toEqual(expect.any(String));
+    expect(survivesTerminalSourceIssue({ cause })).toBe(true);
+  });
+  it("keeps in-flight system recovery open and closes everything else", () => {
+    for (const state of ["scheduled", "running", "awaiting_evidence"]) {
+      expect(survivesTerminalSourceIssue({ cause: "saved-debt", evidence: { systemRecovery: { state } } })).toBe(true);
+    }
+    expect(survivesTerminalSourceIssue({ cause: "saved-debt", evidence: { systemRecovery: { state: "completed" } } })).toBe(false);
+    expect(survivesTerminalSourceIssue({ cause: "saved-debt" })).toBe(false);
+  });
+});
 
 describe("issueRecoveryActionService", () => {
   it.each(["unrelated unique constraint", "other SQLSTATE", "cyclic cause"])("does not retry %s errors", async kind => {
