@@ -26,6 +26,7 @@ import {
   decideIsolatedCopyReclaim,
   inspectIsolatedCopyDir,
   isIsolatedCopyWorkspace,
+  planIsolatedCopyCloneReclaim,
 } from "../services/isolated-copy-workspace-reclaim.ts";
 
 const execFileAsync = promisify(execFile);
@@ -86,6 +87,19 @@ async function cloneInto(copyDir: string, name: string, state: "pushed" | "dirty
     await git(repo, ["commit", "-m", "local only"]);
   }
   return repo;
+}
+
+// Sets every modification time below `dir` back by `agoMs`.
+async function age(dir: string, agoMs: number) {
+  const when = new Date(Date.now() - agoMs);
+  async function visit(target: string) {
+    const stat = await fs.lstat(target);
+    if (stat.isDirectory()) {
+      for (const entry of await fs.readdir(target)) await visit(path.join(target, entry));
+    }
+    await fs.lutimes(target, when, when);
+  }
+  await visit(dir);
 }
 
 afterAll(async () => {
@@ -169,6 +183,134 @@ describe("isolated copy workspace inspection", () => {
   });
 });
 
+describe("isolated copy per-clone reclaim plan", () => {
+  it("removes a clean, pushed clone and records its HEAD and remote ref", async () => {
+    const root = await tempRoot();
+    const copy = path.join(root, "isolated-workspaces", "c", "i");
+    const repo = await cloneInto(copy, "a", "pushed");
+    const plan = planIsolatedCopyCloneReclaim(copy, await inspectIsolatedCopyDir(copy));
+    expect(plan.keep).toEqual([]);
+    expect(plan.remove).toEqual([{
+      relativePath: "a",
+      kind: "clone",
+      mainRepoPath: repo,
+      head: await git(repo, ["rev-parse", "HEAD"]),
+      remoteRef: "origin/main",
+      remoteUrl: path.join(root, "origin-a.git"),
+    }]);
+  });
+
+  it.each([
+    ["dirty", "dirty"],
+    ["unpushed", "unpushed"],
+    ["no_remote", "no_remote"],
+  ] as const)("keeps a %s clone", async (state, reason) => {
+    const root = await tempRoot();
+    const copy = path.join(root, "isolated-workspaces", "c", "i");
+    await cloneInto(copy, "a", "pushed");
+    await cloneInto(copy, "b", state);
+    const plan = planIsolatedCopyCloneReclaim(copy, await inspectIsolatedCopyDir(copy));
+    expect(plan.remove.map((entry) => entry.relativePath)).toEqual(["a"]);
+    expect(plan.keep).toEqual([{ relativePath: "b", reasons: expect.arrayContaining([reason]) }]);
+  });
+
+  it("keeps a clone with an untracked file, a stash or an unpushed side branch", async () => {
+    const root = await tempRoot();
+    const copy = path.join(root, "isolated-workspaces", "c", "i");
+    const untracked = await cloneInto(copy, "untracked", "pushed");
+    await writeFile(path.join(untracked, "notes.md"), "draft\n");
+    const stashed = await cloneInto(copy, "stashed", "pushed");
+    await fs.appendFile(path.join(stashed, "README.md"), "wip\n");
+    await git(stashed, ["stash"]);
+    const branched = await cloneInto(copy, "branched", "pushed");
+    await git(branched, ["checkout", "-b", "side"]);
+    await writeFile(path.join(branched, "side.txt"), "side\n");
+    await git(branched, ["add", "."]);
+    await git(branched, ["commit", "-m", "side"]);
+    await git(branched, ["checkout", "main"]);
+    const plan = planIsolatedCopyCloneReclaim(copy, await inspectIsolatedCopyDir(copy));
+    expect(plan.remove).toEqual([]);
+    expect(Object.fromEntries(plan.keep.map((entry) => [entry.relativePath, entry.reasons]))).toEqual({
+      untracked: ["dirty"],
+      stashed: ["dirty"],
+      branched: ["unpushed"],
+    });
+  });
+
+  it("removes a clean worktree before its main repository and keeps a main with a dirty worktree", async () => {
+    const root = await tempRoot();
+    const copy = path.join(root, "isolated-workspaces", "c", "i");
+    const main = await cloneInto(copy, "main", "pushed");
+    await git(main, ["worktree", "add", "--detach", path.join(copy, "wt"), "HEAD"]);
+    let plan = planIsolatedCopyCloneReclaim(copy, await inspectIsolatedCopyDir(copy));
+    expect(plan.remove.map((entry) => [entry.relativePath, entry.kind])).toEqual([["wt", "worktree"], ["main", "clone"]]);
+    await writeFile(path.join(copy, "wt", "change.txt"), "x\n");
+    plan = planIsolatedCopyCloneReclaim(copy, await inspectIsolatedCopyDir(copy));
+    expect(plan.remove).toEqual([]);
+    expect(Object.fromEntries(plan.keep.map((entry) => [entry.relativePath, entry.reasons]))).toEqual({
+      main: ["has_linked_worktrees"],
+      wt: ["dirty"],
+    });
+  });
+
+  it("keeps a clone that holds another repository", async () => {
+    const root = await tempRoot();
+    const copy = path.join(root, "isolated-workspaces", "c", "i");
+    const outer = await cloneInto(copy, "outer", "pushed");
+    await cloneInto(outer, "inner", "dirty");
+    // Git shows the inner repository as untracked, or as ignored when excluded.
+    let plan = planIsolatedCopyCloneReclaim(copy, await inspectIsolatedCopyDir(copy));
+    expect(plan.remove).toEqual([]);
+    expect(plan.keep).toEqual([{ relativePath: "outer", reasons: ["dirty"] }]);
+    await fs.appendFile(path.join(outer, ".git", "info", "exclude"), "inner/\n");
+    plan = planIsolatedCopyCloneReclaim(copy, await inspectIsolatedCopyDir(copy));
+    expect(plan.remove).toEqual([]);
+    expect(plan.keep).toEqual([{ relativePath: "outer", reasons: ["ignored_files"] }]);
+  });
+
+  it("keeps a worktree whose main repository is outside the copy", async () => {
+    const root = await tempRoot();
+    const outside = await cloneInto(path.join(root, "elsewhere", "c", "i"), "main", "pushed");
+    const copy = path.join(root, "isolated-workspaces", "c", "i");
+    await fs.mkdir(copy, { recursive: true });
+    await git(outside, ["worktree", "add", "--detach", path.join(copy, "wt"), "HEAD"]);
+    const plan = planIsolatedCopyCloneReclaim(copy, await inspectIsolatedCopyDir(copy));
+    expect(plan.remove).toEqual([]);
+    expect(plan.keep).toEqual([{ relativePath: "wt", reasons: ["worktree_of_external_repo"] }]);
+  });
+
+  it("keeps files outside repositories and compacts only outside regenerable directories without protected files", async () => {
+    const root = await tempRoot();
+    const copy = path.join(root, "isolated-workspaces", "c", "i");
+    await cloneInto(copy, "a", "pushed");
+    await writeFile(path.join(copy, "evidence", "run.txt"), "result\n");
+    await writeFile(path.join(copy, "notes.md"), "review\n");
+    await writeFile(path.join(copy, "node_modules", "dep", "index.js"), "x\n");
+    await writeFile(path.join(copy, "tool", "build", "out.js"), "x\n");
+    await writeFile(path.join(copy, "target", "capture.pcap"), "x\n");
+    const inspection = await inspectIsolatedCopyDir(copy);
+    const plan = planIsolatedCopyCloneReclaim(copy, inspection);
+    expect(plan.remove.map((entry) => entry.relativePath)).toEqual(["a"]);
+    expect(plan.compactOutside.sort()).toEqual(["node_modules", "tool/build"]);
+    expect(decideIsolatedCopyReclaim(inspection).action).toBe("compact");
+  });
+
+  it("reports the newest modification time in the copy", async () => {
+    const root = await tempRoot();
+    const copy = path.join(root, "isolated-workspaces", "c", "i");
+    await cloneInto(copy, "a", "pushed");
+    await age(copy, 72 * HOUR_MS);
+    expect((await inspectIsolatedCopyDir(copy)).newestMtimeMs).toBeLessThan(Date.now() - 71 * HOUR_MS);
+    // Directory changes (compaction moving node_modules out, Git index
+    // refresh) do not count as use.
+    await fs.rm(path.join(copy, "a", "node_modules"), { recursive: true });
+    await fs.mkdir(path.join(copy, "a", ".git", "probe"));
+    expect((await inspectIsolatedCopyDir(copy)).newestMtimeMs).toBeLessThan(Date.now() - 71 * HOUR_MS);
+    await writeFile(path.join(copy, "a", "src", "new.ts"), "x\n");
+    expect((await inspectIsolatedCopyDir(copy)).newestMtimeMs).toBeGreaterThan(Date.now() - HOUR_MS);
+  });
+});
+
 describeEmbeddedPostgres("isolated copy workspace reclaim sweep", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -206,6 +348,7 @@ describeEmbeddedPostgres("isolated copy workspace reclaim sweep", () => {
     state: "pushed" | "dirty" | "unpushed";
     issueStatus?: "done" | "cancelled" | "in_progress";
     terminalAgoMs?: number;
+    lastUsedAgoMs?: number;
   }) {
     const companyId = randomUUID();
     const issueId = randomUUID();
@@ -228,6 +371,7 @@ describeEmbeddedPostgres("isolated copy workspace reclaim sweep", () => {
       status: "active",
       cwd: copy,
       providerType: "local_fs",
+      ...(options.lastUsedAgoMs ? { lastUsedAt: new Date(Date.now() - options.lastUsedAgoMs) } : {}),
     });
     const status = options.issueStatus ?? "done";
     const terminalAt = new Date(Date.now() - (options.terminalAgoMs ?? 49 * HOUR_MS));
@@ -331,5 +475,88 @@ describeEmbeddedPostgres("isolated copy workspace reclaim sweep", () => {
     await service().sweepTerminalWorkspaces();
     expect(await exists(path.join(seeded.copy, "repo", "node_modules"))).toBe(true);
     expect(await status(seeded.executionWorkspaceId)).toBe("active");
+  });
+
+  // An idle copy: unused and unchanged for 49 hours. `repo` is dirty, so the
+  // copy cannot be archived; `clean` is a pushed clone; notes sit outside.
+  async function seedIdleCopy(options: { issueStatus?: "done" | "in_progress"; openChild?: boolean }) {
+    const seeded = await seed({ state: "dirty", issueStatus: options.issueStatus, lastUsedAgoMs: 49 * HOUR_MS });
+    const clean = await cloneInto(seeded.copy, "clean", "pushed");
+    await writeFile(path.join(seeded.copy, "notes.md"), "review notes\n");
+    await writeFile(path.join(seeded.copy, "node_modules", "dep", "index.js"), "x\n");
+    if (options.openChild) {
+      const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId: row!.companyId,
+        identifier: `Z-${Math.floor(Math.random() * 100000)}`,
+        title: "Child",
+        status: "in_progress",
+        priority: "medium",
+        parentId: seeded.issueId,
+      });
+    }
+    const head = await git(clean, ["rev-parse", "HEAD"]);
+    await age(seeded.copy, 49 * HOUR_MS);
+    return { ...seeded, clean, head };
+  }
+
+  it("removes a clean, pushed clone from an idle copy and keeps everything else", async () => {
+    const seeded = await seedIdleCopy({});
+    const result = await service().sweepTerminalWorkspaces();
+    expect(result.archived).toBe(0);
+    expect(await status(seeded.executionWorkspaceId)).toBe("active");
+    expect(await exists(seeded.clean)).toBe(false);
+    expect(await exists(path.join(seeded.copy, "node_modules"))).toBe(false);
+    expect(await fs.readFile(path.join(seeded.copy, "repo", "README.md"), "utf8")).toContain("uncommitted");
+    expect(await exists(path.join(seeded.copy, "notes.md"))).toBe(true);
+    const events = await db.select().from(activityLog).where(eq(activityLog.action, "execution_workspace.isolated_copy_clones_removed"));
+    expect(events).toHaveLength(1);
+    expect(events[0]!.details).toMatchObject({
+      removedClones: [{ relativePath: "clean", kind: "clone", head: seeded.head, remoteRef: "origin/main" }],
+      compactedOutside: ["node_modules"],
+    });
+  });
+
+  it("removes clean clones from an idle copy whose task tree is still open", async () => {
+    const seeded = await seedIdleCopy({ openChild: true });
+    await service().sweepTerminalWorkspaces();
+    expect(await exists(seeded.clean)).toBe(false);
+    expect(await exists(path.join(seeded.copy, "repo", "README.md"))).toBe(true);
+    expect(await exists(path.join(seeded.copy, "notes.md"))).toBe(true);
+  });
+
+  it("does not remove clones while an open task uses the copy", async () => {
+    const seeded = await seedIdleCopy({ issueStatus: "in_progress" });
+    await service().sweepTerminalWorkspaces();
+    expect(await exists(seeded.clean)).toBe(true);
+    expect(await exists(path.join(seeded.copy, "node_modules"))).toBe(true);
+  });
+
+  it("does not remove clones from a copy changed in the last 48 hours", async () => {
+    const seeded = await seedIdleCopy({});
+    await writeFile(path.join(seeded.copy, "repo", "fresh.txt"), "x\n");
+    await service().sweepTerminalWorkspaces();
+    expect(await exists(seeded.clean)).toBe(true);
+    expect(await exists(path.join(seeded.copy, "notes.md"))).toBe(true);
+  });
+
+  it("does not remove clones from a copy used in the last 48 hours", async () => {
+    const seeded = await seedIdleCopy({});
+    await db.update(executionWorkspaces).set({ lastUsedAt: new Date() }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await service().sweepTerminalWorkspaces();
+    expect(await exists(seeded.clean)).toBe(true);
+  });
+
+  it("removes a clean worktree through Git and keeps its dirty main repository", async () => {
+    const seeded = await seed({ state: "dirty", lastUsedAgoMs: 49 * HOUR_MS });
+    const main = path.join(seeded.copy, "repo");
+    const worktree = path.join(seeded.copy, "wt");
+    await git(main, ["worktree", "add", "--detach", worktree, "HEAD"]);
+    await age(seeded.copy, 49 * HOUR_MS);
+    await service().sweepTerminalWorkspaces();
+    expect(await exists(worktree)).toBe(false);
+    expect(await fs.readFile(path.join(main, "README.md"), "utf8")).toContain("uncommitted");
+    expect(await git(main, ["worktree", "list", "--porcelain"])).not.toContain(worktree);
   });
 });
