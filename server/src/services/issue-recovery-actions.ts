@@ -780,6 +780,7 @@ export async function closeRecoveryActionsForTerminalSourceIssue(
       })
       .where(and(...predicates))
       .returning(),
+    { companyId: input.companyId },
   );
 }
 
