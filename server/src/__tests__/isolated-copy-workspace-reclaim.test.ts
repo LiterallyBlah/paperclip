@@ -142,6 +142,31 @@ describe("isolated copy workspace inspection", () => {
     expect(decision.reasons).toEqual(expect.arrayContaining(["mail", "files_outside_repositories"]));
     expect(decision.action).toBe("compact");
   });
+
+  it("does not archive a regenerable-named directory outside any repository", async () => {
+    const root = await tempRoot();
+    const copy = path.join(root, "isolated-workspaces", "c", "i");
+    await cloneInto(copy, "a", "pushed");
+    await writeFile(path.join(copy, "target", "x.pcap"), "capture");
+    const inspection = await inspectIsolatedCopyDir(copy);
+    const decision = decideIsolatedCopyReclaim(inspection);
+    expect(decision.action).not.toBe("archive");
+    expect(decision.reasons).toContain("files_outside_repositories");
+    expect(inspection.regenerableDirs).not.toContain("target");
+  });
+
+  it("does not archive an in-repo directory ignored only by .git/info/exclude", async () => {
+    const root = await tempRoot();
+    const copy = path.join(root, "isolated-workspaces", "c", "i");
+    const repo = await cloneInto(copy, "a", "pushed");
+    await fs.appendFile(path.join(repo, ".git", "info", "exclude"), "build/\n");
+    await writeFile(path.join(repo, "build", "report.txt"), "findings");
+    const inspection = await inspectIsolatedCopyDir(copy);
+    const decision = decideIsolatedCopyReclaim(inspection);
+    expect(decision.action).not.toBe("archive");
+    expect(decision.reasons).toContain("ignored_files");
+    expect(inspection.regenerableDirs.sort()).toEqual(["a/dist", "a/node_modules"]);
+  });
 });
 
 describeEmbeddedPostgres("isolated copy workspace reclaim sweep", () => {

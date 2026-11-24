@@ -98,11 +98,21 @@ function classifyProtected(name: string, isDirectory: boolean): "database" | "ma
   return null;
 }
 
-function isRegenerablePath(relativePath: string) {
-  return relativePath.split("/").some((segment) => REGENERABLE_WORKSPACE_DIR_NAMES.has(segment));
+// True when `relativePath` is one of `dirs` or lies below one of them.
+function isWithinDirs(relativePath: string, dirs: string[]) {
+  const value = relativePath.replace(/\/+$/, "");
+  return dirs.some((dir) => value === dir || value.startsWith(`${dir}/`));
 }
 
-async function inspectRepo(root: string, relativePath: string, signal?: AbortSignal): Promise<IsolatedCopyRepoState> {
+// Returns the repository state and every path Git reports as ignored. The
+// caller checks the ignored paths against the regenerable directories that
+// `findRegenerableWorkspaceDirs` vouches for; a name alone is not evidence.
+async function inspectRepo(
+  root: string,
+  relativePath: string,
+  signal?: AbortSignal,
+): Promise<{ state: IsolatedCopyRepoState; ignoredPaths: string[] }> {
+  const ignoredPaths: string[] = [];
   const repoPath = path.join(root, relativePath);
   const state: IsolatedCopyRepoState = {
     relativePath,
@@ -118,7 +128,7 @@ async function inspectRepo(root: string, relativePath: string, signal?: AbortSig
       const code = entry.slice(0, 2);
       const file = entry.slice(3);
       if (code === "!!") {
-        if (!isRegenerablePath(file)) state.ignoredNonRegenerable = true;
+        ignoredPaths.push(file);
       } else if (!/^[RC]/.test(code) || file) {
         state.dirty = true;
       }
@@ -138,12 +148,15 @@ async function inspectRepo(root: string, relativePath: string, signal?: AbortSig
   } catch {
     state.inspectionFailed = true;
   }
-  return state;
+  return { state, ignoredPaths };
 }
 
 // Walks the directory without following symlinks. It finds nested Git
 // repositories, protected files (databases, mail, evidence) and files that no
-// repository holds. Regenerable directories are not searched.
+// repository holds. Inside a repository, regenerable-named directories are not
+// searched; Git status and `findRegenerableWorkspaceDirs` decide whether they
+// are really regenerable. Outside any repository nothing vouches for them, so
+// they count as unversioned files.
 export async function inspectIsolatedCopyDir(root: string, options: { signal?: AbortSignal } = {}): Promise<IsolatedCopyInspection> {
   const result: IsolatedCopyInspection = { repos: [], protectedFiles: [], unversionedPaths: [], regenerableDirs: [], truncated: false };
   const repoPaths: string[] = [];
@@ -174,7 +187,10 @@ export async function inspectIsolatedCopyDir(root: string, options: { signal?: A
       const isDirectory = entry.isDirectory();
       const kind = classifyProtected(entry.name, isDirectory);
       if (kind) result.protectedFiles.push({ kind, relativePath });
-      if (isDirectory && REGENERABLE_WORKSPACE_DIR_NAMES.has(entry.name)) continue;
+      if (isDirectory && REGENERABLE_WORKSPACE_DIR_NAMES.has(entry.name)) {
+        if (!repoHere) result.unversionedPaths.push(relativePath);
+        continue;
+      }
       if (!repoHere && !isDirectory) result.unversionedPaths.push(relativePath);
       if (isDirectory && depth < PROTECTED_SEARCH_DEPTH) await walk(relativePath, depth + 1, repoHere);
       else if (isDirectory && !repoHere) result.unversionedPaths.push(relativePath);
@@ -183,10 +199,13 @@ export async function inspectIsolatedCopyDir(root: string, options: { signal?: A
 
   await walk("", 0, false);
   for (const repoPath of repoPaths) {
-    const repo = await inspectRepo(root, repoPath, options.signal);
+    const { state: repo, ignoredPaths } = await inspectRepo(root, repoPath, options.signal);
     result.repos.push(repo);
     if (repo.inspectionFailed) continue;
     const dirs = await findRegenerableWorkspaceDirs(path.join(root, repoPath), { signal: options.signal }).catch(() => []);
+    // An ignored path that compaction would not remove (for example one that
+    // only `.git/info/exclude` ignores) would be lost by an archive.
+    if (ignoredPaths.some((ignored) => !isWithinDirs(ignored, dirs))) repo.ignoredNonRegenerable = true;
     result.regenerableDirs.push(...dirs.map((dir) => (repoPath ? path.posix.join(repoPath, dir) : dir)));
   }
   return result;
