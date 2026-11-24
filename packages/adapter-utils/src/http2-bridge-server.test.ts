@@ -2021,6 +2021,49 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
     }
   });
 
+  it("relays agent self-rotate of a bound secret and denies its lookalikes before forwarding", async () => {
+    const seen: Http2BridgeForwardRequest[] = [];
+    const { gateway, handle } = createTestPair({
+      routes: HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
+      forwardRequest: async (request) => {
+        seen.push(request);
+        return { status: 200, headers: { "content-type": "application/json" }, body: Buffer.from("{}") };
+      },
+    });
+    try {
+      const rotatePath = "/api/agents/me/secrets/bla4083.dummy.a/rotate";
+      const allowed = await gateway.forwardRequest({
+        method: "POST", path: rotatePath, query: "", headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({ value: "x" })), receivedToken: BRIDGE_TOKEN,
+      });
+      expect(allowed.status).toBe(200);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ method: "POST", pathname: rotatePath });
+      expect(seen[0]?.headers.authorization).toBeUndefined();
+      for (const request of [
+        { method: "GET", path: rotatePath },
+        { method: "PUT", path: rotatePath },
+        { method: "POST", path: "/api/agents/11111111-1111-4111-8111-111111111111/secrets/k/rotate" },
+        { method: "POST", path: "/api/agents/me/secrets/k" },
+        { method: "POST", path: "/api/agents/me/secrets/k/rotate/x" },
+        { method: "POST", path: "/api/agents/me/secrets/a/b/rotate" },
+        { method: "POST", path: "/api/secrets/11111111-1111-4111-8111-111111111111/rotate" },
+        { method: "POST", path: "/api/companies/11111111-1111-4111-8111-111111111111/me/user-secrets/22222222-2222-4222-8222-222222222222/rotate" },
+        { method: "GET", path: "/api/agents/me/secrets" },
+      ]) {
+        const response = await gateway.forwardRequest({
+          ...request, query: "", headers: {},
+          body: request.method === "GET" ? Buffer.alloc(0) : Buffer.from("{}"), receivedToken: BRIDGE_TOKEN,
+        });
+        expect(response.status, `${request.method} ${request.path}`).toBe(403);
+      }
+      expect(seen).toHaveLength(1);
+    } finally {
+      await gateway.close();
+      await handle.close();
+    }
+  });
+
   it("test_a_maximum_size_multipart_attachment_upload_fits_through_the_bridge", async () => {
     // A file at the exact attachment content ceiling (10 MiB — the same
     // figure `MAX_ATTACHMENT_BYTES` in `server/src/attachment-types.ts`
