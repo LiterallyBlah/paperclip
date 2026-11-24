@@ -122,6 +122,7 @@ import {
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
+import { removeAgentEnvSecretBinding, removeAgentSecretBindingSchema } from "../services/agent-secret-binding-removal.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
@@ -5634,6 +5635,30 @@ export function agentRoutes(
     });
 
     res.json(redactAgentRowForResponse(agent));
+  });
+
+  // Conditional, board-only removal of exactly one agent env secret binding.
+  // The service re-checks the env leaf and the binding row under the agent row
+  // lock and answers 409 on any mismatch, so a stale or repeated call writes
+  // nothing. Other config keys, bindings and access grants are kept.
+  router.post("/agents/:id/secret-bindings/remove", async (req, res) => {
+    assertBoard(req);
+    const parsed = removeAgentSecretBindingSchema.safeParse(req.body);
+    if (!parsed.success) throw unprocessable("Invalid secret binding removal request", parsed.error.issues);
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+    if (!existing) return;
+    await assertCanUpdateAgent(req, existing);
+    const actor = getActorInfo(req);
+    const result = await removeAgentEnvSecretBinding(db, existing.id, parsed.data, {
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+    });
+    res.json({ ...redactAgentRowForResponse(result.agent), removed: result.removed });
   });
 
   router.post("/agents/:id/lifecycle/retry", async (req, res) => {
