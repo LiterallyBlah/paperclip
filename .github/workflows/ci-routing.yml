@@ -380,25 +380,31 @@ jobs:
           STACK_JSON: ${{ toJSON(github.event.pull_request.stack) }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_MERGE_SHA: ${{ github.sha }}
+          # Plan from the same repository and base branch whose runner scripts
+          # the merge executes. Upstream master's matrix can shard lanes this
+          # tree's run-vitest-stable.mjs rejects (BLA-5008).
+          PLAN_REPOSITORY: ${{ github.repository }}
+          PLAN_BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
           fallback() { echo 'plan=' >> "$GITHUB_OUTPUT"; exit 0; }
           [[ "$FULL_CI" == 'true' ]] || fallback
           [[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$EVENT_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]] || fallback
-          trusted="$(gh api /repos/paperclipai/paperclip/git/ref/heads/master --jq .object.sha)" || fallback
+          [[ "$PLAN_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && "$PLAN_BASE_REF" =~ ^[A-Za-z0-9_./-]+$ ]] || fallback
+          trusted="$(gh api "/repos/$PLAN_REPOSITORY/git/ref/heads/$PLAN_BASE_REF" --jq .object.sha)" || fallback
           [[ "$trusted" =~ ^[0-9a-f]{40}$ ]] || fallback
           directory="$(mktemp -d)"
           trap 'rm -rf "$directory"' EXIT
           for file in .github/scripts/ci-plan.mjs .github/scripts/ci-inputs.mjs .github/scripts/ci-diff.mjs .github/ci-task-matrix.json turbo.json; do
             gh api -H 'Accept: application/vnd.github.raw+json' \
-              "/repos/paperclipai/paperclip/contents/$file?ref=$trusted" \
+              "/repos/$PLAN_REPOSITORY/contents/$file?ref=$trusted" \
               > "$directory/${file##*/}" || fallback
           done
           # Read the exact tested merge and both parents. The event's base SHA can
           # lag behind its actual first parent. A bare tree diff has no API file cap.
           git init --bare "$directory/repository.git" >/dev/null || fallback
           git -C "$directory/repository.git" fetch --quiet --no-tags --filter=blob:none --depth=2 \
-            https://github.com/paperclipai/paperclip.git "$EVENT_MERGE_SHA" || fallback
+            "https://github.com/$PLAN_REPOSITORY.git" "$EVENT_MERGE_SHA" || fallback
           if [[ "$PROFILE_CI" == 'true' || "$FORCE_FULL_CI" == 'true' ]]; then
             export CI_FORCE_REASON='Full suite requested by label'
           elif [[ "$STACK_JSON" != 'null' && -n "$STACK_JSON" ]]; then

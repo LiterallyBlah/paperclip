@@ -46,7 +46,12 @@ import {
   inspectIsolatedCopyDir,
   isIsolatedCopyWorkspace,
   ISOLATED_COPY_RECLAIM_MIN_IDLE_MS,
+  moveIsolatedCopyCloneEvidence,
   planIsolatedCopyCloneReclaim,
+  removeExternalIsolatedCopyWorktree,
+  restoreIsolatedCopyCloneEvidence,
+  type IsolatedCopyCloneRemoval,
+  type IsolatedCopyEvidenceMove,
   pruneGitWorktrees,
   type IsolatedCopyInspection,
 } from "./isolated-copy-workspace-reclaim.js";
@@ -2705,7 +2710,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     const exists = await fs.lstat(dir).then((stat) => stat.isDirectory(), () => false);
     const inspection = exists
       ? await inspectIsolatedCopyDir(dir, { signal })
-      : { repos: [], protectedFiles: [], unversionedPaths: [], regenerableDirs: [], outsideRegenerableDirs: [], outsideRegenerableHeld: [], newestMtimeMs: 0, truncated: false };
+      : { repos: [], protectedFiles: [], unversionedPaths: [], regenerableDirs: [], outsideRegenerableDirs: [], outsideRegenerableHeld: [], newestMtimeMs: 0, truncated: false, nestedRepoPaths: [] };
     const decision = decideIsolatedCopyReclaim(inspection);
     const logBase = {
       event: "execution_workspace.isolated_copy_reclaim",
@@ -2918,7 +2923,52 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           if (!(await idleIsolatedCopyGuardPasses(tx, row))) return null;
         }
         if (await isolatedCopyHasOpenUser(tx, workspace.companyId, sharingIds)) return null;
-        return moveWorkspaceDirsToTrash(dir, paths);
+        // Evidence first: a clone whose files cannot be moved stays whole.
+        const evidenceMoves = new Map<string, IsolatedCopyEvidenceMove[]>();
+        const failed = new Set<string>();
+        for (const entry of plan.remove) {
+          try {
+            evidenceMoves.set(entry.relativePath, await moveIsolatedCopyCloneEvidence(dir, entry));
+          } catch (error) {
+            failed.add(entry.relativePath);
+            logger.warn({ err: error, dir, relativePath: entry.relativePath }, "isolated copy clone evidence move failed; clone kept");
+          }
+        }
+        const externalRemoved: string[] = [];
+        for (const entry of plan.remove.filter((item) => item.kind === "external_worktree" && !failed.has(item.relativePath))) {
+          try {
+            await removeExternalIsolatedCopyWorktree(dir, entry, signal);
+            externalRemoved.push(entry.relativePath);
+          } catch (error) {
+            failed.add(entry.relativePath);
+            logger.warn({ err: error, dir, relativePath: entry.relativePath }, "isolated copy external worktree removal failed; worktree kept");
+          }
+        }
+        // A main repository goes only together with all of its worktrees.
+        const keptMains = new Set(plan.remove.filter((item) => item.kind === "worktree" && failed.has(item.relativePath))
+          .map((item) => path.resolve(item.mainRepoPath)));
+        for (const entry of plan.remove) {
+          if (entry.kind === "clone" && keptMains.has(path.resolve(dir, entry.relativePath))) failed.add(entry.relativePath);
+        }
+        const trashPaths = [
+          ...plan.remove.filter((item) => item.kind !== "external_worktree" && !failed.has(item.relativePath)).map((item) => item.relativePath),
+          ...plan.compactOutside,
+        ];
+        // A clone that stayed gets its evidence back.
+        const restoreStayed = async (trashed: Set<string>) => {
+          for (const entry of plan.remove) {
+            if (externalRemoved.includes(entry.relativePath) || trashed.has(entry.relativePath)) continue;
+            await restoreIsolatedCopyCloneEvidence(evidenceMoves.get(entry.relativePath) ?? []).catch((error) => {
+              logger.warn({ err: error, dir, relativePath: entry.relativePath }, "failed to restore isolated copy clone evidence; it stays in the evidence directory");
+            });
+          }
+        };
+        const trash = await moveWorkspaceDirsToTrash(dir, trashPaths).catch(async (error) => {
+          await restoreStayed(new Set());
+          throw error;
+        });
+        await restoreStayed(new Set(trash.moved.map((item) => item.relativePath)));
+        return { ...trash, moved: [...trash.moved, ...externalRemoved.map((relativePath) => ({ relativePath, trashPath: "" }))] };
       });
       if (!moves) return 0;
       const moved = new Set(moves.moved.map((entry) => entry.relativePath));
@@ -2936,7 +2986,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         logger.warn({ err: error, trashDir: moves.trashDir }, "failed to delete removed isolated copy clones; a later sweep retries");
       });
       remember();
-      const removedClones = plan.remove.filter((entry) => moved.has(entry.relativePath));
+      const removedClones: IsolatedCopyCloneRemoval[] = plan.remove.filter((entry) => moved.has(entry.relativePath));
       const compactedOutside = plan.compactOutside.filter((entry) => moved.has(entry));
       if (moved.size > 0) {
         await logActivity(db, {
