@@ -1197,6 +1197,8 @@ export type {
   ConnectionIntentPayload,
   ConnectionIntentResult,
   RequestConfirmationSecretProposalPayload,
+  RequestConfirmationSecretProposalBinding,
+  IssueThreadInteractionSecretProposalReadiness,
   RequestConfirmationSecretProposalResult,
   RequestCheckboxConfirmationOption,
   RequestCheckboxConfirmationPayload,
@@ -2188,6 +2190,8 @@ export {
   secretProviderConfigPayloadSchema,
   createSecretBindingSchema,
   rotateSecretSchema,
+  agentRotateBoundSecretSchema,
+  AGENT_BOUND_SECRET_ROTATE_MAX_VALUE_BYTES,
   secretBindingTargetSchema,
   updateSecretSchema,
   createToolActionRequestSchema,
@@ -2907,3 +2911,4 @@ export {
   TASK_IDENTITY_CHANGED_FIELD,
   issueActivityChangesTaskIdentity,
 } from "./issue-activity-identity.js";
+export { markdownToPlainPreview } from "./markdown-plain-text.js";

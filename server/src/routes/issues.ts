@@ -26,6 +26,7 @@ import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../services/native-runtime/native-workspace-finalization-recovery-state.js";
 import { monitorPoliciesEqual, applyActorMonitorScheduledBy, assertCanManageIssueMonitor, summarizeIssueMonitor } from "../services/issue-monitors.js";
 import type { IssuePrivacyConstraints } from "@paperclipai/shared";
+import type { IssueThreadInteractionSecretProposalReadiness } from "@paperclipai/shared";
 import { canActorReadHeartbeatRun } from "../services/heartbeat-run-privacy.js";
 import {
   childCreatedByRequest,
@@ -269,7 +270,11 @@ import {
   type QueuedCommentIssueContext,
 } from "../modules/wake-queue/index.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
-import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
+import {
+  actorHasSecretDefinitionAdminAccess,
+  assertCanResolveProposal,
+  proposalResolutionBlockReason,
+} from "../services/secret-proposal-authorization.js";
 import {
   buildDocumentReviewContext,
   buildPlanReviewContext,
@@ -446,8 +451,15 @@ import {
   queuedCommentIdsFromWakePayload,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
+import { isOperatorHeldRecoveryAction } from "../services/recovery/recovery-owner-routing.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+/**
+ * Task statuses a stopped pending-stage recovery may keep: the stage's own
+ * `in_review`, or `blocked` when the source run's automatic no-replay
+ * settlement projected it (BLA-4186; proven inside the recovery).
+ */
+const STOPPED_STAGE_RECOVERY_STATUSES = new Set<string>(["in_review", "blocked"]);
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -3547,6 +3559,40 @@ export function issueRoutes(
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const secretProposals = createSecretProposalsService(db);
+  async function secretProposalCardReadiness(
+    req: Request,
+    companyId: string,
+    interaction: {
+      id: string;
+      kind: string;
+      status: string;
+      payload?: unknown;
+    },
+  ): Promise<IssueThreadInteractionSecretProposalReadiness | null> {
+    if (interaction.kind !== "request_confirmation" || interaction.status !== "pending") return null;
+    const linked = readObject(readObject(interaction.payload).secretProposal);
+    const proposalId = readNonEmptyString(linked.proposalId);
+    if (!proposalId) return null;
+    const plan = await secretProposals.planCardApproval(companyId, interaction.id, proposalId);
+    const base = {
+      approvesSecret: Boolean(plan.secret),
+      bindingCount: plan.bindings.length,
+    };
+    if (plan.blockReason) {
+      return { ...base, canAccept: false, blockReason: plan.blockReason };
+    }
+    for (const proposal of [...(plan.secret ? [plan.secret] : []), ...plan.bindings]) {
+      const reason = await proposalResolutionBlockReason({
+        db,
+        actor: req.actor,
+        companyId,
+        proposal,
+        targetAgentName: proposal.targetId ? plan.targetAgentNames.get(proposal.targetId) : null,
+      });
+      if (reason) return { ...base, canAccept: false, blockReason: reason };
+    }
+    return { ...base, canAccept: true, blockReason: null };
+  }
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
@@ -7854,6 +7900,10 @@ export function issueRoutes(
    * source run are cleared, and the participant gets one stage wake (post
    * commit) keyed by issue, stage and review round. Every refusal throws
    * before any write, so the transaction leaves no state change.
+   *
+   * BLA-4186: the task may also be `blocked`, but only by this source run's
+   * own automatic no-replay settlement (outcome `blocked`, replay `blocked`,
+   * same run) with no unblock descriptor. The status stays `blocked`.
    */
   async function reconcileStoppedPendingStage(input: {
     req: Request;
@@ -7883,7 +7933,7 @@ export function issueRoutes(
     const stage = state?.currentStageId
       ? policy?.stages.find((candidate) => candidate.id === state.currentStageId) ?? null
       : null;
-    if (issue.status !== "in_review" || state?.status !== "pending" || !participant || !stage ||
+    if (!STOPPED_STAGE_RECOVERY_STATUSES.has(issue.status) || state?.status !== "pending" || !participant || !stage ||
         stage.type !== state.currentStageType) {
       throw refuse("The task has no pending execution stage to resume.", "stage_recovery_stage_not_pending");
     }
@@ -7902,6 +7952,14 @@ export function issueRoutes(
     if (typeof sourceRunId !== "string" || decision.runId !== sourceRunId) {
       throw refuse("The reconciliation does not name this recovery action's source run.",
         "stage_recovery_source_mismatch");
+    }
+    if (issue.status === "blocked") {
+      const automatic = action.evidence.automaticRecovery as { replay?: unknown; runId?: unknown } | undefined;
+      if (action.outcome !== "blocked" || automatic?.replay !== "blocked" || automatic.runId !== sourceRunId ||
+          issue.unblockDescriptor != null) {
+        throw refuse("The task is blocked by something other than this source run's automatic recovery stop.",
+          "stage_recovery_block_unverified", { sourceRunId });
+      }
     }
     const [sourceRun] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sourceRunId),
@@ -8084,7 +8142,8 @@ export function issueRoutes(
         state.currentParticipant?.type !== "agent" || state.currentParticipant.agentId !== owner.agentId ||
         issue.assigneeAgentId !== owner.agentId || !redeliveryOwnerAdmitted(action, owner.agentId, state) ||
         owner.idempotencyKey !== pendingStageRecoveryWakeKey(issue.id, owner) ||
-        issue.checkoutRunId || issue.executionRunId) return null;
+        issue.checkoutRunId || issue.executionRunId ||
+        (issue.status === "blocked" && issue.unblockDescriptor != null)) return null;
     const [delivered] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId),
       eq(agentWakeupRequests.agentId, owner.agentId),
@@ -10910,7 +10969,17 @@ export function issueRoutes(
           eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
           actionId ? eq(issueRecoveryActions.id, actionId) : inArray(issueRecoveryActions.status, ["active", "escalated"]),
         )).limit(1).for("update");
+        // BLA-4186: `restored` at an unchanged `blocked` status, without
+        // workspace repair evidence, is admitted only by the settled
+        // stopped-pending-stage recovery below.
+        const blockedStageRecoveryOnly = outcome === "restored" && sourceIssueStatus === "blocked" &&
+          !executionReconciliation?.workspaceRepairEvidence;
+        const refuseBlockedRestore = () => unprocessable(
+          "Restored recovery actions must move the source issue to todo, done, or in_review",
+          { code: "recovery_restore_status_invalid" },
+        );
         if (workspaceRepairAction && hasRequiredWorkspaceRecovery(workspaceRepairAction.evidence)) {
+          if (blockedStageRecoveryOnly) throw refuseBlockedRestore();
           assertBoard(req);
           await requireRecoveryActionAuthority(req, lockedIssue, issueRecoveryActionReadModel(workspaceRepairAction),
             { source: "recovery_action_resolution" });
@@ -10967,7 +11036,7 @@ export function issueRoutes(
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
               assertBoard(req);
-              if (sourceIssueStatus === "in_review" && lockedIssue.status === "in_review") {
+              if (sourceIssueStatus === lockedIssue.status && STOPPED_STAGE_RECOVERY_STATUSES.has(lockedIssue.status)) {
                 const stageRecovery = await reconcileStoppedPendingStage({
                   req, tx: tx as unknown as Db, issue: lockedIssue, action: settled,
                   decision: executionReconciliation, outcome, resolutionNote: resolutionNote ?? null,
@@ -10994,11 +11063,14 @@ export function issueRoutes(
               activeRecoveryAction = issueRecoveryActionReadModel(reopened!);
             } else {
               const redelivery = executionReconciliation && outcome === "restored" &&
-                sourceIssueStatus === "in_review" && lockedIssue.status === "in_review"
+                sourceIssueStatus === lockedIssue.status && STOPPED_STAGE_RECOVERY_STATUSES.has(lockedIssue.status)
                 ? await redeliverStoppedPendingStage({ req, tx: tx as unknown as Db, issue: lockedIssue,
                   action: settled, decision: executionReconciliation })
                 : null;
               if (redelivery) return { issue: lockedIssue, ...redelivery, stageRecovery: true as const };
+              const stageRecovered = (settled.evidence.continuationDeliveryOwner as
+                PendingStageParticipantDeliveryOwner | undefined)?.kind === "pending_stage_participant";
+              if (blockedStageRecoveryOnly && !stageRecovered) throw refuseBlockedRestore();
               return {
                 issue: lockedIssue,
                 recoveryAction: settled,
@@ -11007,6 +11079,7 @@ export function issueRoutes(
             }
           }
         }
+        if (blockedStageRecoveryOnly) throw refuseBlockedRestore();
         if (
           !activeRecoveryAction ||
           (actionId && activeRecoveryAction.id !== actionId)
@@ -11108,7 +11181,7 @@ export function issueRoutes(
         ) {
           if (
             lockedIssue.status !== "blocked" ||
-            activeRecoveryAction.ownerType !== "board" ||
+            !isOperatorHeldRecoveryAction(activeRecoveryAction) ||
             (!workspaceBaseRef && !workspaceRetry && activeRecoveryAction.wakePolicy?.type !== "board_escalation") ||
             !activeRecoveryAction.returnOwnerAgentId ||
             lockedIssue.assigneeAgentId !== activeRecoveryAction.returnOwnerAgentId
@@ -15826,11 +15899,26 @@ export function issueRoutes(
       }
       const enteringBlocked =
         existing.status !== "blocked" && updateFields.status === "blocked";
-      if (enteringBlocked) {
+      // A task that stays blocked can lose its last real wait through a later
+      // edit: an emptied blocker list or a cleared unblock descriptor. That
+      // leaves a narrative-only block nothing will ever wake, so it takes the
+      // same check as entering blocked. A kept blocker link stays a wait even
+      // when its blockers are finished: the dependency-ready wake owns it.
+      const droppingBlockedWait =
+        existing.status === "blocked" &&
+        nextStatus === "blocked" &&
+        ((Array.isArray(req.body.blockedByIssueIds) &&
+          req.body.blockedByIssueIds.length === 0) ||
+          (req.body.unblockDescriptor === null && existing.unblockDescriptor != null));
+      if (enteringBlocked || droppingBlockedWait) {
         const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
           ? [...new Set(req.body.blockedByIssueIds as string[])]
           : null;
-        const hasUnresolvedBlocker = requestedBlockerIds
+        const hasUnresolvedBlocker = !enteringBlocked
+          ? requestedBlockerIds
+            ? requestedBlockerIds.length > 0
+            : (await svc.getDependencyReadiness(existing.id)).blockerIssueIds.length > 0
+          : requestedBlockerIds
           ? requestedBlockerIds.length > 0 &&
             (await db
               .select({ id: issueRows.id })
@@ -15874,15 +15962,47 @@ export function issueRoutes(
             .limit(1)
             .then((rows) => rows[0] ?? null),
         ]);
+        // A person who owns the task, or the current human stage participant,
+        // is a native human wait the board already sees.
+        const nextAssigneeUserId =
+          updateFields.assigneeUserId !== undefined
+            ? updateFields.assigneeUserId
+            : existing.assigneeUserId;
+        const nextExecutionState = parseIssueExecutionState(
+          updateFields.executionState !== undefined
+            ? updateFields.executionState
+            : existing.executionState,
+        );
+        const humanWait =
+          Boolean(nextAssigneeUserId) ||
+          (nextExecutionState?.status === "pending" &&
+            nextExecutionState.currentParticipant?.type === "user");
+        // An active recovery action that already holds a blocked task is its
+        // own board-visible wait; editing the task's links must not fail on it.
+        const recoveryHeld =
+          droppingBlockedWait &&
+          (activeRecoveryActionBeforeUpdate ??
+            (await recoveryActionsSvc.getActiveForIssue(
+              existing.companyId,
+              existing.id,
+            ))) != null;
+        const effectiveDescriptor = enteringBlocked
+          ? descriptor
+          : updateFields.unblockDescriptor !== undefined
+            ? updateFields.unblockDescriptor
+            : existing.unblockDescriptor;
         if (
           !hasUnresolvedBlocker &&
           !pendingInteraction &&
           !pendingApproval &&
-          !descriptor
+          !humanWait &&
+          !recoveryHeld &&
+          !effectiveDescriptor
         ) {
           res.status(422).json({
-            error:
-              "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
+            error: enteringBlocked
+              ? "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor"
+              : "A blocked task must keep unresolved blockers, a pending interaction/approval, or unblockDescriptor; move it out of blocked instead",
           });
           return;
         }
@@ -18993,7 +19113,20 @@ export function issueRoutes(
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const interactions =
       await issueThreadInteractionService(db).listForIssue(id);
-    res.json(interactions);
+    res.json(
+      await Promise.all(
+        interactions.map(async (interaction) => {
+          const readiness = await secretProposalCardReadiness(
+            req,
+            issue.companyId,
+            interaction,
+          );
+          return readiness
+            ? { ...interaction, secretProposalReadiness: readiness }
+            : interaction;
+        }),
+      ),
+    );
   });
 
   router.post(
@@ -19237,6 +19370,22 @@ export function issueRoutes(
       const actor = getActorInfo(req);
       if (
         current.kind === "request_confirmation" &&
+        current.status === "pending" &&
+        current.payload.secretProposal &&
+        !opts.approveSecretProposal
+      ) {
+        // Refuse before the card is marked accepted, with the same plain
+        // reason the card already shows, instead of failing after the click.
+        const readiness = await secretProposalCardReadiness(req, issue.companyId, current);
+        if (readiness && !readiness.canAccept) {
+          throw unprocessable(
+            readiness.blockReason ?? "This secret proposal cannot be approved from this card",
+            { code: "secret_proposal_not_approvable" },
+          );
+        }
+      }
+      if (
+        current.kind === "request_confirmation" &&
         current.payload.toolAction
       ) {
         if (!opts.approveToolActionRequest)
@@ -19346,13 +19495,20 @@ export function issueRoutes(
             );
             if (
               !proposal ||
-              proposal.kind !== "binding" ||
-              proposal.originIssueId !== issue.id ||
-              proposal.interactionId !== interaction.id
+              proposal.interactionId !== interaction.id ||
+              (proposal.kind === "binding" && proposal.originIssueId !== issue.id)
             ) {
               throw notFound("Secret proposal not found");
             }
-            await secretProposals.approve(issue.companyId, proposal.id, {
+            if (req.actor.type !== "board" || actor.actorType !== "user") {
+              throw forbidden("Only a board user can approve secret proposals");
+            }
+            // One decision: a pending secret proposal behind this card is
+            // approved together with every binding on it (cascade). Each
+            // proposal passes the same checks as Secrets › Proposals.
+            const approved = await secretProposals.approveFromCard(issue.companyId, {
+              interactionId: interaction.id,
+              proposalId: proposal.id,
               resolvedByUserId,
               assertCanResolve: (lockedProposal, txDb) =>
                 assertCanResolveProposal({
@@ -19360,10 +19516,23 @@ export function issueRoutes(
                   actor: req.actor,
                   companyId: issue.companyId,
                   proposal: lockedProposal,
+                  assertSecretDefinitionAdmin: () => {
+                    if (!actorHasSecretDefinitionAdminAccess(req.actor, issue.companyId)) {
+                      throw forbidden("Company admin access required");
+                    }
+                  },
                 }),
             });
+            const configPaths = approved.bindings
+              .map((binding) => binding.configPath)
+              .filter((value): value is string => Boolean(value));
             await notifySecretProposalResolution({
-              proposal,
+              proposal: {
+                originIssueId: approved.bindings[0]?.originIssueId ?? approved.anchor.originIssueId,
+                kind: configPaths.length > 0 ? "binding" : "secret",
+                proposedName: approved.secretProposal?.proposedName ?? approved.anchor.proposedName,
+                configPath: configPaths.join(", ") || null,
+              },
               status: "approved",
               userId: resolvedByUserId,
               issues: svc,

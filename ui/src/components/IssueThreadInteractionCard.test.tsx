@@ -27,6 +27,8 @@ import {
   pendingToolActionWriteInteraction,
   issueThreadInteractionFixtureMeta,
   pendingSecretProposalInteraction,
+  pendingSecretBundleInteraction,
+  blockedSecretBundleInteraction,
   pendingConnectionAuthorizationInteraction,
   resolvedConnectionAuthorizationInteraction,
   executedSecretProposalInteraction,
@@ -1604,6 +1606,53 @@ describe("IssueThreadInteractionCard secret-proposal card", () => {
     );
   });
 
+  it("renders one card for a new secret with all its bindings", async () => {
+    const onAcceptInteraction = vi.fn(async () => undefined);
+    const host = renderCard({
+      interaction: pendingSecretBundleInteraction,
+      onAcceptInteraction,
+      onRejectInteraction: vi.fn(async () => undefined),
+    });
+    expect(host.textContent).toContain("Approve a new secret and its bindings");
+    expect(host.textContent).toContain("infra/light/training-ssh-ed25519");
+    expect(host.textContent).toContain("2 bindings");
+    expect(host.textContent).toContain("InfraEngineer");
+    expect(host.textContent).toContain("LabRunner");
+    expect(host.textContent).not.toContain("You cannot approve this from the card");
+    const approve = Array.from(host.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Approve secret & bindings"),
+    );
+    expect(approve?.disabled).toBe(false);
+    await act(async () => {
+      approve?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onAcceptInteraction).toHaveBeenCalledWith(pendingSecretBundleInteraction);
+  });
+
+  it("disables accept with a plain reason when the server says the cascade is not allowed", async () => {
+    const onAcceptInteraction = vi.fn(async () => undefined);
+    const onRejectInteraction = vi.fn(async () => undefined);
+    const host = renderCard({
+      interaction: blockedSecretBundleInteraction,
+      onAcceptInteraction,
+      onRejectInteraction,
+    });
+    expect(host.textContent).toContain("You cannot approve this from the card");
+    expect(host.textContent).toContain("Company owner or admin access is required");
+    const approve = Array.from(host.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("Approve secret & bindings"),
+    );
+    expect(approve?.disabled).toBe(true);
+    await act(async () => {
+      approve?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onAcceptInteraction).not.toHaveBeenCalled();
+    const reject = Array.from(host.querySelectorAll("button")).find((button) =>
+      button.textContent?.trim() === "Reject",
+    );
+    expect(reject?.disabled).toBe(false);
+  });
+
   it("renders an accepted proposal as executed rather than merely accepted", () => {
     const host = renderCard({ interaction: executedSecretProposalInteraction });
     expect(host.textContent).toContain("Executed");
@@ -1884,5 +1933,69 @@ describe("IssueThreadInteractionCard resolver audience", () => {
     expect(
       footer?.querySelector('[data-testid="interaction-resolved-by-agent-chip"]'),
     ).not.toBeNull();
+  });
+});
+
+describe("IssueThreadInteractionCard summary Markdown", () => {
+  const markdownSummary = [
+    "**Decision needed.** Pick the launch plan.",
+    "",
+    "- First option keeps the current scope",
+    "- Second option adds the [draft brief](/api/attachments/attachment-1/content)",
+    "",
+    "Background is in the [public notes](https://example.com/notes).",
+    "",
+    '<script>window.__summaryScriptRan = true</script><img src="x" onerror="window.__summaryImgRan = true">',
+    "",
+    "Do not follow [this link](javascript:window.__summaryLinkRan=true) or ![remote](https://example.com/pixel.png).",
+  ].join("\n");
+
+  function summaryHost() {
+    const host = renderCard({
+      interaction: { ...pendingAskUserQuestionsInteraction, summary: markdownSummary },
+    });
+    const summary = host.querySelector('[data-testid="interaction-summary"]');
+    expect(summary).not.toBeNull();
+    return summary as HTMLElement;
+  }
+
+  it("renders the summary as Markdown instead of raw text", () => {
+    const summary = summaryHost();
+    expect(summary.textContent).not.toContain("**");
+    expect(summary.querySelector("strong")?.textContent).toBe("Decision needed.");
+    const items = Array.from(summary.querySelectorAll("ul > li"));
+    expect(items.map((item) => item.textContent)).toEqual([
+      "First option keeps the current scope",
+      "Second option adds the draft brief",
+    ]);
+  });
+
+  it("keeps relative and external links as anchors with their href", () => {
+    const summary = summaryHost();
+    const relative = Array.from(summary.querySelectorAll("a")).find((a) => a.textContent?.includes("draft brief"));
+    expect(relative?.getAttribute("href")).toBe("/api/attachments/attachment-1/content");
+    const external = Array.from(summary.querySelectorAll("a")).find((a) => a.textContent?.includes("public notes"));
+    expect(external?.getAttribute("href")).toBe("https://example.com/notes");
+    expect(external?.getAttribute("rel")).toContain("noopener");
+  });
+
+  it("creates no raw HTML elements, keeps images inert and neutralises javascript: links", () => {
+    const summary = summaryHost();
+    const win = window as unknown as Record<string, unknown>;
+    expect(summary.querySelector("script")).toBeNull();
+    expect(summary.querySelector("img")).toBeNull();
+    expect(summary.querySelector("[onerror]")).toBeNull();
+    expect(win.__summaryScriptRan).toBeUndefined();
+    expect(win.__summaryImgRan).toBeUndefined();
+    expect(summary.querySelector("[data-markdown-image-reference]")?.textContent).toContain("remote");
+    const unsafe = Array.from(summary.querySelectorAll("a")).find((a) => a.textContent?.includes("this link"));
+    const href = unsafe?.getAttribute("href") ?? "";
+    expect(href.toLowerCase()).not.toContain("javascript:");
+    expect(Array.from(summary.querySelectorAll("a")).every((a) => !(a.getAttribute("href") ?? "").toLowerCase().startsWith("javascript:"))).toBe(true);
+  });
+
+  it("does not render the summary body for connection authorization cards", () => {
+    const host = renderCard({ interaction: pendingConnectionAuthorizationInteraction });
+    expect(host.querySelector('[data-testid="interaction-summary"]')).toBeNull();
   });
 });

@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 
-export type TaskDrainState = { startedAt: Date; expiresAt: Date | null; ownerId?: string };
+/**
+ * `operationId` names one maintenance operation (this drain) in its audit
+ * rows, so its exit can re-dispatch the work it ended exactly once.
+ */
+export type TaskDrainState = { startedAt: Date; expiresAt: Date | null; ownerId?: string; operationId?: string };
 let taskDrainState: TaskDrainState | null = null;
 const expiryListeners = new Set<() => void>();
 const changeListeners = new Set<() => void>();
@@ -68,6 +72,7 @@ export function readTaskDrain(now: Date): TaskDrainState | null {
 export function computeTaskDrain(opts: { ttlMs?: number | null; purpose?: "idle" } = {}): TaskDrainState {
   const startedAt = new Date();
   return { startedAt, expiresAt: opts.ttlMs == null ? null : new Date(startedAt.getTime() + opts.ttlMs),
+    operationId: randomUUID(),
     ...(opts.purpose === "idle" ? { ownerId: randomUUID() } : {}) };
 }
 

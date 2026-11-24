@@ -4,7 +4,13 @@ import path from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  cleanupStalePartialBackups,
+  createBufferedTextFileWriter,
+  createGzipTextFileWriter,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
@@ -37,6 +43,35 @@ async function createSiblingDatabase(connectionString: string, databaseName: str
   const targetUrl = new URL(connectionString);
   targetUrl.pathname = `/${databaseName}`;
   return targetUrl.toString();
+}
+
+async function waitFor(condition: () => boolean | Promise<boolean>, label: string, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await condition())) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+}
+
+function archives(dir: string): string[] {
+  return fs.readdirSync(dir).filter((name) => name.endsWith(".sql.gz")).sort();
+}
+
+function partials(dir: string): string[] {
+  return fs.readdirSync(dir).filter((name) => name.endsWith(".sql.gz.partial")).sort();
+}
+
+async function withPgDumpFixture<T>(dir: string, script: string, run: () => Promise<T>): Promise<T> {
+  const executable = path.join(dir, "pg-dump-fixture");
+  fs.writeFileSync(executable, `#!/bin/sh\n${script}`, { mode: 0o700 });
+  const previous = process.env.PAPERCLIP_PG_DUMP_PATH;
+  process.env.PAPERCLIP_PG_DUMP_PATH = executable;
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) delete process.env.PAPERCLIP_PG_DUMP_PATH;
+    else process.env.PAPERCLIP_PG_DUMP_PATH = previous;
+  }
 }
 
 afterEach(async () => {
@@ -73,6 +108,192 @@ describe("createBufferedTextFileWriter", () => {
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
   });
+});
+
+describe("createGzipTextFileWriter", () => {
+  it("gunzips to exactly what the plain buffered writer writes for the same calls", async () => {
+    const tempDir = createTempDir("paperclip-gzip-writer-");
+    const plainPath = path.join(tempDir, "plain.sql");
+    const gzipPath = path.join(tempDir, "stream.sql.gz");
+    const plain = createBufferedTextFileWriter(plainPath, 64);
+    const gzip = createGzipTextFileWriter(gzipPath, 64);
+    const writers = [plain, gzip];
+    const apply = async (step: (writer: typeof plain) => unknown) => {
+      for (const writer of writers) await step(writer);
+    };
+
+    await apply((w) => w.emit("-- header"));
+    await apply((w) => w.emit(""));
+    for (let i = 0; i < 500; i++) {
+      await apply((w) => w.emit(`INSERT INTO t VALUES (${i}, 'r\u00e9sum\u00e9 ${"x".repeat(i % 37)}');`));
+      if (i % 97 === 0) await apply((w) => w.drain());
+      if (i % 151 === 0) {
+        await apply((w) => w.writeRaw("\n"));
+        await apply((w) => w.writeRaw(Buffer.from(`${i}\tcopy row\n`)));
+        await apply((w) => w.writeRaw("\\.\n"));
+      }
+    }
+    await apply((w) => w.emit("COMMIT;"));
+    await apply((w) => w.emit(""));
+    await apply((w) => w.close());
+
+    const expected = fs.readFileSync(plainPath);
+    expect(expected.length).toBeGreaterThan(10_000);
+    expect(gunzipSync(fs.readFileSync(gzipPath)).equals(expected)).toBe(true);
+    expect(expected.toString("utf8").endsWith("COMMIT;\n")).toBe(true);
+  });
+
+  it("rethrows the underlying stream error and leaves no file when the output cannot be written", async () => {
+    const tempDir = createTempDir("paperclip-gzip-writer-fail-");
+    const gzipPath = path.join(tempDir, "missing-dir", "stream.sql.gz");
+    const writer = createGzipTextFileWriter(gzipPath, 1);
+    writer.emit("SELECT 1;");
+    await expect(writer.close()).rejects.toMatchObject({ code: "ENOENT" });
+    await writer.abort();
+    expect(fs.existsSync(gzipPath)).toBe(false);
+  });
+});
+
+describe("cleanupStalePartialBackups", () => {
+  it("removes only stale partial archives for the prefix", () => {
+    const dir = createTempDir("paperclip-partial-cleanup-");
+    const stale = path.join(dir, "paperclip-2026-01-01T00-00-00.sql.gz.partial");
+    const fresh = path.join(dir, "paperclip-2026-01-02T00-00-00.sql.gz.partial");
+    const archive = path.join(dir, "paperclip-2026-01-01T00-00-00.sql.gz");
+    const otherPrefix = path.join(dir, "other-2026-01-01T00-00-00.sql.gz.partial");
+    for (const file of [stale, fresh, archive, otherPrefix]) fs.writeFileSync(file, "x");
+    for (const file of [stale, archive, otherPrefix]) fs.utimesSync(file, new Date(0), new Date(0));
+    expect(cleanupStalePartialBackups(dir, 60 * 60 * 1000)).toBe(1);
+    expect(fs.readdirSync(dir).sort()).toEqual([
+      path.basename(otherPrefix),
+      path.basename(archive),
+      path.basename(fresh),
+    ].sort());
+    expect(cleanupStalePartialBackups(path.join(dir, "missing"), 0)).toBe(0);
+  });
+});
+
+describeEmbeddedPostgres("runDatabaseBackup atomic publish", () => {
+  const retention = { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 };
+
+  it("pg_dump: only a .partial exists mid-stream and a completed run leaves exactly one .sql.gz", async () => {
+    const connectionString = await createTempDatabase();
+    const dir = createTempDir("atomic-pg-dump-");
+    const backupDir = path.join(dir, "backups");
+    const started = path.join(dir, "started");
+    const release = path.join(dir, "release");
+    const result = await withPgDumpFixture(
+      dir,
+      `printf 'SELECT 1;\\n'\ntouch '${started}'\nwhile [ ! -e '${release}' ]; do sleep 0.05; done\nprintf 'SELECT 2;\\n'\n`,
+      async () => {
+        const pending = runDatabaseBackup({ connectionString, backupDir, retention, backupEngine: "pg_dump" });
+        pending.catch(() => {});
+        await waitFor(() => fs.existsSync(started), "pg_dump fixture to start");
+        await waitFor(() => fs.existsSync(backupDir) && partials(backupDir).length === 1, "partial archive");
+        // A kill at this point would leave nothing under an archive name.
+        expect(archives(backupDir)).toEqual([]);
+        fs.writeFileSync(release, "");
+        return pending;
+      },
+    );
+    expect(archives(backupDir)).toEqual([path.basename(result.backupFile)]);
+    expect(partials(backupDir)).toEqual([]);
+    expect(gunzipSync(fs.readFileSync(result.backupFile)).toString()).toBe("SELECT 1;\nSELECT 2;\n");
+    expect(result.sizeBytes).toBe(fs.statSync(result.backupFile).size);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("pg_dump: a dump killed mid-stream leaves no .sql.gz and no .partial", async () => {
+    const connectionString = await createTempDatabase();
+    const dir = createTempDir("atomic-pg-dump-kill-");
+    const backupDir = path.join(dir, "backups");
+    await withPgDumpFixture(dir, "printf 'SELECT 1;\\n'\nkill -9 $$\n", async () => {
+      await expect(runDatabaseBackup({ connectionString, backupDir, retention, backupEngine: "pg_dump" }))
+        .rejects.toThrow();
+    });
+    expect(archives(backupDir)).toEqual([]);
+    expect(partials(backupDir)).toEqual([]);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("pruning ignores .partial files", async () => {
+    const connectionString = await createTempDatabase();
+    const dir = createTempDir("atomic-prune-");
+    const backupDir = path.join(dir, "backups");
+    fs.mkdirSync(backupDir);
+    const oldArchive = path.join(backupDir, "paperclip-2020-01-01T00-00-00.sql.gz");
+    const oldPartial = path.join(backupDir, "paperclip-2020-01-02T00-00-00.sql.gz.partial");
+    for (const file of [oldArchive, oldPartial]) {
+      fs.writeFileSync(file, gzipSync("SELECT 'old';"));
+      fs.utimesSync(file, new Date(0), new Date(0));
+    }
+    const result = await withPgDumpFixture(dir, "printf 'SELECT 1;\\n'\n", () =>
+      runDatabaseBackup({ connectionString, backupDir, retention, backupEngine: "pg_dump", stalePartialMaxAgeMs: Infinity }));
+    expect(result.prunedCount).toBe(1);
+    expect(fs.existsSync(oldArchive)).toBe(false);
+    expect(fs.existsSync(oldPartial)).toBe(true);
+    expect(archives(backupDir)).toEqual([path.basename(result.backupFile)]);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("each run removes stale .partial files but keeps fresh ones", async () => {
+    const connectionString = await createTempDatabase();
+    const dir = createTempDir("atomic-stale-");
+    const backupDir = path.join(dir, "backups");
+    fs.mkdirSync(backupDir);
+    const stale = path.join(backupDir, "paperclip-2020-01-02T00-00-00.sql.gz.partial");
+    const fresh = path.join(backupDir, "paperclip-concurrent.sql.gz.partial");
+    fs.writeFileSync(stale, "x");
+    fs.writeFileSync(fresh, "x");
+    fs.utimesSync(stale, new Date(Date.now() - 25 * 60 * 60 * 1000), new Date(Date.now() - 25 * 60 * 60 * 1000));
+    const result = await withPgDumpFixture(dir, "printf 'SELECT 1;\\n'\n", () =>
+      runDatabaseBackup({ connectionString, backupDir, retention, backupEngine: "pg_dump" }));
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(partials(backupDir)).toEqual([path.basename(fresh)]);
+    expect(archives(backupDir)).toEqual([path.basename(result.backupFile)]);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("javascript: an abort mid-stream leaves no .sql.gz and a completed run leaves exactly one", async () => {
+    const connectionString = await createTempDatabase();
+    const backupDir = createTempDir("atomic-javascript-");
+    const sql = postgres(connectionString, { max: 2, onnotice: () => {} });
+    try {
+      await sql.unsafe(`
+        CREATE TABLE atomic_fixture (id integer PRIMARY KEY, value text NOT NULL);
+        INSERT INTO atomic_fixture SELECT g, repeat('x', 100) FROM generate_series(1, 200) g;
+      `);
+      const locker = await sql.reserve();
+      try {
+        // Hold the table so the backup stalls part-way through its data dump.
+        await locker`BEGIN`;
+        await locker`LOCK TABLE atomic_fixture IN ACCESS EXCLUSIVE MODE`;
+        const pending = runDatabaseBackup({ connectionString, backupDir, retention, backupEngine: "javascript" });
+        pending.catch(() => {});
+        const blockedBackend = async () => {
+          const rows = await sql<{ pid: number }[]>`
+            SELECT pid FROM pg_stat_activity
+            WHERE wait_event_type = 'Lock' AND query ILIKE '%atomic_fixture%' AND pid <> pg_backend_pid()
+          `;
+          return rows[0]?.pid ?? null;
+        };
+        await waitFor(async () => (await blockedBackend()) !== null, "backup to block on the table lock");
+        expect(partials(backupDir)).toHaveLength(1);
+        expect(archives(backupDir)).toEqual([]);
+        const pid = await blockedBackend();
+        await sql`SELECT pg_terminate_backend(${pid})`;
+        await expect(pending).rejects.toThrow();
+        expect(archives(backupDir)).toEqual([]);
+        expect(partials(backupDir)).toEqual([]);
+      } finally {
+        await locker`ROLLBACK`.catch(() => {});
+        locker.release();
+      }
+
+      const result = await runDatabaseBackup({ connectionString, backupDir, retention, backupEngine: "javascript" });
+      expect(archives(backupDir)).toEqual([path.basename(result.backupFile)]);
+      expect(partials(backupDir)).toEqual([]);
+      expect(gunzipSync(fs.readFileSync(result.backupFile)).toString()).toContain("atomic_fixture");
+    } finally {
+      await sql.end();
+    }
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
@@ -662,5 +883,123 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       }
     },
     20_000,
+  );
+  it(
+    "streams JavaScript backups straight to gzip without an uncompressed file and restores them",
+    async () => {
+      const source = await createTempDatabase();
+      const target = await createSiblingDatabase(source, "stream_restore_target");
+      const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+      const targetSql = postgres(target, { max: 1, onnotice: () => {} });
+      const backupDir = createTempDir("paperclip-db-stream-");
+      const seen = new Set<string>();
+      const watcher = fs.watch(backupDir, (_event, name) => {
+        if (name) seen.add(String(name));
+      });
+      const poll = setInterval(() => {
+        for (const name of fs.readdirSync(backupDir)) seen.add(name);
+      }, 5);
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE public.stream_rows (id integer PRIMARY KEY, payload text NOT NULL);
+          INSERT INTO public.stream_rows
+          SELECT g, repeat(md5(g::text), 8) FROM generate_series(1, 20000) AS g;
+        `);
+        const backup = await runDatabaseBackup({
+          connectionString: source,
+          backupDir,
+          backupEngine: "javascript",
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        });
+        clearInterval(poll);
+        watcher.close();
+        for (const name of fs.readdirSync(backupDir)) seen.add(name);
+
+        expect(backup.backupFile.endsWith(".sql.gz")).toBe(true);
+        // Only the gzip archive, first under its temporary name, ever appears.
+        expect([...seen].filter((name) => !name.endsWith(".sql.gz") && !name.endsWith(".sql.gz.partial"))).toEqual([]);
+        expect(seen.has(`${path.basename(backup.backupFile)}.partial`)).toBe(true);
+        expect(fs.readdirSync(backupDir)).toEqual([path.basename(backup.backupFile)]);
+        const text = gunzipSync(fs.readFileSync(backup.backupFile)).toString("utf8");
+        expect(text.startsWith("-- Paperclip database backup\n-- Created: ")).toBe(true);
+        expect(text.endsWith("COMMIT;\n-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900\n")).toBe(true);
+
+        await runDatabaseRestore({ connectionString: target, backupFile: backup.backupFile });
+        expect(await targetSql`SELECT count(*)::int AS n, sum(length(payload))::int AS bytes FROM public.stream_rows`)
+          .toEqual([{ n: 20000, bytes: 20000 * 256 }]);
+      } finally {
+        clearInterval(poll);
+        watcher.close();
+        await sourceSql.end();
+        await targetSql.end();
+      }
+    },
+    120_000,
+  );
+
+  it(
+    "removes the partial archive and rethrows the original error when a JavaScript backup fails mid-stream",
+    async () => {
+      const source = await createTempDatabase();
+      const sourceSql = postgres(source, { max: 1, onnotice: () => {} });
+      const backupDir = createTempDir("paperclip-db-stream-fail-");
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE public.stream_rows (id integer PRIMARY KEY, payload text NOT NULL);
+          INSERT INTO public.stream_rows
+          SELECT g, repeat(md5(g::text), 8) FROM generate_series(1, 20000) AS g;
+          CREATE TABLE public.stream_tail (id integer PRIMARY KEY);
+          INSERT INTO public.stream_tail VALUES (1);
+        `);
+        // Tables dump in name order, so stream_rows is already streamed into the
+        // .partial archive when the backup blocks on the locked stream_tail.
+        // Terminating that blocked backend fails the backup mid-stream at a fixed
+        // point, instead of racing the dump to completion on a fast runner.
+        let terminated = false;
+        let failure: unknown = null;
+        const locker = await sourceSql.reserve();
+        // pg_stat_activity is snapshotted per transaction, so poll it from a
+        // separate connection rather than from inside the lock holder's.
+        const monitorSql = postgres(source, { max: 1, onnotice: () => {} });
+        try {
+          await locker`BEGIN`;
+          await locker`LOCK TABLE public.stream_tail IN ACCESS EXCLUSIVE MODE`;
+          const pending = runDatabaseBackup({
+            connectionString: source,
+            backupDir,
+            backupEngine: "javascript",
+            retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          }).then(() => null, (error: unknown) => error);
+          const blockedBackend = async () => {
+            const rows = await monitorSql<{ pid: number }[]>`
+              SELECT pid FROM pg_stat_activity
+              WHERE wait_event_type = 'Lock' AND query ILIKE '%stream_tail%' AND pid <> pg_backend_pid()
+            `;
+            return rows[0]?.pid ?? null;
+          };
+          await waitFor(async () => (await blockedBackend()) !== null, "backup to block on stream_tail", 60_000);
+          expect(partials(backupDir)).toHaveLength(1);
+          const pid = await blockedBackend();
+          const rows = await locker<{ ok: boolean }[]>`SELECT pg_terminate_backend(${pid}) AS ok`;
+          terminated = rows[0]?.ok === true;
+          failure = await pending;
+        } finally {
+          await locker`ROLLBACK`.catch(() => {});
+          locker.release();
+          await monitorSql.end();
+        }
+
+        expect(terminated).toBe(true);
+        expect(failure).toBeInstanceOf(Error);
+        // postgres.js surfaces the server's admin-shutdown error (57P01) or the
+        // dropped socket; either way it is the original driver error, not a
+        // cleanup or stream error from the backup writer.
+        expect(String((failure as Error).message)).not.toMatch(/stream|closed backup file/i);
+        expect(fs.readdirSync(backupDir)).toEqual([]);
+      } finally {
+        await sourceSql.end();
+      }
+    },
+    120_000,
   );
 });

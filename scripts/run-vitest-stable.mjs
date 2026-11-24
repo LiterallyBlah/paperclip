@@ -7,6 +7,9 @@ import { fileURLToPath } from "node:url";
 import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
 import { invocationEnv } from "./ci-profile/record.mjs";
 import { vitestRetryArgs } from "./ci/vitest-retry.mjs";
+// Node >=24.11 (engines) strips the helper's types on import, so the runner
+// and the per-worker setup share one chmod-aware remover.
+import { removeTestHome } from "../tests/helpers/remove-test-home.ts";
 
 import { assertSelectedTests, partitionTestLines } from "./test-line-shard.mjs";
 import { loadSelection, selectedShard } from "./ci/test-selection-manifest.mjs";
@@ -409,13 +412,43 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   return shardFiles.map((file) => byRepoPath.get(file));
 }
 
+// Vitest children still running, so a signal to the runner can be forwarded
+// and each invocation's finally can remove its root once the child closes.
+const activeChildren = new Set();
+let receivedSignal = null;
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    receivedSignal ??= signal;
+    // Between invocations no root exists (runVitest creates and removes it
+    // around the only await), so there is nothing to wait for.
+    if (activeChildren.size === 0) process.exit(128 + os.constants.signals[receivedSignal]);
+    for (const child of activeChildren) child.kill(signal);
+  });
+}
+
 async function runVitest(args, label, testShard = null, exactFiles = false) {
+  if (receivedSignal) throw new Error(`${label} not started (${receivedSignal})`);
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
   const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
   // Production workspace/security checks reject symlink aliases. In particular
   // /tmp is /private/tmp on macOS, so fixture roots must use the canonical path.
   const testRoot = realpathSync(mkdtempSync(path.join(tempRootParent, "pv-")));
+  try {
+    await runVitestInRoot(args, label, testShard, testRoot, exactFiles);
+  } finally {
+    // Worker homes inside it can hold 0555 runtime-context bundles that a
+    // plain recursive rm cannot delete, and the workers' own exit cleanup
+    // does not always run. Remove only the root this invocation created.
+    try {
+      removeTestHome(testRoot);
+    } catch (error) {
+      console.warn(`[test:run] could not remove ${testRoot}: ${error.message}`);
+    }
+  }
+}
+
+async function runVitestInRoot(args, label, testShard, testRoot, exactFiles = false) {
   // Keep per-run paths compact so Unix socket fixtures stay under macOS path limits.
   const env = {
     ...process.env,
@@ -479,9 +512,15 @@ async function runVitest(args, label, testShard = null, exactFiles = false) {
       env: invocationEnv("vitest", env),
       stdio: "inherit",
     });
-    child.once("error", reject);
+    activeChildren.add(child);
+    child.once("error", (error) => {
+      activeChildren.delete(child);
+      reject(error);
+    });
     child.once("close", (code, signal) => {
-      if (code === 0) resolve();
+      activeChildren.delete(child);
+      if (receivedSignal) reject(new Error(`${label} interrupted (${receivedSignal})`));
+      else if (code === 0) resolve();
       else reject(new Error(`${label} failed (${signal ?? code})`));
     });
   });
@@ -762,5 +801,5 @@ try {
   }
 } catch (error) {
   console.error(`[test:run] ${error.message}`);
-  process.exitCode = 1;
+  process.exitCode = receivedSignal ? 128 + os.constants.signals[receivedSignal] : 1;
 }

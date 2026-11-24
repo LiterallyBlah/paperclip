@@ -25,6 +25,7 @@ import { registerObsoletePolicyReviewWork } from "./native-runtime/obsolete-poli
 import { registerCancelledWorkspacePreservationWork } from "./native-runtime/native-failed-workspace-recovery.js";
 import { readUpgradeReadiness } from "./heartbeat/upgrade-readiness.js";
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
+import { recordLegacyStartupCancellationSettled } from "./legacy-startup-cancellation.js";
 import { writeExecutionControl } from "./execution-control-notifications.js";
 import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
 import { settleFailedNativeRecoveryPreparation } from "./native-runtime/native-recovery-preparation-failure.js";
@@ -656,12 +657,14 @@ export function getTaskDrainStatus(): {
   pendingWakes: number;
   quiescent: boolean;
   ownerId?: string;
+  operationId?: string;
 } {
   const state = readTaskDrain(new Date());
   const activeRuns = activeRunExecutionPromises.size;
   const pendingWakes = activeWakeupPromises.size;
   return {
     ...(state?.ownerId ? { ownerId: state.ownerId } : {}),
+    ...(state?.operationId ? { operationId: state.operationId } : {}),
     draining: state !== null,
     startedAt: state?.startedAt ?? null,
     expiresAt: state?.expiresAt ?? null,
@@ -828,13 +831,18 @@ function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
 }
 
+export type HeartbeatSchedulingSuppressionReason =
+  | "worktree_instance"
+  | "database_restore_in_progress"
+  | "task_drain"
+  | "server_shutdown";
+
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
   overrides: { allowWorktreeRunExecution?: boolean } = {},
 ): {
   suppressed: boolean;
-  reason:
-    "worktree_instance" | "database_restore_in_progress" | "task_drain" | null;
+  reason: HeartbeatSchedulingSuppressionReason | null;
 } {
   if (
     isTruthyRuntimeEnvValue(env.PAPERCLIP_IN_WORKTREE) &&
@@ -903,6 +911,12 @@ export function heartbeatService(
     resolveResponsibleUserIdForRunContext,
   } = createHeartbeatRunPreparation(db);
   let shutdownInProgress = false;
+  // Set at the very start of a planned shutdown, before the scheduler settles
+  // and the running-run drain takes its snapshot. From then on no queued run
+  // may start: a run admitted after the snapshot would never be drained and
+  // would be reaped as process_lost on the next boot. Like a task drain, this
+  // holds admission only; queued wakes stay durable for the next process.
+  let shutdownAdmissionStopped = false;
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -956,7 +970,13 @@ export function heartbeatService(
     }
     return cachedWorktreeRunExecutionOverride;
   };
-  const getSchedulingSuppression = async (fresh = false) => {
+  const getSchedulingSuppression = async (fresh = false): Promise<{
+    suppressed: boolean;
+    reason: HeartbeatSchedulingSuppressionReason | null;
+  }> => {
+    if (shutdownAdmissionStopped) {
+      return { suppressed: true, reason: "server_shutdown" };
+    }
     const override = await resolveWorktreeRunExecutionOverride(fresh);
     return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
       allowWorktreeRunExecution: override.allowed,
@@ -1638,6 +1658,7 @@ export function heartbeatService(
     nextAgentTimerAt,
     tickIssueMonitors,
     nextIssueMonitorAt,
+    reconcileTriggeredIssueMonitors,
     recoverActiveSessionGoals,
     recoverPendingSessionGoalActions,
   } = createHeartbeatScheduling(db, {
@@ -4095,6 +4116,16 @@ export function heartbeatService(
             logger.warn({ err: error, runId: run.id }, "failed to acknowledge Stop after native process settlement");
           });
         }
+        if (latestRun?.status === "cancelled" && latestRun.runtimeMode === "legacy" &&
+            latestRun.controllerBootId === legacyControllerBootId) {
+          // This executor owns the run on this boot and is past lease cleanup.
+          // Stop won before adapter entry, so no process can acknowledge it.
+          // The recorder rechecks the locked handoff and all launch evidence.
+          await recordLegacyStartupCancellationSettled(db, {
+            runId: run.id, companyId: run.companyId, controllerBootId: legacyControllerBootId,
+            adapterEntered: legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld,
+          }).catch(error => logger.warn({ runId: run.id, error }, "Could not record legacy startup cancellation settlement"));
+        }
         await db.update(heartbeatRuns).set({
           executionStage: sql`case when ${heartbeatRuns.status} = 'cancelled' then 'settled' else ${heartbeatRuns.executionStage} end`,
           controllerLeaseExpiresAt: null,
@@ -4326,6 +4357,7 @@ export function heartbeatService(
     wakeup: trackWakeup,
     dispatchPendingNativeStatusWakeups,
     triggerIssueMonitor,
+    reconcileTriggeredIssueMonitors,
 
     reportRunActivity: clearDetachedRunWarning,
     registerExternalConversationSettlementWork: (
@@ -4444,6 +4476,10 @@ export function heartbeatService(
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
+    // Idempotent: stops admission of new runs for the rest of this process.
+    beginShutdownAdmissionStop: () => {
+      shutdownAdmissionStopped = true;
+    },
     drainRunningRunsForShutdown,
     drainActiveRunExecutions,
     startTaskDrain,

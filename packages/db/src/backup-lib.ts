@@ -1,8 +1,8 @@
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
-import { open as openFile } from "node:fs/promises";
+import { open as openFile, rename } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
@@ -31,7 +31,15 @@ export type RunDatabaseBackupOptions = {
   backupEngine?: "auto" | "pg_dump" | "javascript";
   /** Optional durability gate. A rejected archive must not prune history. */
   verifyBeforePrune?: (backupFile: string) => Promise<void>;
+  /**
+   * Each run removes `<prefix>-*.sql.gz.partial` files older than this, left
+   * by a run that was killed. Defaults to 24 hours, far longer than any
+   * backup, so a concurrent run keeps its file. `Infinity` disables it.
+   */
+  stalePartialMaxAgeMs?: number;
 };
+
+const DEFAULT_STALE_PARTIAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export type RunDatabaseBackupResult = {
   backupFile: string;
@@ -187,6 +195,74 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
   }
 
   return toDelete.length;
+}
+
+/**
+ * Suffix for an archive that is still being written. A backup only takes its
+ * final `.sql.gz` name once the stream has completed and been fsynced, so a
+ * process killed mid-run never leaves a truncated file under an archive name
+ * that retention, health checks or restore would treat as valid.
+ */
+export const PARTIAL_BACKUP_SUFFIX = ".partial";
+
+async function syncPath(path: string, flags: "r" | "r+"): Promise<void> {
+  const handle = await openFile(path, flags);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function publishBackupArchive(partialFile: string, backupFile: string): Promise<void> {
+  await syncPath(partialFile, "r+");
+  await rename(partialFile, backupFile);
+  // Persist the rename itself. Some platforms cannot fsync a directory; the
+  // archive is complete either way, so this step is best effort.
+  try {
+    await syncPath(dirname(backupFile), "r");
+  } catch {
+    // ignore
+  }
+}
+
+function removeFileQuietly(filePath: string): void {
+  if (!existsSync(filePath)) return;
+  try {
+    unlinkSync(filePath);
+  } catch {
+    // Preserve the original backup failure if cleanup also fails.
+  }
+}
+
+/**
+ * Removes `<prefix>-*.sql.gz.partial` files left by a backup that was killed
+ * before it finished. Only files older than `maxAgeMs` are removed, so a
+ * backup that is still running keeps its temporary file. Returns the number
+ * of files removed.
+ */
+export function cleanupStalePartialBackups(
+  backupDir: string,
+  maxAgeMs: number,
+  filenamePrefix = "paperclip",
+): number {
+  if (!existsSync(backupDir)) return 0;
+  const cutoff = Date.now() - Math.max(0, maxAgeMs);
+  let removed = 0;
+  for (const name of readdirSync(backupDir)) {
+    if (!name.startsWith(`${filenamePrefix}-`)) continue;
+    if (!name.endsWith(`.sql.gz${PARTIAL_BACKUP_SUFFIX}`)) continue;
+    const fullPath = resolve(backupDir, name);
+    try {
+      const stat = statSync(fullPath);
+      if (!stat.isFile() || stat.mtimeMs >= cutoff) continue;
+      unlinkSync(fullPath);
+      removed++;
+    } catch {
+      // A concurrent writer may have renamed or removed it; skip.
+    }
+  }
+  return removed;
 }
 
 function formatBackupSize(sizeBytes: number): string {
@@ -353,10 +429,16 @@ async function runPgDumpBackup(opts: {
     throw new Error("pg_dump did not expose stdout");
   }
 
-  await Promise.all([
+  // Wait for both sides to settle before failing. With Promise.all a non-zero
+  // exit rejected while the write stream was still opening or flushing the
+  // archive, so the caller's cleanup could run before the file existed and
+  // leave a stray .partial behind.
+  const [piped, exited] = await Promise.allSettled([
     pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
     waitForChildExit(child, pgDumpBin),
   ]);
+  if (exited.status === "rejected") throw exited.reason;
+  if (piped.status === "rejected") throw piped.reason;
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
@@ -449,23 +531,30 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
   }
 }
 
-export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES) {
-  const filePromise = openFile(filePath, "w");
+type BufferedTextSink = {
+  write(chunk: string | Buffer): Promise<void>;
+  close(): Promise<void>;
+  /** Release the sink after a failure. Must not throw. */
+  destroy(): Promise<void>;
+};
+
+export type BufferedTextWriter = {
+  emit(line: string): void;
+  drain(): Promise<void>;
+  writeRaw(chunk: string | Buffer): Promise<void>;
+  close(): Promise<void>;
+  abort(): Promise<void>;
+};
+
+function createBufferedTextWriter(filePath: string, sink: BufferedTextSink, maxBufferedBytes: number): BufferedTextWriter {
   const flushThreshold = Math.max(1, Math.trunc(maxBufferedBytes));
   let bufferedLines: string[] = [];
   let bufferedBytes = 0;
   let firstChunk = true;
   let closed = false;
+  let finalized = false;
+  let aborted = false;
   let pendingWrite = Promise.resolve();
-
-  const writeChunk = async (chunk: string | Buffer): Promise<void> => {
-    const file = await filePromise;
-    if (typeof chunk === "string") {
-      await file.write(chunk, null, "utf8");
-    } else {
-      await file.write(chunk);
-    }
-  };
 
   const flushBufferedLines = () => {
     if (bufferedLines.length === 0) return;
@@ -475,7 +564,7 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
     const chunkBody = linesToWrite.join("\n");
     const chunk = firstChunk ? chunkBody : `\n${chunkBody}`;
     firstChunk = false;
-    pendingWrite = pendingWrite.then(() => writeChunk(chunk));
+    pendingWrite = pendingWrite.then(() => sink.write(chunk));
   };
 
   return {
@@ -502,7 +591,7 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       }
       flushBufferedLines();
       firstChunk = false;
-      pendingWrite = pendingWrite.then(() => writeChunk(chunk));
+      pendingWrite = pendingWrite.then(() => sink.write(chunk));
       await pendingWrite;
     },
     async close() {
@@ -510,16 +599,19 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       closed = true;
       flushBufferedLines();
       await pendingWrite;
-      const file = await filePromise;
-      await file.close();
+      await sink.close();
+      finalized = true;
     },
     async abort() {
-      if (closed) return;
+      // A failed close() still leaves a partial file to remove; only a
+      // completed close() or an earlier abort() makes this a no-op.
+      if (finalized || aborted) return;
       closed = true;
+      aborted = true;
       bufferedLines = [];
       bufferedBytes = 0;
       await pendingWrite.catch(() => {});
-      await filePromise.then((file) => file.close()).catch(() => {});
+      await sink.destroy();
       if (existsSync(filePath)) {
         try {
           unlinkSync(filePath);
@@ -529,6 +621,80 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       }
     },
   };
+}
+
+export function createBufferedTextFileWriter(
+  filePath: string,
+  maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES,
+): BufferedTextWriter {
+  const filePromise = openFile(filePath, "w");
+  return createBufferedTextWriter(filePath, {
+    async write(chunk) {
+      const file = await filePromise;
+      if (typeof chunk === "string") {
+        await file.write(chunk, null, "utf8");
+      } else {
+        await file.write(chunk);
+      }
+    },
+    async close() {
+      const file = await filePromise;
+      await file.close();
+    },
+    async destroy() {
+      await filePromise.then((file) => file.close()).catch(() => {});
+    },
+  }, maxBufferedBytes);
+}
+
+/**
+ * Same text layout as createBufferedTextFileWriter, but the bytes go through
+ * gzip straight into `filePath`, so no uncompressed copy is ever written to
+ * disk. Each chunk waits for its write callback, which only fires once gzip
+ * and the file stream have taken it, so memory stays bounded by the line
+ * buffer plus the stream high-water marks.
+ */
+export function createGzipTextFileWriter(
+  filePath: string,
+  maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES,
+): BufferedTextWriter {
+  const gzip = createGzip();
+  const output = createWriteStream(filePath);
+  const finished = pipeline(gzip, output);
+  finished.catch(() => {});
+  const endedEarly = finished.then(() => {
+    throw new Error(`Backup gzip stream ended before writing finished: ${filePath}`);
+  });
+  endedEarly.catch(() => {});
+  // A write callback can report a generic "stream destroyed" error; the
+  // pipeline rejection carries the failure that caused it (for example ENOSPC).
+  const streamFailure = (fallback: unknown) => finished.then(() => fallback, (error: unknown) => error);
+
+  return createBufferedTextWriter(filePath, {
+    async write(chunk) {
+      const written = new Promise<void>((resolveWrite, rejectWrite) => {
+        gzip.write(chunk, (error) => (error ? rejectWrite(error) : resolveWrite()));
+      });
+      written.catch(() => {});
+      try {
+        await Promise.race([written, endedEarly]);
+      } catch (error) {
+        throw await streamFailure(error);
+      }
+    },
+    async close() {
+      gzip.end();
+      await finished;
+    },
+    async destroy() {
+      gzip.destroy();
+      output.destroy();
+      await finished.catch(() => {});
+      if (!output.closed) {
+        await new Promise<void>((resolveClose) => output.once("close", () => resolveClose()));
+      }
+    },
+  }, maxBufferedBytes);
 }
 
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
@@ -548,12 +714,21 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
+  try {
+    cleanupStalePartialBackups(opts.backupDir, opts.stalePartialMaxAgeMs ?? DEFAULT_STALE_PARTIAL_MAX_AGE_MS, filenamePrefix);
+  } catch {
+    // Leftover cleanup must never block a new backup.
+  }
   // Initial and final sleep checks can run within the same second. A failed
   // second checkpoint must never overwrite the first verified recovery point.
   const checkpointSuffix = opts.verifyBeforePrune ? `-${randomUUID()}` : "";
-  const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}${checkpointSuffix}.sql`);
-  const backupFile = `${sqlFile}.gz`;
-  const writer = createBufferedTextFileWriter(sqlFile);
+  const backupFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}${checkpointSuffix}.sql.gz`);
+  // Both engines stream into this temporary name and rename it to backupFile
+  // only after the stream has completed and been fsynced.
+  const partialFile = `${backupFile}${PARTIAL_BACKUP_SUFFIX}`;
+  // The JavaScript engine opens its writer only after engine selection, so the
+  // pg_dump path never shares the archive path with an open writer.
+  let activeWriter: BufferedTextWriter | null = null;
 
   try {
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
@@ -563,14 +738,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await closeSql();
         await runPgDumpBackup({
           connectionString: opts.connectionString,
-          backupFile,
+          backupFile: partialFile,
           connectTimeout,
         });
         dumped = true;
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
-        }
+        removeFileQuietly(partialFile);
         if (backupEngine === "pg_dump") {
           throw error;
         }
@@ -581,8 +754,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       if (dumped) {
         // Only an engine failure can select the JavaScript fallback. Once
         // pg_dump succeeds, archive verification or persistence failures
-        // must retain their original error and must not reuse a closed writer.
-        await writer.abort();
+        // must retain their original error.
+        await publishBackupArchive(partialFile, backupFile);
         const sizeBytes = statSync(backupFile).size;
         await opts.verifyBeforePrune?.(backupFile);
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
@@ -592,6 +765,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     await sql`SELECT 1`;
 
+    // Stream the SQL text straight into a gzip archive under the temporary
+    // name; no uncompressed intermediate file is written.
+    const writer = createGzipTextFileWriter(partialFile);
+    activeWriter = writer;
     const emit = (line: string) => writer.emit(line);
     const emitStatement = (statement: string) => {
       emit(statement);
@@ -1066,12 +1243,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emit("");
 
     await writer.close();
-
-    // Compress the SQL file with gzip
-    const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
-    unlinkSync(sqlFile);
+    await publishBackupArchive(partialFile, backupFile);
 
     const sizeBytes = statSync(backupFile).size;
     await opts.verifyBeforePrune?.(backupFile);
@@ -1083,13 +1255,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       prunedCount,
     };
   } catch (error) {
-    await writer.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
-    }
-    if (existsSync(sqlFile)) {
-      try { unlinkSync(sqlFile); } catch { /* ignore */ }
-    }
+    await activeWriter?.abort();
+    removeFileQuietly(partialFile);
+    removeFileQuietly(backupFile);
     throw error;
   } finally {
     await closeSql();

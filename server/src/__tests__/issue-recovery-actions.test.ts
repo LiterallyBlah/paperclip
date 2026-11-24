@@ -98,8 +98,11 @@ describe("issueRecoveryActionService", () => {
     const error: Error & { cause?: unknown } = new Error("Wrapped database failure");
     error.cause = kind === "unrelated unique constraint" ? { code: "23505", constraint_name: "other_unique_constraint" }
       : kind === "other SQLSTATE" ? { code: "23503", constraint_name: constraint } : error;
+    // Fork (#76): a routine board-owned kind first asks the recovery-owner router for the
+    // company's coordinator (awaited select...where with no limit), so the query is thenable.
     const query = { from() { return this; }, where() { return this; }, orderBy() { return this; },
-      limit() { return Promise.resolve([]); } };
+      limit() { return Promise.resolve([]); },
+      then<T>(resolve: (rows: unknown[]) => T, reject?: (error: unknown) => T) { return Promise.resolve([]).then(resolve, reject); } };
     const fakeDb = {
       async transaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> { return fn(fakeDb); },
       execute: vi.fn(async () => [{ pendingPreparationContinuation: false }]),
@@ -109,7 +112,8 @@ describe("issueRecoveryActionService", () => {
     await expect(issueRecoveryActionService(fakeDb as never).upsertSourceScoped({ companyId: "company", sourceIssueId: "issue",
       kind: "missing_disposition", cause: "saved-debt", fingerprint: "same-source", nextAction: "Restore existing work." }))
       .rejects.toBe(error);
-    expect(fakeDb.select).toHaveBeenCalledOnce();
+    // The active read plus #76's one coordinator lookup; no retry repeats either.
+    expect(fakeDb.select).toHaveBeenCalledTimes(2);
     expect(fakeDb.insert).toHaveBeenCalledOnce();
   });
   it("does not reactivate an action resolved between the active read and update", async () => {
@@ -1278,6 +1282,38 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         payload: expect.objectContaining({ status: "blocked", _previous: { status: "in_progress" } }),
       }),
     ]);
+  });
+
+  it("gives an ownerless provider-quota stranding to the board on both the action and its recovery event", async () => {
+    const { companyId, sourceIssue } = await seedCompany();
+    await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, sourceIssue.id));
+    const [unassigned] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: unassigned!,
+      previousStatus: "in_progress",
+      latestRun: null,
+      recoveryCause: "provider_quota",
+    });
+
+    expect(updated?.status).toBe("blocked");
+    const [action] = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // No return owner means no quota monitor can resume it: a person decides.
+    expect(action).toMatchObject({ cause: "provider_quota", ownerType: "board", ownerAgentId: null,
+      returnOwnerAgentId: null, monitorPolicy: null });
+    expect(action!.evidence).toMatchObject({ routingPolicy: "board_escalation_no_takeover_v1" });
+    const [event] = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId), eq(activityLog.entityId, sourceIssue.id),
+      eq(activityLog.action, "issue.updated"),
+      sql`${activityLog.details}->>'recoveryActionId' = ${action!.id}`,
+    ));
+    expect(event?.details).toMatchObject({ recoveryOwnerType: "board", recoveryOwnerAgentId: null,
+      routingPolicy: "board_escalation_no_takeover_v1" });
+    const notices = await db.select().from(issueComments).where(and(
+      eq(issueComments.issueId, sourceIssue.id), eq(issueComments.authorType, "system")));
+    expect(JSON.stringify(notices.map((notice) => notice.metadata))).toContain("Board decision required");
   });
 
   it("schedules another provider-quota monitor after a prior quota monitor fired", async () => {

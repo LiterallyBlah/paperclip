@@ -103,11 +103,16 @@ describe.skipIf(!support.supported)("onboarding first-task execution admission",
       createdByAgentId: f.agentId, createdByRunId: f.runId,
     })).document : null;
     const svc = issueThreadInteractionService(server.db);
+    // Fork (#60): a card with no agent addressee that omits resolverPolicy inherits
+    // human_only. As in #60's confirmation-comment-resolution fixture, these proposals
+    // request `anyone` explicitly so the agent can record a chat answer; admission still
+    // needs a persisted human acceptance either way.
     const card = await svc.create(issue, checkbox ? {
+      resolverPolicy: "anyone",
       kind: "request_checkbox_confirmation", payload: { version: 1, prompt: "Approve this plan?",
         options: [{ id: "execute", label: "Execute the plan" }], defaultSelectedOptionIds: ["execute"], minSelected: 1,
         target: { type: "issue_document", key: "plan", issueId: f.issueId, documentId: plan!.id, revisionId: plan!.latestRevisionId! } },
-    } : { kind: "request_confirmation", payload: { version: 1, prompt: "Create one task for the agreed deliverable?" } }, { agentId: f.agentId });
+    } : { resolverPolicy: "anyone", kind: "request_confirmation", payload: { version: 1, prompt: "Create one task for the agreed deliverable?" } }, { agentId: f.agentId });
     return { issue, card, svc, plan };
   };
   const accept = async (f: Awaited<ReturnType<typeof fixture>>, p: Awaited<ReturnType<typeof proposal>>) => {
@@ -442,8 +447,11 @@ describe.skipIf(!support.supported)("onboarding first-task execution admission",
       expect(interaction.kind).toBe(kind === "confirmation" ? "request_confirmation" : "request_checkbox_confirmation");
       await expect(create(f)).rejects.toThrow(/proposal.*accept/i);
       const selectedOptionIds = kind === "checkbox" ? ((args.payload as { options: { id: string }[] }).options.map(option => option.id)) : undefined;
-      await issueThreadInteractionService(server.db).acceptInteraction({ id: f.issueId, companyId: f.companyId, projectId: null, goalId: null }, interaction.id,
+      const decided = issueThreadInteractionService(server.db).acceptInteraction({ id: f.issueId, companyId: f.companyId, projectId: null, goalId: null }, interaction.id,
         selectedOptionIds ? { selectedOptionIds } : {}, actor === "human" ? { userId: f.responsibleUserId! } : { agentId: f.agentId, runId: f.runId });
+      // Fork (#60): the shipped recipe omits resolverPolicy, so the card inherits human_only
+      // and the agent's own accept is refused outright.
+      if (actor === "human") await decided; else await expect(decided).rejects.toThrow(/human-only/);
       if (actor === "human") await expect(create(f)).resolves.toMatchObject({ task: { parentId: f.issueId } });
       else await expect(create(f)).rejects.toThrow(/proposal.*accept/i);
     }

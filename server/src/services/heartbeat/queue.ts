@@ -236,7 +236,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   isSameTaskScope: (left: string | null, right: string | null) => boolean;
   runTaskKey: (run: HeartbeatRun) => string | null;
   filterZombieCoalesceTarget: <T extends { id: string; status: string }>(run: T | null, live: { has(id: string): boolean }) => T | null;
-  getSchedulingSuppression: () => Promise<{ suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | "task_drain" | null }>;
+  getSchedulingSuppression: () => Promise<{ suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | "task_drain" | "server_shutdown" | null }>;
   isRunAdmissionClosed?: () => boolean;
   canStartNewExternalBotWork: (agent: typeof agents.$inferSelect) => Promise<boolean>;
   executeRun: (runId: string) => Promise<void>;
@@ -256,6 +256,9 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
 
 
 export const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+// How long a deferred wake without saved input waits after its holder is gone
+// before the periodic stranded-queue pass releases it through the drain.
+export const STRANDED_CONTENTLESS_WAKE_GRACE_MS = 2 * 60 * 1000;
 
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -1981,8 +1984,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        // A card addressee or a mentioned agent need not own the task. A
+        // former owner's ordinary messages stay for the assignment handoff.
         or(eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
-          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`)))
+          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`,
+          sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
         scope.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
@@ -1992,7 +1998,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
         ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
-        dependencyResolvedWakePayloadSql),
+        dependencyResolvedWakePayloadSql,
+        // A wake with no saved input is revisited only after the holder has
+        // been gone for a while, so an ordinary release settles it first.
+        lte(agentWakeupRequests.requestedAt, new Date(Date.now() - STRANDED_CONTENTLESS_WAKE_GRACE_MS))),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
@@ -2004,8 +2013,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const releasedNativeSources = new Set<string>();
     for (const { wake } of strandedQueues) {
       const dependencyWake = isDependencyResolvedWakePayload(wake.payload);
-      if (!dependencyWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
-          !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
+      const strandedIssueId = String(wake.payload?.issueId);
+      const savedInput = queuedCommentIdsFromWakePayload(wake.payload).length > 0 ||
+        Boolean(await readQueuedInteractionResponse(db, wake.companyId, strandedIssueId, wake.payload));
+      // A card still waiting for its addressee is live input too. The same
+      // stored-row check admits the run, so a resolved card never revives it.
+      const addressedCard = !dependencyWake && !savedInput && wake.payload?.mutation === "interaction" &&
+        Boolean(await readAddressedInteractionForWake(db, { companyId: wake.companyId, issueId: strandedIssueId,
+          agentId: wake.agentId, contextSnapshot: parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]) }));
+      const contentless = !queuedCommentIdsFromWakePayload(wake.payload).length && wake.payload?.mutation !== "interaction";
+      if (!dependencyWake && !savedInput && !addressedCard &&
+          !(contentless && wake.requestedAt <= new Date(Date.now() - STRANDED_CONTENTLESS_WAKE_GRACE_MS))) continue;
       const [latest] = await db.select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
@@ -2806,9 +2824,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // here dropped the wake permanently — an accepted plan whose
     // continuation wake landed mid-drain left its issue in `todo` with no
     // run and no path until a person noticed.
+    // A planned shutdown holds admission the same way: the wake stays queued
+    // for the next process instead of being dropped.
     if (
       schedulingSuppression.suppressed &&
-      schedulingSuppression.reason !== "task_drain"
+      schedulingSuppression.reason !== "task_drain" &&
+      schedulingSuppression.reason !== "server_shutdown"
     ) {
       await writeSkippedHeartbeatRequest("heartbeat.scheduling_suppressed", {
         reason: schedulingSuppression.reason,

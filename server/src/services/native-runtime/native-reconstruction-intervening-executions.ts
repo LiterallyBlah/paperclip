@@ -6,6 +6,7 @@ import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js"
 import { hasRequiredWorkspaceRecovery } from "../workspace-restore-recovery-state.js";
 import { nativeSha256 } from "./canonical.js";
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
+import { isOperatorHeldRecoveryAction } from "../recovery/recovery-owner-routing.js";
 
 type RecordedExecution = NonNullable<NonNullable<ExecutionReconciliation["workspaceReconstruction"]>["interveningExecutions"]>;
 type InterveningRun = Pick<typeof heartbeatRuns.$inferSelect,
@@ -54,7 +55,7 @@ export async function reconciledInterveningExecutions(db: Db, source: typeof hea
     )).for("share");
     const repairs = actions.filter(action => {
       const decision = action.evidence.executionReconciliation as ExecutionReconciliation | undefined;
-      return action.evidence.runId === run.id && action.kind === "active_run_watchdog" && action.ownerType === "board"
+      return action.evidence.runId === run.id && action.kind === "active_run_watchdog" && isOperatorHeldRecoveryAction(action)
         && action.returnOwnerAgentId === null && hasRequiredWorkspaceRecovery(action.evidence)
         && action.evidence.continuationDelivery === "not_requested" && decision?.runId === run.id
         && decision.providerStopped === true && decision.actionOutcome === "not_performed"

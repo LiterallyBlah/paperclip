@@ -1046,19 +1046,24 @@ export function statusCardService(
       updatesLastHour: recent.filter((row) => row.kind !== "compile" && row.finishedAt).length,
       tokensToday: Number(daily[0]?.tokens ?? 0),
       manual: forceRun,
+      lastGeneratedAt: card.lastGeneratedAt,
     });
     if (decision.action !== "run") {
+      const eligibleAt = nextStatusCardPolicyEligibility({
+        policy: card.refreshPolicy, now, lastChangeAt,
+        completedUpdateTimes: recent.filter(row => row.kind !== "compile" && row.finishedAt).map(row => row.startedAt),
+        tokensToday: Number(daily[0]?.tokens ?? 0),
+      });
+      // A reactive wait inside the post-generation spacing window is due at the
+      // end of that window, not at the next policy opening.
+      const spacedDueAt = "dueAt" in decision ? decision.dueAt : undefined;
       const [next] = await mutate(card.companyId, tx => tx.update(statusCards).set({
         pendingChangeCount: changes.length,
         pendingChangeHash,
         lastChangeAt,
         state: decision.action === "pause_budget" ? "paused_budget" : decision.action === "pause_hours" ? "paused_hours" : "active",
         nextEvalReason: "policy",
-        nextEvalAt: nextStatusCardPolicyEligibility({
-          policy: card.refreshPolicy, now, lastChangeAt,
-          completedUpdateTimes: recent.filter(row => row.kind !== "compile" && row.finishedAt).map(row => row.startedAt),
-          tokensToday: Number(daily[0]?.tokens ?? 0),
-        }),
+        nextEvalAt: eligibleAt && spacedDueAt && spacedDueAt > eligibleAt ? spacedDueAt : eligibleAt,
       }).where(and(eq(statusCards.id, card.id), currentRevision)).returning());
       if (!next) return undefined;
       return { card: next, generatingIssue: null, alreadyGenerating: false, enqueued: false };

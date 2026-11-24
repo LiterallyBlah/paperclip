@@ -33,6 +33,19 @@ import type { RunProcessResult } from "./server-utils.js";
 
 const execFile = promisify(execFileCallback);
 
+// Lookalikes of the agent self-rotate route that must stay denied on the bridge.
+const SELF_ROTATE_DENIED_REQUESTS: ReadonlyArray<{ method: string; path: string }> = [
+  { method: "GET", path: "/api/agents/me/secrets/bla4083.dummy.a/rotate" },
+  { method: "PUT", path: "/api/agents/me/secrets/bla4083.dummy.a/rotate" },
+  { method: "POST", path: "/api/agents/11111111-1111-4111-8111-111111111111/secrets/k/rotate" },
+  { method: "POST", path: "/api/agents/me/secrets/k" },
+  { method: "POST", path: "/api/agents/me/secrets/k/rotate/x" },
+  { method: "POST", path: "/api/agents/me/secrets/a/b/rotate" },
+  { method: "POST", path: "/api/secrets/11111111-1111-4111-8111-111111111111/rotate" },
+  { method: "POST", path: "/api/companies/11111111-1111-4111-8111-111111111111/me/user-secrets/22222222-2222-4222-8222-222222222222/rotate" },
+  { method: "GET", path: "/api/agents/me/secrets" },
+];
+
 describe("sandbox callback bridge", () => {
   const cleanupDirs: string[] = [];
   function queueRuntimeInput(
@@ -498,6 +511,56 @@ describe("sandbox callback bridge", () => {
       if (index === 0) expect(JSON.parse(response.body)).toEqual(schema);
     }
     expect(forwarded).toEqual(["GET /api/openapi.json"]);
+  });
+
+  it("relays agent self-rotate of a bound secret over the queue and denies its lookalikes", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-self-rotate-"));
+    cleanupDirs.push(rootDir);
+    const queueDir = path.join(rootDir, "queue");
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const forwarded: string[] = [];
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(), queueDir,
+      handleRequest: async (request) => {
+        forwarded.push(`${request.method} ${request.path}`);
+        return { status: 200, body: "{}" };
+      },
+    });
+    cleanupFns.push(() => worker.stop());
+    const requests = [
+      { method: "POST", path: "/api/agents/me/secrets/bla4083.dummy.a/rotate" },
+      ...SELF_ROTATE_DENIED_REQUESTS,
+    ];
+    for (const [index, request] of requests.entries()) {
+      await publishBridgeRequest(path.join(directories.requestsDir, `rotate-${index}.json`), JSON.stringify({
+        id: `rotate-${index}`, ...request, query: "", headers: {}, body: index === 0 ? "{\"value\":\"x\"}" : "",
+        createdAt: new Date().toISOString(),
+      }));
+    }
+    await vi.waitFor(async () => {
+      expect(await createFileSystemSandboxCallbackBridgeQueueClient().listJsonFiles(directories.responsesDir))
+        .toHaveLength(requests.length);
+    }, { timeout: 5_000 });
+    for (const [index, request] of requests.entries()) {
+      const response = JSON.parse(await readFile(path.join(directories.responsesDir, `rotate-${index}.json`), "utf8"));
+      expect(response.status, `${request.method} ${request.path}`).toBe(index === 0 ? 200 : 403);
+      if (index > 0) {
+        expect(JSON.parse(response.body)).toEqual({ error: `Route not allowed: ${request.method} ${request.path}` });
+      }
+    }
+    expect(forwarded).toEqual(["POST /api/agents/me/secrets/bla4083.dummy.a/rotate"]);
+  });
+
+  it("admits only POST /api/agents/me/secrets/:key/rotate for secrets on both route lists", () => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(
+        { method: "POST", path: "/api/agents/me/secrets/bla4083.dummy.a/rotate" }, routes,
+      )).toBeNull();
+      for (const request of SELF_ROTATE_DENIED_REQUESTS) {
+        expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request, routes))
+          .toBe(`Route not allowed: ${request.method} ${request.path}`);
+      }
+    }
   });
 
   it("denies non-allowlisted requests by default", async () => {

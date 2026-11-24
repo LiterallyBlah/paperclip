@@ -83,7 +83,9 @@ const support = await getEmbeddedPostgresTestSupport();
     const accepted = await request(fixture.app).get("/actor").set("Authorization", `Bearer ${fixture.token}`);
     expect(accepted.status).toBe(200);
     expect(accepted.body).toMatchObject({ identityContextId: pending!.id, onBehalfOfUserId: "next-user" });
-    await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, fixture.runId));
+    // Fork (#48): a terminal run with no finishedAt loses its JWT (401). A just-cancelled run
+    // inside the 10 s grace keeps the cancelled-write 403 this test checks.
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, fixture.runId));
     const revoked = await request(fixture.app).patch("/actor").set("Authorization", `Bearer ${fixture.token}`);
     expect(revoked.status).toBe(403);
     expect(revoked.body.code).toBe("agent_run_cancelled");

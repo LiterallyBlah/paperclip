@@ -255,11 +255,15 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
         title: text("Interaction card title.", 300),
         prompt: text("Question or decision prompt.", 10_000),
         payload: openObject,
-        resolverPolicy: { const: "human_only", description: "Optionally require an authenticated human response." },
         targetRevisionId: nullableText(
           "Optional bound document revision.",
           240,
         ),
+        resolverPolicy: {
+          enum: ["anyone", "not_creator", "human_only"],
+          description:
+            "Who may resolve the card. Omitted means human_only. Send anyone on an ordinary confirmation or checkbox card whose chat answer you will record.",
+        },
         continuationPolicy: {
           enum: ["none", "wake_assignee", "wake_assignee_on_accept"],
         },

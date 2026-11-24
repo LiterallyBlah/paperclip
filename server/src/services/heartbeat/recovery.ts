@@ -46,9 +46,11 @@ import {
 } from "../legacy-controller-lease.js";
 import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { readEnvironmentStopFailure, type PluginEnvironmentStopFailure } from "@paperclipai/plugin-sdk";
+import { isSshPendingCleanupLease, reconcileSshPendingCleanup, SSH_UNSUPPORTED_CLEANUP_OPERATION } from "../ssh-pending-cleanup-reconciliation.js";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
-import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
+import { legacyExecutionNeedsReconciliationWithEvidence, settleShutdownStoppedGatewayRun, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
 import { reconcileRetainedWorkspaces } from "../workspace-recovery.js";
+import { readPlannedShutdownMarkers } from "../planned-shutdown-marker.js";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import { sweepOrphanedRunScratch, type RunScratchSweepRunState } from "../run-scratch.js";
@@ -115,7 +117,8 @@ import {
   type HotRestartReportRun,
 } from "../hot-restart.js";
 import { serverVersion } from "../../version.js";
-import { adapterExecutionControls, waitForAdapterStop } from "../adapter-execution-control.js";
+import { adapterExecutionControls, waitForAdapterStop, type AdapterCancellationOutcome } from "../adapter-execution-control.js";
+import { readRunCancellation } from "../run-cancellation.js";
 import { allowLegacyShutdownWorkspaceCleanup, beginLegacyShutdownWorkspaceSettlement, finishLegacyShutdownWorkspaceSettlement, maintainLegacyShutdownWorkspaceSettlement, sweepLegacyShutdownWorkspaceSettlements } from "../legacy-shutdown-workspace-settlement.js";
 
 import type { environmentService } from "../environments.js";
@@ -1136,10 +1139,64 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     }
   }
 
+  /** Admission is already stopped when the drain starts, so this boot's
+   * legacy runs can only finish. Give them a bounded window to finish on their
+   * own before any is interrupted. Returns how many finished in the window. */
+  async function waitForLegacyRunsToFinish(
+    selectedRunIds: readonly string[] | null,
+    graceMs: number,
+  ) {
+    if (graceMs <= 0) return 0;
+    const listOwnedRunning = async () => {
+      const rows = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.status, "running"),
+          eq(heartbeatRuns.runtimeMode, "legacy"),
+          or(isNull(heartbeatRuns.controllerBootId), eq(heartbeatRuns.controllerBootId, legacyControllerBootId)),
+          ...(selectedRunIds ? [inArray(heartbeatRuns.id, [...selectedRunIds])] : []),
+        ));
+      return new Set(rows.map((row) => row.id));
+    };
+    const initial = await listOwnedRunning();
+    if (initial.size === 0) return 0;
+    logger.info({ running: initial.size, graceMs }, "waiting for running heartbeat runs to finish before shutdown");
+    const deadline = Date.now() + graceMs;
+    let remaining = initial;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+      remaining = await listOwnedRunning();
+      if ([...initial].every((id) => !remaining.has(id))) break;
+    }
+    return [...initial].filter((id) => !remaining.has(id)).length;
+  }
+
+  async function recordShutdownCancellationOutcome(
+    runId: string,
+    outcome: AdapterCancellationOutcome,
+  ) {
+    const patch: Record<string, unknown> = {};
+    if (outcome.executionCancellation) patch.executionCancellation = outcome.executionCancellation;
+    if (outcome.executionRecovery) patch.executionRecovery = outcome.executionRecovery;
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify(patch)}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(heartbeatRuns.id, runId),
+        eq(heartbeatRuns.status, "interrupted"),
+        eq(heartbeatRuns.errorCode, "server_shutdown_interrupted"),
+      ));
+  }
+
   async function drainRunningRunsForShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
+    options: { completionGraceMs?: number } = {},
   ) {
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
@@ -1148,8 +1205,14 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         interruptedRunIds: [],
         retryRunIds: [],
         restartSuspendedRunIds: [],
+        completedDuringGrace: 0,
       };
     }
+    const completionGraceMs = Math.max(0, options.completionGraceMs ?? 0);
+    const completedDuringGrace = await waitForLegacyRunsToFinish(selectedRunIds, completionGraceMs);
+    // Interruption times must reflect when the drain acted, not when it began
+    // waiting for runs to finish.
+    if (completionGraceMs > 0) now = new Date();
     const activeRuns = await db
       .select({
         run: heartbeatRuns,
@@ -1323,6 +1386,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           }
           return;
         }
+        // The adapter returns its stop evidence after the shutdown CAS, so its
+        // own terminal write is skipped. Keep that evidence on the interrupted
+        // row: the retry decision below may only trust a confirmed stop.
+        if (control?.cancellationOutcome) {
+          await recordShutdownCancellationOutcome(run.id, control.cancellationOutcome);
+          await settleShutdownStoppedGatewayRun(db, { run: interruptedStatus.run });
+        }
         // Settlement can save restore-failure evidence after the shutdown CAS.
         let interrupted = (control && await getRun(run.id, { includeExecutionEvidence: true })) ?? interruptedStatus.run;
         await setWakeupStatus(run.wakeupRequestId, "cancelled", {
@@ -1409,6 +1479,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       interruptedRunIds,
       retryRunIds,
       restartSuspendedRunIds,
+      completedDuringGrace,
     };
   }
 
@@ -1777,7 +1848,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // path uses the provider and configuration recorded on the lease first;
       // the environment is lifecycle context and only a legacy fallback.
       const isOrphanEphemeralLease = lease.leasePolicy === "ephemeral";
-      const useRecordedTeardown = isOrphanEphemeralLease || !environment || hasStopOnlyCleanup(lease);
+      // An SSH lease names a shared host/account/workspace, not a sandbox, so it
+      // has no provider teardown. It settles only from exact run stop evidence
+      // (see ssh-pending-cleanup-reconciliation.ts) and never through the
+      // generic teardown or its unfenced revert, which would drop receipts.
+      const sshReconciliation = !hasStopOnlyCleanup(lease) && isSshPendingCleanupLease(lease, environment);
+      const useRecordedTeardown = !sshReconciliation &&
+        (isOrphanEphemeralLease || !environment || hasStopOnlyCleanup(lease));
 
       // Do not consume a finite cleanup attempt while the provider plugin is
       // briefly unavailable. A plugin worker restart, a plugin reload, or a
@@ -1844,7 +1921,24 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           action: "environment_lease.cleanup_retried", entityType: "environment_lease", entityId: row.id,
           runId: row.heartbeatRunId ?? undefined, details: { attempt: attempts + 1, reason: "environment_deleted" },
         });
-        if (useRecordedTeardown) {
+        if (sshReconciliation) {
+          const outcome = await reconcileSshPendingCleanup(db, lease, { attemptId: claimed });
+          if (outcome.outcome === "settled") {
+            destroyed += 1;
+            await logActivity(db, {
+              companyId: lease.companyId, actorType: "system", actorId: "pending_cleanup_sweep",
+              action: "environment_lease.cleanup_reconciled", entityType: "environment_lease", entityId: lease.id,
+              runId: lease.heartbeatRunId, details: { provider: "ssh", source: outcome.source,
+                priorCleanupStatus: lease.cleanupStatus, priorFailureReason: lease.failureReason },
+            }).catch(() => logger.warn({ leaseId: lease.id }, "could not record SSH cleanup reconciliation activity"));
+          } else if (outcome.outcome === "unresolved") {
+            logger.warn(
+              { leaseId: row.id, environmentId: row.environmentId, attempts: attempts + 1,
+                reason: outcome.reason, unsupportedOperation: SSH_UNSUPPORTED_CLEANUP_OPERATION },
+              "SSH pending_cleanup lease has no exact stop evidence; it stays unresolved",
+            );
+          }
+        } else if (useRecordedTeardown) {
           // Tear the sandbox down from the recorded provider config and the
           // cleanup-authorized secret versions. Preserve any provider receipt;
           // a completed retry must grant the same evidence as initial cleanup.
@@ -2109,6 +2203,68 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       });
     activeRunExecutionPromises.add(cleanup);
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
+  }
+
+  async function finalizePlannedShutdownLeftover(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: { adapterType: string; adapterConfig: Record<string, unknown> };
+    signal: "SIGINT" | "SIGTERM";
+    interruptedBeforeDispatch: boolean;
+    now: Date;
+  }) {
+    const { run, now } = input;
+    const message = `Interrupted by planned server shutdown (${input.signal}) before the drain finalized the run`;
+    const write = await setRunStatusFromLive(run.id, "interrupted", ["running"], {
+      error: message,
+      errorCode: "server_shutdown_interrupted",
+      signal: input.signal,
+      finishedAt: now,
+      resultJson: mergeRunStopMetadataForAgent(input.agent, "interrupted", {
+        conversationContinuationEligible: await runUsedConversationAdapter(db, run),
+        resultJson: {
+          ...parseObject(run.resultJson),
+          plannedShutdownRecovery: { signal: input.signal, recoveredAt: now.toISOString() },
+          ...(input.interruptedBeforeDispatch
+            ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
+            : {}),
+        },
+        errorCode: "server_shutdown_interrupted",
+        errorMessage: message,
+      }),
+    });
+    if (!write.updated || !write.run) return false;
+    await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: now, error: null });
+    let interrupted =
+      (await classifyAndPersistRunLiveness(write.run, parseObject(write.run.resultJson))) ?? write.run;
+    await releaseEnvironmentLeasesForRun({
+      runId: interrupted.id,
+      companyId: interrupted.companyId,
+      agentId: interrupted.agentId,
+      status: interrupted.status,
+      failureReason: interrupted.error ?? undefined,
+    });
+    const agent = await getAgent(run.agentId);
+    const retry =
+      agent && !await pendingCaseHandoffForRun(db, run.id, run.companyId)
+        ? await enqueueProcessLossRetry(interrupted, agent, now)
+        : null;
+    if (!retry) await releaseIssueExecutionAndPromote(interrupted);
+    await appendRunEvent(interrupted, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message,
+      payload: {
+        signal: input.signal,
+        plannedShutdown: true,
+        ...(retry ? { retryRunId: retry.id } : {}),
+      },
+    });
+    await finalizeAgentStatus(run.agentId, "interrupted", message, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    });
+    await startNextQueuedRunForAgent(run.agentId);
+    return true;
   }
 
   type RecoveryScope = {
@@ -2661,6 +2817,30 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         run.controllerBootId !== legacyControllerBootId &&
         !revokedState.processPid &&
         !revokedState.processGroupId;
+      // The previous controller recorded a planned shutdown and was stopped
+      // before its drain finalized this run. This is a planned-restart
+      // interruption, not a process loss: record it the way the drain would
+      // have, with the same no-replay retry gate.
+      const plannedShutdown =
+        run.runtimeMode === "legacy" &&
+        !!run.controllerBootId &&
+        run.controllerBootId !== legacyControllerBootId
+          ? readPlannedShutdownMarkers(now).get(run.controllerBootId)
+          : undefined;
+      if (plannedShutdown) {
+        const finalized = await finalizePlannedShutdownLeftover({
+          run,
+          agent: { adapterType, adapterConfig },
+          signal: plannedShutdown.signal,
+          interruptedBeforeDispatch: restartInterruptedBeforeDispatch,
+          now,
+        });
+        if (finalized) {
+          runningProcesses.delete(run.id);
+          reaped.push(run.id);
+        }
+        continue;
+      }
       const shouldRetry =
         !await pendingCaseHandoffForRun(db, run.id, run.companyId) &&
         // Process loss spends the durable failure retry budget that

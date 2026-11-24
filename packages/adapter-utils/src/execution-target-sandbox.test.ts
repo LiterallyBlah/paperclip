@@ -21,6 +21,7 @@ import {
 
 import {
   __duplexReadinessTesting,
+  DUPLEX_GATEWAY_BOOTSTRAP_REQUEST_LINE,
   __http2PrefaceScanTesting,
   DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
   adapterExecutionTargetDuplexObservabilityRecorder,
@@ -3178,6 +3179,27 @@ describe("sandbox adapter execution targets", () => {
     };
   }
 
+  // The launch script's side of the duplex bootstrap handshake. A fake channel
+  // sends this line first, the way the real launch script does once it runs,
+  // and reads the gateway environment from the bootstrap the host writes back.
+  // The launch command itself carries no environment value.
+  const DUPLEX_TEST_BOOTSTRAP_REQUEST = `${DUPLEX_GATEWAY_BOOTSTRAP_REQUEST_LINE}\n`;
+
+  // Parse a complete bootstrap (`N\n` then N shell lines of `export K='v'`), or
+  // return null while it is still incomplete.
+  function parseDuplexTestBootstrap(text: string): Record<string, string> | null {
+    const firstNewline = text.indexOf("\n");
+    if (firstNewline === -1) return null;
+    const lineCount = Number(text.slice(0, firstNewline));
+    const body = text.slice(firstNewline + 1);
+    if (body.split("\n").length - 1 < lineCount) return null;
+    const env: Record<string, string> = {};
+    for (const match of body.matchAll(/export ([A-Za-z_][A-Za-z0-9_]*)='((?:[^']|'"'"')*)'/g)) {
+      env[match[1]!] = match[2]!.replace(/'"'"'/g, "'");
+    }
+    return env;
+  }
+
   // The control surface a test uses to drive one fake duplex channel and read
   // what the broker wrote back through it.
   interface DuplexSelectionControl {
@@ -3221,13 +3243,27 @@ describe("sandbox adapter execution targets", () => {
       command: readonly string[];
     }): Promise<CommandManagedDuplexChannel> => {
       control.openCount += 1;
-      const joined = openInput.command.join(" ");
-      const nonce = /PAPERCLIP_BRIDGE_NONCE='([^']*)'/.exec(joined)?.[1] ?? "";
-      const port = /PAPERCLIP_BRIDGE_PORT='([^']*)'/.exec(joined)?.[1] ?? "";
+      void openInput;
+      let nonce = "";
+      let port = "";
+      let bootstrapText = "";
+      let bootstrapEnv: Record<string, string> | null = null;
+      let runOpen: (() => void) | null = null;
       let dataListener: ((chunk: Uint8Array) => void) | null = null;
       let exitListener: ((exit: { exitCode: number | null }) => void) | null = null;
       const channel: CommandManagedDuplexChannel = {
         write(data: Uint8Array): void {
+          if (!bootstrapEnv) {
+            // The first host input is the bootstrap the launch script reads.
+            bootstrapText += Buffer.from(data).toString("utf8");
+            bootstrapEnv = parseDuplexTestBootstrap(bootstrapText);
+            if (bootstrapEnv) {
+              nonce = bootstrapEnv.PAPERCLIP_BRIDGE_NONCE ?? "";
+              port = bootstrapEnv.PAPERCLIP_BRIDGE_PORT ?? "";
+              setImmediate(() => runOpen?.());
+            }
+            return;
+          }
           const decoded = decodeDuplexLine(Buffer.from(data).toString("utf8").replace(/\n$/, ""));
           if (decoded.ok) {
             control.writtenTypes.push(decoded.frame.type);
@@ -3236,9 +3272,10 @@ describe("sandbox adapter execution targets", () => {
         onData(listener: (chunk: Uint8Array) => void): void {
           dataListener = listener;
           control.emitData = (chunk) => dataListener?.(new TextEncoder().encode(chunk));
-          // Drive the readiness emission on the next tick, after the gate also
-          // registers its exit listener.
-          setImmediate(() => {
+          // Drive the readiness emission after the bootstrap handshake, on the
+          // next tick, after the gate also registers its exit listener.
+          setImmediate(() => dataListener?.(new TextEncoder().encode(DUPLEX_TEST_BOOTSTRAP_REQUEST)));
+          runOpen = () => {
             const emitRaw = (text: string) => dataListener?.(new TextEncoder().encode(text));
             const emitFrame = (frame: Record<string, unknown>) =>
               dataListener?.(new TextEncoder().encode(`${JSON.stringify(frame)}\n`));
@@ -3248,7 +3285,7 @@ describe("sandbox adapter execution targets", () => {
             } else {
               emitFrame({ version: 2, type: "ready", nonce });
             }
-          });
+          };
         },
         onExit(listener: (exit: { exitCode: number | null }) => void): void {
           exitListener = listener;
@@ -3321,10 +3358,7 @@ describe("sandbox adapter execution targets", () => {
       command: readonly string[];
     }): Promise<CommandManagedDuplexChannel> => {
       control.openCount += 1;
-      const joined = openInput.command.join(" ");
-      const nonce = /PAPERCLIP_BRIDGE_NONCE='([^']*)'/.exec(joined)?.[1] ?? "";
-      const port = /PAPERCLIP_BRIDGE_PORT='([^']*)'/.exec(joined)?.[1] ?? "";
-      const bridgeToken = /PAPERCLIP_BRIDGE_TOKEN='([^']*)'/.exec(joined)?.[1] ?? "";
+      void openInput;
       const [hostSide, sandboxSide] = duplexPair();
       const dataListeners: Array<(chunk: Uint8Array) => void> = [];
       const exitListeners: Array<(exit: { exitCode: number | null }) => void> = [];
@@ -3353,11 +3387,25 @@ describe("sandbox adapter execution targets", () => {
           hostSide.end();
         },
       };
-      setImmediate(() => {
+      // Play the launch script: send the bootstrap request, read the bootstrap
+      // the host writes back, then run the scripted gateway output.
+      setImmediate(() => sandboxSide.write(DUPLEX_TEST_BOOTSTRAP_REQUEST));
+      let bootstrapText = "";
+      const onBootstrapChunk = (chunk: Buffer) => {
+        bootstrapText += chunk.toString("utf8");
+        const env = parseDuplexTestBootstrap(bootstrapText);
+        if (!env) return;
+        sandboxSide.off("data", onBootstrapChunk);
+        sandboxSide.pause();
+        setImmediate(() => runOpen(env));
+      };
+      sandboxSide.on("data", onBootstrapChunk);
+      const runOpen = (env: Record<string, string>) => {
+        const nonce = env.PAPERCLIP_BRIDGE_NONCE ?? "";
         const ctx: Http2OpenContext = {
           nonce,
-          port,
-          bridgeToken,
+          port: env.PAPERCLIP_BRIDGE_PORT ?? "",
+          bridgeToken: env.PAPERCLIP_BRIDGE_TOKEN ?? "",
           emitRaw: (bytes) => sandboxSide.write(typeof bytes === "string" ? Buffer.from(bytes) : bytes),
           emitReady: (readyNonce = nonce) =>
             sandboxSide.write(
@@ -3372,7 +3420,7 @@ describe("sandbox adapter execution targets", () => {
           ctx.emitReady();
           ctx.connectHttp2();
         }
-      });
+      };
       return channel;
     };
     return { runner: { ...base, openDuplexChannel }, control };
@@ -4942,32 +4990,40 @@ describe("sandbox adapter execution targets", () => {
 
   it("test_the_host_writes_no_byte_before_the_ready_line_is_accepted", async () => {
     // The launch wrapper gives the gateway no start acknowledgment (accepted
-    // fact from PAP-5065): a host byte written before the READY line is
-    // accepted can reach the shell instead of the child. This test proves
-    // the host writes nothing to the channel until well after it accepted
-    // READY: it holds the channel open, with no client preface arriving
-    // (so the http2 server, if bound, would try to write its own SETTINGS
-    // frame), and asserts zero bytes crossed the channel the whole time.
+    // fact from PAP-5065): a host byte written before the launch script runs
+    // can reach the outer shell instead of the child. The one start
+    // acknowledgment is the script's own bootstrap request line, and the one
+    // host input it asks for is the bootstrap. This test proves the host
+    // writes nothing before that request, exactly the bootstrap after it, and
+    // nothing else until well after it accepted READY: it holds the channel
+    // open, with no client preface arriving (so the http2 server, if bound,
+    // would try to write its own SETTINGS frame), and asserts no other byte
+    // crossed the channel the whole time.
     const { rootDir, remoteCwd } = await createSandboxWorkspace("paperclip-http2-no-early-write-");
     const api = await startRecordingApiServer();
     const base = createLocalSandboxRunner();
     const hostWrites: Buffer[] = [];
+    let requestSent = false;
+    let bootstrapReceived = false;
     let readyLineSent = false;
     const readySentAtMs = { value: 0 };
     const openDuplexChannel = async (openInput: {
       command: readonly string[];
     }): Promise<CommandManagedDuplexChannel> => {
-      const joined = openInput.command.join(" ");
-      const nonce = /PAPERCLIP_BRIDGE_NONCE='([^']*)'/.exec(joined)?.[1] ?? "";
+      void openInput;
+      let nonce = "";
       let dataListener: ((chunk: Uint8Array) => void) | null = null;
       const channel: CommandManagedDuplexChannel = {
         write: (data: Uint8Array) => {
-          // Any host write before READY is accepted is exactly the fault
+          // The bootstrap is the one host input the launch script asks for.
+          // Any other host write before READY is accepted is exactly the fault
           // this test guards against.
-          hostWrites.push(Buffer.from(data));
-        },
-        onData: (listener: (chunk: Uint8Array) => void) => {
-          dataListener = listener;
+          if (!requestSent || bootstrapReceived) {
+            hostWrites.push(Buffer.from(data));
+            return;
+          }
+          bootstrapReceived = true;
+          nonce = parseDuplexTestBootstrap(Buffer.from(data).toString("utf8"))?.PAPERCLIP_BRIDGE_NONCE ?? "";
           setImmediate(() => {
             readySentAtMs.value = Date.now();
             readyLineSent = true;
@@ -4978,6 +5034,15 @@ describe("sandbox adapter execution targets", () => {
             // while it waits out the preface bound, proving the READY-accept
             // gate — not a timer — is what would unlock a host write.
           });
+        },
+        onData: (listener: (chunk: Uint8Array) => void) => {
+          dataListener = listener;
+          // The host must write nothing until the launch script asks for the
+          // bootstrap, so hold the request back for a while first.
+          setTimeout(() => {
+            requestSent = true;
+            dataListener?.(new TextEncoder().encode(DUPLEX_TEST_BOOTSTRAP_REQUEST));
+          }, 50);
         },
         onExit: (_listener: (exit: { exitCode: number | null }) => void) => {},
         stop: () => {},
@@ -4997,6 +5062,7 @@ describe("sandbox adapter execution targets", () => {
       // and across the whole open attempt, including the wait after READY,
       // the host wrote zero bytes to the channel.
       expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      expect(bootstrapReceived).toBe(true);
       expect(hostWrites).toHaveLength(0);
     } finally {
       await bridge?.stop();

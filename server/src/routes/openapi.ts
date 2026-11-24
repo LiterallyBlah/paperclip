@@ -135,6 +135,7 @@ import {
   createSecretSchema,
   updateSecretSchema,
   rotateSecretSchema,
+  agentRotateBoundSecretSchema,
   rotateUserSecretValueSchema,
   createUserSecretDefinitionSchema,
   updateUserSecretDefinitionSchema,
@@ -1437,6 +1438,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/attention/history",
   "GET /api/companies/{companyId}/attention/summary",
   "GET /api/companies/{companyId}/attention/tasks",
+  "GET /api/agents/{id}/secret-rotation-grant",
+  "PUT /api/agents/{id}/secret-rotation-grant",
+  "DELETE /api/agents/{id}/secret-rotation-grant",
   "POST /api/issues/{id}/interactions/{interactionId}/dismiss",
   "POST /api/issues/{id}/retry",
   "GET /api/companies/{companyId}/prompt-injection-prevention",
@@ -3755,6 +3759,99 @@ registry.registerPath({
     },
     401: r.unauthorized,
     403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/me/secrets/{key}/rotate",
+  tags: ["secrets"],
+  summary: "Rotate the value of one granted, bound secret for the current agent run",
+  description:
+    "Requires a run-bound agent token and a secrets:rotate_bound grant whose scope names exactly this secret and binding. The value is never returned.",
+  request: { params: z.object({ key: z.string() }), body: jsonBody(agentRotateBoundSecretSchema) },
+  responses: {
+    200: {
+      description: "Rotated secret identity and new version",
+      content: {
+        "application/json": {
+          schema: z.object({
+            id: z.string().uuid(),
+            key: z.string(),
+            version: z.number().int().positive(),
+          }),
+        },
+      },
+    },
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+const secretRotationGrantViewSchema = z.object({
+  id: z.string().uuid(),
+  permissionKey: z.literal("secrets:rotate_bound"),
+  scope: z.union([z.object({ secretId: z.string(), bindingId: z.string() }), z.unknown()]),
+  scopeValid: z.boolean(),
+  grantedByUserId: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+const secretRotationGrantBodyDoc = z.object({ secretId: z.string().uuid(), bindingId: z.string().uuid() }).strict();
+
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/{id}/secret-rotation-grant",
+  tags: ["agents"],
+  summary: "Read an agent's secrets:rotate_bound grant",
+  description: "Board users only. Returns the one rotate grant of this agent, or null. Never returns secret values.",
+  request: { params: z.object({ id: z.string().uuid() }) },
+  responses: {
+    200: r.ok(z.object({ grant: secretRotationGrantViewSchema.nullable() })),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/agents/{id}/secret-rotation-grant",
+  tags: ["agents"],
+  summary: "Grant an agent secrets:rotate_bound for exactly one directly bound secret",
+  description:
+    "Board users only. The secret must be an active company secret and the binding a direct binding of that secret to this agent. Insert only: an identical board grant returns 200, any other existing rotate grant returns 409 and is never overwritten. Other grants are not changed.",
+  request: { params: z.object({ id: z.string().uuid() }), body: jsonBody(secretRotationGrantBodyDoc) },
+  responses: {
+    200: r.ok(z.object({ created: z.literal(false), grant: secretRotationGrantViewSchema })),
+    201: {
+      description: "Grant created",
+      content: { "application/json": { schema: z.object({ created: z.literal(true), grant: secretRotationGrantViewSchema }) } },
+    },
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/agents/{id}/secret-rotation-grant",
+  tags: ["agents"],
+  summary: "Remove an agent's secrets:rotate_bound grant when its scope matches exactly",
+  description: "Board users only. Deletes only this agent's rotate grant, and only when its scope equals the body. Other grants are not changed.",
+  request: { params: z.object({ id: z.string().uuid() }), body: jsonBody(secretRotationGrantBodyDoc) },
+  responses: {
+    200: r.ok(z.object({ removed: z.literal(true), grantId: z.string().uuid() })),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
@@ -7311,6 +7408,40 @@ registry.registerPath({
   summary: "End a task drain and restore run admission",
   request: { query: z.object({ ownerId: z.string().uuid().optional() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/instance/heartbeat-runs/{runId}/administrative-stop-reconciliation",
+  tags: ["instance"],
+  summary: "Record an administrative stop reconciliation for one historical cancelled legacy run",
+  description:
+    "Instance admins only. Writes resultJson.administrativeStopReconciliation once, only when the run is a cancelled legacy run with no process, session, exit, retained execution event, coordinator, provider handoff or unsettled lease, its controller boot is not the current one, and no live server-uid process was born near the run. It never writes executor receipts. 409 reports the refusal code.",
+  request: {
+    params: z.object({ runId: z.string().uuid() }),
+    body: jsonBody(z.object({ companyId: z.string().uuid(), decisionRef: z.string().min(1).max(200), reason: z.string().min(1).max(2000) }).strict()),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/maintenance-redispatch",
+  tags: ["instance"],
+  summary:
+    "Read-only affected-run manifest for one task drain (default: the latest): each run or stage wake the window ended, the re-dispatch decision and any dispatched wake",
+  request: { query: z.object({ operationId: z.string().uuid().optional() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/instance/maintenance-redispatch",
+  tags: ["instance"],
+  summary:
+    "Apply the maintenance re-dispatch for an ended task drain: wake each eligible task or review participant at most once per operation",
+  request: { body: jsonBody(z.object({ operationId: z.string().uuid().optional() })) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({

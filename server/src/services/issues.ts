@@ -274,6 +274,8 @@ import { buildIssueChanges } from "./issue-change-receipt.js";
 import { ensurePersonalPrivateProject } from "./projects.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import { withoutDeferredWakesBehindHold } from "./execution-blocker.js";
+import { isOperatorHeldRecoveryAction } from "./recovery/recovery-owner-routing.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -4064,9 +4066,12 @@ async function readIssueBlockerAttentionBatch(
   }
 
   for (const chunk of chunkList(nodeIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
-    const wakeRowsPromise: Promise<IssueBlockerAttentionActivePathRow[]> =
+    const wakeRowsPromise: Promise<Array<IssueBlockerAttentionActivePathRow & { id: string; agentId: string; status: string }>> =
       dbOrTx
         .select({
+          id: agentWakeupRequests.id,
+          agentId: agentWakeupRequests.agentId,
+          status: agentWakeupRequests.status,
           issueId: sql<
             string | null
           >`${agentWakeupRequests.payload} ->> 'issueId'`,
@@ -4086,7 +4091,8 @@ async function readIssueBlockerAttentionBatch(
             ),
           ),
         );
-    const wakeRows = await wakeRowsPromise;
+    // A deferred wake that a recovery hold keeps from running is not live work.
+    const wakeRows = await withoutDeferredWakesBehindHold(dbOrTx, companyId, await wakeRowsPromise);
     for (const row of wakeRows) {
       if (row.issueId) activeIssueIds.add(row.issueId);
     }
@@ -4251,6 +4257,7 @@ async function readIssueBlockerAttentionBatch(
       ownerType: string;
       ownerAgentId: string | null;
       ownerUserId: string | null;
+      evidence: Record<string, unknown> | null;
     }> = [];
     for (const chunk of chunkList(explicitWaitCandidateIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
       recoveryActionRows.push(...await dbOrTx
@@ -4261,6 +4268,7 @@ async function readIssueBlockerAttentionBatch(
           ownerType: issueRecoveryActions.ownerType,
           ownerAgentId: issueRecoveryActions.ownerAgentId,
           ownerUserId: issueRecoveryActions.ownerUserId,
+          evidence: issueRecoveryActions.evidence,
         })
         .from(issueRecoveryActions)
         .where(
@@ -4326,7 +4334,7 @@ async function readIssueBlockerAttentionBatch(
     }
     for (const row of recoveryActionRows) {
       const healthy =
-        (row.status === "escalated" && row.ownerType === "board") ||
+        (row.status === "escalated" && isOperatorHeldRecoveryAction(row)) ||
         Boolean(row.ownerUserId) ||
         (Boolean(row.ownerAgentId) && liveRecoveryActionIds.has(row.id));
       if (healthy) explicitWaitingIssueIds.add(row.sourceIssueId);
@@ -4792,7 +4800,7 @@ async function listIssueReviewAttentionMap(
   const [
     agentRows,
     activeRunRows,
-    wakeRows,
+    candidateWakeRows,
     interactionRows,
     approvalRows,
     recoveryActionRows,
@@ -4947,6 +4955,13 @@ async function listIssueReviewAttentionMap(
         ),
       ),
   ]);
+
+  // A deferred wake that a recovery hold keeps from running is not a review path.
+  const wakeRows = await withoutDeferredWakesBehindHold(
+    dbOrTx,
+    companyId,
+    candidateWakeRows as Array<{ id: string; companyId: string; issueId: string | null; agentId: string; status: string; reason: string | null; createdAt: Date }>,
+  );
 
   const recoveryPaths = [
     ...(recoveryActionRows as Array<{
@@ -5921,7 +5936,7 @@ async function listIssueBlockedInboxAttentionMap(
 
   const [
     activeRunRows,
-    wakeRows,
+    candidateWakeRows,
     scheduledRetryRows,
     interactionRows,
     approvalRows,
@@ -5959,6 +5974,7 @@ async function listIssueBlockedInboxAttentionMap(
       ? Promise.resolve([])
       : dbOrTx
           .select({
+            id: agentWakeupRequests.id,
             companyId: agentWakeupRequests.companyId,
             issueId: sql<string | null>`coalesce(
               ${agentWakeupRequests.payload} ->> 'issueId',
@@ -6056,6 +6072,13 @@ async function listIssueBlockedInboxAttentionMap(
       hydrateLiveness: false,
     }),
   ]);
+
+  // A deferred wake that a recovery hold keeps from running is not live work.
+  const wakeRows = await withoutDeferredWakesBehindHold(
+    dbOrTx,
+    companyId,
+    candidateWakeRows as Array<{ id: string; companyId: string; issueId: string | null; agentId: string | null; status: string }>,
+  );
 
   const pendingInteractions = (
     interactionRows as BlockedInboxInteractionRow[]

@@ -43,6 +43,7 @@ import { timeStartupRecovery } from "./startup-recovery-timing.js";
 import { runtimeAssetRetention } from "./services/native-runtime/runtime-asset-retention.js";
 import { skillPackageWork } from "./services/skill-package-work.js";
 import { skillSourceSyncService } from "./services/skill-source-sync.js";
+import { maintenanceRedispatchService } from "./services/maintenance-redispatch.js";
 import {
   skillVersionRetentionService,
 } from "./services/skill-version-retention.js";
@@ -94,6 +95,7 @@ import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./se
 import { deliverPendingPauseResumes } from "./services/issue-tree-resume.js";
 import { deliverBudgetResumeContinuations, type BudgetResumeDelivery } from "./services/budget-resume-continuation.js";
 import { invalidateNativeReplacementDiscovery, reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
+import { reconcileTerminalSourceHolds } from "./services/terminal-hold-reconciliation.js";
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { acknowledgeNativeStartupCleanup } from "./services/native-runtime/native-startup-cleanup.js";
 import { executionControlSchedule, registerExecutionControlWork } from "./services/execution-control-work.js";
@@ -118,6 +120,7 @@ import {
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
   reconcilePendingMigrationHistory,
+  cleanupStalePartialBackups,
   authUsers,
   companies,
   companyMemberships,
@@ -212,7 +215,10 @@ import {
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
   runBoundedShutdownStep,
+  resolveShutdownRunCompletionGraceMs,
 } from "./shutdown.js";
+import { writePlannedShutdownMarker } from "./services/planned-shutdown-marker.js";
+import { legacyControllerBootId } from "./services/legacy-controller-lease.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { initializeAdapterSettings } from "./services/adapter-settings.js";
 import { migrateCloudConfiguration } from "./services/cloud-configuration-migration.js";
@@ -1248,6 +1254,7 @@ async function startServerWithDatabaseTeardown(
     runIds?: readonly string[] | null,
   ) => Promise<unknown>) | null = null;
   let drainHeartbeatExecutionFinalizers: (() => Promise<void>) | null = null;
+  let stopHeartbeatAdmissionForShutdown: (() => void) | null = null;
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{
     skipDrain: boolean;
     drainRunIds?: string[];
@@ -1396,7 +1403,11 @@ async function startServerWithDatabaseTeardown(
       },
     }), next: executionSchedule.finalization },
     { queue: DELIVERY_QUEUES.executionStatus, run: () => deliverExecutionStatuses(db), next: executionSchedule.status },
-    { queue: DELIVERY_QUEUES.executionDisposition, run: () => settleUnrecoverableExecutions(db), next: executionSchedule.disposition },
+    { queue: DELIVERY_QUEUES.executionDisposition, run: async () => {
+      // Settle verdict-only holds first, so an applied hand-back never waits for a manual reconcile.
+      await reconcileTerminalSourceHolds(db, heartbeat?.wakeup ?? null);
+      await settleUnrecoverableExecutions(db);
+    }, next: executionSchedule.disposition },
     ...(heartbeat ? [
       { queue: DELIVERY_QUEUES.executionReplacement, run: () => reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run) }), next: executionSchedule.replacement, onSettled: () => invalidateNativeReplacementDiscovery(db), settleEmptyWhilePaused: true },
       { queue: DELIVERY_QUEUES.executionContinuation, run: async () => {
@@ -1536,8 +1547,11 @@ async function startServerWithDatabaseTeardown(
     const retentionExecutor = decisionRetentionService(db as any, {
       notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
     });
+    stopHeartbeatAdmissionForShutdown = heartbeat.beginShutdownAdmissionStop;
     drainHeartbeatRunsForShutdown = (signal, runIds) => (
-      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds)
+      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds, {
+        completionGraceMs: resolveShutdownRunCompletionGraceMs(process.env),
+      })
     );
     drainHeartbeatExecutionFinalizers = () =>
       heartbeat.drainActiveRunExecutions();
@@ -1570,6 +1584,10 @@ async function startServerWithDatabaseTeardown(
         orphanGraceMs: config.taskDirectoryOrphanGraceDays * 24 * 60 * 60 * 1000,
       } : undefined,
       workspaceReaperCooldownDays: config.workspaceReaperCooldownDays,
+      isolatedCopyReclaim: {
+        enabled: config.isolatedCopyReclaimEnabled,
+        dryRun: config.isolatedCopyReclaimDryRun,
+      },
       workspaceCompactionDelayMs: config.workspaceCompactionDelayHours === null
         ? null
         : config.workspaceCompactionDelayHours * 60 * 60 * 1000,
@@ -1721,6 +1739,20 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
+        // A task drain that a restart ended has no stop row. Close it and
+        // re-dispatch, once, the work its window ended. Live runs, retries and
+        // queued wakes are skipped, and the idempotency key keeps it to one
+        // wake per operation and task.
+        await timeStartupRecovery("maintenance_redispatch", async () => {
+          const companyIds = (await db.select({ id: companies.id }).from(companies)).map((row) => row.id);
+          const result = await maintenanceRedispatchService(db, {
+            wakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts),
+          }).closeDrainEndedByRestart(companyIds);
+          if (result.marked) {
+            logger.info({ operationId: result.operation?.operationId, counts: result.manifest?.counts ?? null },
+              "startup closed a task drain ended by restart");
+          }
+        }).catch((err: unknown) => logger.error({ err }, "startup maintenance re-dispatch failed"));
         const recoveredGoalActions = await timeStartupRecovery("goal_actions", () => heartbeat.recoverPendingSessionGoalActions()).catch(err => {
           logger.error({ err }, "startup session-goal action recovery failed");
           return { enqueued: 0, invalid: 0 };
@@ -1956,6 +1988,16 @@ async function startServerWithDatabaseTeardown(
       },
       "Automatic database backups enabled",
     );
+    // A backup killed mid-run leaves only a `.partial` file. Anything older
+    // than one interval cannot belong to a run that is still going.
+    try {
+      const removedPartials = cleanupStalePartialBackups(config.databaseBackupDir, backupIntervalMs, "paperclip");
+      if (removedPartials > 0) {
+        logger.warn({ backupDir: config.databaseBackupDir, removedPartials }, "Removed stale partial database backups");
+      }
+    } catch (error) {
+      logger.warn({ err: error, backupDir: config.databaseBackupDir }, "Could not clean up stale partial database backups");
+    }
     // The final pre-sleep dump remains on the volume throughout sleep. Take
     // a fresh backup on restart before idle eligibility is enabled, including
     // after rollback of the opt-in flag. Failure retains the marker for retry.
@@ -2053,6 +2095,14 @@ async function startServerWithDatabaseTeardown(
     const shutdownStartedAt = Date.now();
     logger.info({ signal }, "shutdown signal received; starting ordered shutdown");
     setStartupRecoveryPhase("draining");
+    // Stop admitting runs before anything else, so the drain snapshot below
+    // sees every run this process will ever start (BLA-4340 #46).
+    stopHeartbeatAdmissionForShutdown?.();
+    try {
+      writePlannedShutdownMarker({ bootId: legacyControllerBootId, pid: process.pid, signal });
+    } catch (err) {
+      logger.warn({ err, signal }, "could not record planned shutdown marker; leftover runs fall back to process-loss recovery");
+    }
     for (const client of liveEventsWebSocketServer.clients) client.close(1012, "Server restarting");
     liveEventsWebSocketServer.close();
     // Finish admitted HTTP requests while their services, workers and database
@@ -2223,10 +2273,12 @@ async function startServerWithDatabaseTeardown(
   const shutdown = (signal: "SIGINT" | "SIGTERM", exitProcess: boolean) =>
     shutdownPromise ??= performShutdown(signal, exitProcess);
 
-  process.once("SIGINT", () => {
+  // `on`, not `once`: with `once`, a repeated signal falls through to Node's
+  // default handler and kills the process before the drain finishes.
+  process.on("SIGINT", () => {
     void shutdown("SIGINT", true);
   });
-  process.once("SIGTERM", () => {
+  process.on("SIGTERM", () => {
     void shutdown("SIGTERM", true);
   });
 

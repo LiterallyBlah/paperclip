@@ -358,10 +358,12 @@ describe("issue validators", () => {
   it.each(["backlog", "in_progress", "blocked", "cancelled"])("requires workspace evidence to record a repair at unchanged %s status", sourceIssueStatus => {
     const input = { outcome: "restored", sourceIssueStatus };
     expect(resolveIssueRecoveryActionSchema.safeParse(input).success).toBe(false);
+    // BLA-4186: a reconciled stopped pending stage may keep `blocked`; the
+    // route admits it only for the settlement's own projection.
     expect(resolveIssueRecoveryActionSchema.safeParse({ ...input, executionReconciliation: {
       runId: "11111111-1111-4111-8111-111111111111", providerStopped: true, actionOutcome: "mixed",
       outcomeEvidence: "Observed and reconciled the source run action outcomes.",
-    } }).success).toBe(false);
+    } }).success).toBe(sourceIssueStatus === "blocked");
     expect(resolveIssueRecoveryActionSchema.safeParse({ ...input, executionReconciliation: {
       runId: "11111111-1111-4111-8111-111111111111", providerStopped: true, actionOutcome: "mixed",
       outcomeEvidence: "Observed and reconciled the source run action outcomes.",

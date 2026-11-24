@@ -26,6 +26,8 @@ export interface Company {
   budgetMonthlyCents: number;
   spentMonthlyCents: number;
   defaultResponsibleUserId: string | null;
+  /** Agent that owns routine recovery actions; null uses the root CEO agent. */
+  recoveryCoordinatorAgentId: string | null;
   requireBoardApprovalForNewAgents: boolean;
   interactionResolverGovernance: InteractionResolverGovernance;
   feedbackDataSharingEnabled: boolean;

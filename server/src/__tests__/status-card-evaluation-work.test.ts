@@ -125,6 +125,11 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const created = await cards.create(companyId, { interestPrompt: "Blockers", titlePinned: false, agentId, refreshPolicy }, actor);
     const compile = await cards.requestCompile(created.id, actor);
     await writeback(created.id, compile.generatingIssue.id, true);
+    // Fork (#44, live reactive spacing): a reactive card waits at least 20 minutes after
+    // its last summary. This fixture's compile writeback is that summary, so it is
+    // backdated past the window to keep these upstream tests about debounce and
+    // delivery work rather than the spacing floor (covered by status-card-refresh-coalescing).
+    if (mode === "reactive") await db.update(statusCards).set({ lastGeneratedAt: new Date(Date.now() - 60 * 60_000) }).where(eq(statusCards.id, created.id));
     if (!coordinator && mode === "reactive") await cards.tickDueStatusCards();
     return cards.getById(created.id).then(row => row!);
   }

@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { agents, companies, createDb, heartbeatRuns, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
-import { loadAgentRunAuthentication } from "../middleware/agent-run-authentication.js";
+import { agentRunAuthenticationRevoked, loadAgentRunAuthentication } from "../middleware/agent-run-authentication.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -84,6 +84,18 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "requested" } } })
       .where(eq(heartbeatRuns.id, runId));
     expect(agentRunWritesRevoked((await loadAgentRunAuthentication(db, input))[0])).toBe(true);
+  });
+
+  it("projects finishedAt and treats a non-UUID run id as missing", async () => {
+    const finishedAt = new Date("2026-01-02T03:04:05.000Z");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt }).where(eq(heartbeatRuns.id, runId));
+    const [row] = await loadAgentRunAuthentication(db, input);
+    expect(row.status).toBe("succeeded");
+    expect(row.finishedAt).toEqual(finishedAt);
+    expect(agentRunAuthenticationRevoked(row)?.code).toBe("agent_run_finished");
+    expect(await loadAgentRunAuthentication(db, { ...input, runId: "not-a-uuid" })).toEqual([]);
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, runId));
+    expect(agentRunAuthenticationRevoked((await loadAgentRunAuthentication(db, input))[0])).toBeNull();
   });
 
   it("does not return another company, agent, or run", async () => {

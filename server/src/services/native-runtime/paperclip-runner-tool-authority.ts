@@ -3137,6 +3137,12 @@ export class PaperclipRunnerToolAuthority {
     if (!kind) throw new Error("paperclip_runner_interaction_kind_invalid");
     const prompt = requiredString(input.prompt);
     const idempotencyKey = requiredString(input.idempotencyKey);
+    // An omitted policy leaves the server default (human_only for these
+    // unaddressed cards). A caller that will record the user's chat answer
+    // requests its audience explicitly.
+    const resolverPolicy = input.resolverPolicy === undefined || input.resolverPolicy === null
+      ? undefined
+      : requiredString(input.resolverPolicy);
     let publication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
     const apply = async (tx: Db, context: {
       run: typeof heartbeatRuns.$inferSelect;
@@ -3189,6 +3195,7 @@ export class PaperclipRunnerToolAuthority {
           kind,
           idempotencyKey,
           sourceRunId: this.binding.runId,
+          ...(resolverPolicy ? { resolverPolicy } : {}),
           title: requiredString(input.title),
           summary: prompt,
           ...(input.resolverPolicy === undefined ? {} : { resolverPolicy: input.resolverPolicy }),

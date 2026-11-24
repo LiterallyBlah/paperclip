@@ -9,6 +9,7 @@ import { hasPendingNativeReplacements } from "./native-runtime/native-safe-repla
 import { nextAbandonedNativeOwnerReleaseAt } from "./native-runtime/native-failed-run-owner-release.js";
 import { hasPendingPauseResume } from "./issue-tree-resume.js";
 import { hasPendingBudgetResume } from "./budget-resume-continuation.js";
+import { nextTerminalHoldReviewAt } from "./terminal-hold-reconciliation.js";
 
 export function registerExecutionControlWork(
   coordinator: ReturnType<typeof createDeliveryWorkCoordinator>,
@@ -107,7 +108,9 @@ export function executionControlSchedule(db: Db) {
         db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(obsoleteExecutionConversationHold()).limit(1),
         unresolvedExecutionDispositions(db, 1),
       ]);
-      return conversation.length || execution.length ? retry() : null;
+      if (conversation.length || execution.length) return retry();
+      // Verdict-only holds kept for now are checked again when due.
+      return deadline([await nextTerminalHoldReviewAt(db)]);
     },
     async localLogin() {
       const rows = await db.select({ at: adapterAuthSessions.expiresAt }).from(adapterAuthSessions).where(and(

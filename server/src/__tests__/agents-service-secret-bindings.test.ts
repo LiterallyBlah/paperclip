@@ -328,6 +328,59 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     });
   });
 
+  it("keeps unrelated binding ids when adapterConfig env adds, removes or re-points a ref", async () => {
+    const companyId = await seedCompany();
+    const secrets = secretService(db);
+    const make = (label: string) => secrets.create(companyId, {
+      name: `${label}-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: `dummy-${label}`,
+    });
+    const [first, second, third, fourth] = [await make("first"), await make("second"), await make("third"), await make("fourth")];
+    const ref = (secretId: string) => ({ type: "secret_ref" as const, secretId, version: "latest" as const });
+    const bindingsByPath = async (agentId: string) => Object.fromEntries(
+      (await db.select().from(companySecretBindings).where(and(
+        eq(companySecretBindings.companyId, companyId),
+        eq(companySecretBindings.targetType, "agent"),
+        eq(companySecretBindings.targetId, agentId),
+      ))).map((row) => [row.configPath, row]),
+    );
+
+    const created = await createAgentLifecycle(db).requestHire(companyId, {
+      name: "Binding Keeper",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: { env: { FIRST: ref(first.id), SECOND: ref(second.id) } },
+      runtimeConfig: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    });
+    const initial = await bindingsByPath(created.id);
+
+    await agentService(db).update(created.id, {
+      adapterConfig: { env: { FIRST: ref(first.id), SECOND: ref(second.id), THIRD: ref(third.id) } },
+    });
+    const added = await bindingsByPath(created.id);
+    expect(added["env.FIRST"].id).toBe(initial["env.FIRST"].id);
+    expect(added["env.SECOND"].id).toBe(initial["env.SECOND"].id);
+
+    await agentService(db).update(created.id, {
+      adapterConfig: { env: { FIRST: ref(first.id), THIRD: ref(third.id) } },
+    });
+    const removed = await bindingsByPath(created.id);
+    expect(Object.keys(removed).sort()).toEqual(["env.FIRST", "env.THIRD"]);
+    expect(removed["env.FIRST"].id).toBe(initial["env.FIRST"].id);
+    expect(removed["env.THIRD"].id).toBe(added["env.THIRD"].id);
+
+    await agentService(db).update(created.id, {
+      adapterConfig: { env: { FIRST: ref(first.id), THIRD: ref(fourth.id) } },
+    });
+    const repointed = await bindingsByPath(created.id);
+    expect(repointed["env.FIRST"].id).toBe(initial["env.FIRST"].id);
+    expect(repointed["env.THIRD"].secretId).toBe(fourth.id);
+    expect(repointed["env.THIRD"].id).not.toBe(added["env.THIRD"].id);
+  });
+
   it("backfills missing secret bindings when a legacy pending agent is approved", async () => {
     const companyId = await seedCompany();
     const secrets = secretService(db);

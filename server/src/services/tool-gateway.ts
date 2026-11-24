@@ -134,7 +134,22 @@ import type {
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { publishInteractionCreatedPluginEvent } from "./plugin-decision-events.js";
 import { secretService } from "./secrets.js";
-import { connectionGrantCredentialRef, resolveConnectionGrantSecret } from "./connection-credentials.js";
+import { createSecretProposalsService } from "./secret-proposals.js";
+import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
+import {
+  SECRET_CAPTURE_ERROR_CODE,
+  SECRET_CAPTURE_FORBIDDEN_CODE,
+  SecretCaptureFailure,
+  decideSecretCapture,
+  extractCapturedValue,
+  parseSecretCaptureDirective,
+  scrubCapturedValue,
+  secretCaptureAuditSummary,
+  secretCaptureMarker,
+  type SecretCaptureDirective,
+  type SecretCaptureReason,
+} from "./tool-gateway-secret-capture.js";
+import { connectionGrantCredentialRef, connectionHeaderCredentialPlan, resolveConnectionGrantSecret } from "./connection-credentials.js";
 import { railwayCommandBudgetMs, createRailwayClient, isRailwayConnection, isRailwayEndpoint, isRailwayToolBlocked, normalizeRailwayToolName, RAILWAY_API_URL, RAILWAY_TOOL_PREFIX, RailwayError } from "./railway.js";
 import { RAILWAY_SSH_SECRET_PATH, runRailwaySshCommand } from "./railway-ssh.js";
 import {
@@ -417,6 +432,12 @@ interface ExecuteGatewayToolInput {
   approvedActionRequestId?: string | null;
   idempotencyKey?: string | null;
   callerHeaders?: Record<string, string | string[] | undefined>;
+  /**
+   * Server-side secret capture (fork feature). The directive is parsed and
+   * authorized here, never forwarded upstream. The actor is the caller's own
+   * Paperclip credential, not the gateway session token.
+   */
+  secretCapture?: { directive: unknown; actor: AuthorizationActor | null } | null;
 }
 
 interface ExecuteTestCallInput {
@@ -1259,6 +1280,75 @@ export function createToolGatewayService(
         issueId: identity.issueId, projectId: identity.projectId, runId: identity.runId, identityContextId: identity.identityContextId,
         toolInvocationId, toolName: tool.name, toolType: tool.providerType, approvedAction,
       }, content, signal);
+    };
+  }
+  const secretProposals = createSecretProposalsService(db);
+  const runSecretRedactions = createRunSecretRedactionRegistry(db);
+  function secretCaptureError(reason: SecretCaptureReason, details: Record<string, unknown> = {}) {
+    // Fixed message and codes only: nothing from the provider result.
+    return new ToolGatewayHttpError(
+      reason === "provider_error" ? 502 : 422,
+      "Secret capture failed. No result content was returned.",
+      SECRET_CAPTURE_ERROR_CODE,
+      { captureReason: reason, ...details },
+    );
+  }
+  async function preflightSecretCapture(
+    input: ExecuteGatewayToolInput,
+    session: ToolGatewaySession,
+    tool: ToolGatewayDescriptor,
+  ): Promise<SecretCaptureDirective> {
+    let directive: SecretCaptureDirective;
+    try {
+      directive = parseSecretCaptureDirective(input.secretCapture?.directive);
+    } catch (error) {
+      if (error instanceof SecretCaptureFailure) throw secretCaptureError(error.reason);
+      throw error;
+    }
+    const refuse = async (reason: SecretCaptureReason | null, denial: string | null) => {
+      await writeAudit({
+        session, companyId: session.companyId, agentId: session.agentId, runId: session.runId, issueId: session.issueId,
+        action: "tool_gateway.call_denied",
+        details: {
+          decision: "deny",
+          reasonCode: denial ? SECRET_CAPTURE_FORBIDDEN_CODE : SECRET_CAPTURE_ERROR_CODE,
+          tool: tool.name,
+          secretCapture: { ...secretCaptureAuditSummary(directive), ...(denial ? { denial } : { captureReason: reason }) },
+        },
+      });
+      if (denial) {
+        return new ToolGatewayHttpError(403, "Secret capture is not allowed for this caller", SECRET_CAPTURE_FORBIDDEN_CODE, { denial });
+      }
+      return secretCaptureError(reason!);
+    };
+    if (input.approvedActionRequestId) throw await refuse("approval_flow_unsupported", null);
+    if (!["mcp_remote_http", "provider_rest", "mcp_local_stdio"].includes(tool.providerType)) {
+      throw await refuse("unsupported_tool", null);
+    }
+    const decision = await decideSecretCapture(db, input.secretCapture?.actor ?? null, session);
+    if (!decision.allowed) throw await refuse(null, decision.reason);
+    return directive;
+  }
+  async function captureSecretFromResult(
+    session: ToolGatewaySession,
+    directive: SecretCaptureDirective,
+    result: unknown,
+  ) {
+    const value = extractCapturedValue(result, directive);
+    let proposal: Awaited<ReturnType<typeof secretProposals.createSecret>>;
+    try {
+      proposal = await secretProposals.createSecret({
+        companyId: session.companyId,
+        heartbeatRunId: session.runId!,
+        registerForRedaction: (secretValue) => runSecretRedactions.register(session.companyId, session.runId!, secretValue),
+      }, { ...directive.proposal, value });
+    } catch {
+      throw new SecretCaptureFailure("proposal_failed");
+    }
+    const marker = secretCaptureMarker(proposal.id);
+    return {
+      result: scrubCapturedValue(result, value, marker),
+      proposal: { id: proposal.id, status: proposal.status, name: proposal.proposedName, key: proposal.proposedKey, marker },
     };
   }
   // Authorization links can contain one-time codes. Keep them briefly in memory;
@@ -4454,10 +4544,8 @@ export function createToolGatewayService(
       }
     }
     const headers: Record<string, string> = {};
-    for (const ref of connection.credentialRefs ?? []) {
-      if (ref.placement !== "header") continue;
-      const grantRef = grantRefForCredential(grant, ref);
-      if (!grantRef) continue;
+    const headerPlan = connectionHeaderCredentialPlan(connection, grant);
+    for (const { ref, grantRef } of headerPlan.resolved) {
       try {
         const value = await resolveGrantSecretValue(
           session,
@@ -4510,6 +4598,32 @@ export function createToolGatewayService(
           },
         );
       }
+    }
+    // A declared header the selected grant cannot supply must never be dropped:
+    // the request would reach the remote unauthenticated and surface only as an
+    // opaque upstream 401. The OAuth access token above may legitimately fill
+    // an Authorization header, so only headers still unset fail here. We do not
+    // fall back to the connection's own refs: the grant is the identity
+    // boundary, and connection-level refs may point at another identity's secret.
+    const unresolvedHeader = headerPlan.missing.find(
+      (ref) => headers[ref.key] === undefined,
+    );
+    if (unresolvedHeader) {
+      await markRemoteConnectionHealth(
+        connection,
+        "missing_secret",
+        "A configured credential secret could not be resolved.",
+      );
+      throw new ToolGatewayHttpError(
+        422,
+        "A configured credential secret could not be resolved.",
+        "mcp_remote_missing_secret",
+        {
+          connectionId: connection.id,
+          grantId: grant.id,
+          credential: unresolvedHeader.name,
+        },
+      );
     }
     return headers;
   }
@@ -6264,7 +6378,17 @@ export function createToolGatewayService(
     invocationId: string,
     callerHeaders?: ExecuteGatewayToolInput["callerHeaders"],
     useDefaultTimeout = false,
+    secretCaptureMode = false,
   ): Promise<RemoteHttpExecutionResult> {
+    // In secret-capture mode the provider's elicitations and handoffs are
+    // refused before anything records them: issue interactions, call events,
+    // retained summaries and audit could otherwise hold provider text that
+    // the capture boundary has not yet scrubbed.
+    const refuseCaptureInteraction = () => new ToolGatewayHttpError(
+      409,
+      "Secret capture does not support provider interactions.",
+      "secret_capture_interaction_refused",
+    );
     const { entry, connection, sourceTemplateKey } = await resolveConnectedRemoteTool(
       session,
       tool,
@@ -6563,6 +6687,13 @@ export function createToolGatewayService(
             maxBytes: MAX_REMOTE_MCP_RESPONSE_BYTES,
             onRequest: async (message) => {
               const pending = extractRemoteMcpPending(message);
+              if (secretCaptureMode && (pending || extractMcpElicitationRequest(message))) {
+                await dispatchRemote(endpoint, {
+                  method: "POST", headers: mcpHttpRequestHeaders(requestHeaders),
+                  body: JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { action: "cancel" } }),
+                });
+                throw refuseCaptureInteraction();
+              }
               if (pending) {
                 await retainUpstreamHandoff(invocationId, pending);
                 // Defer this interaction to the user. Do not claim that consent
@@ -6630,6 +6761,13 @@ export function createToolGatewayService(
       const payloadRecord = asRecord(payload);
       if (!payloadRecord) throw malformedRemoteMcpResponse();
       const upstreamPending = extractRemoteMcpPending(payloadRecord, String(connection.config.sourceTemplateKey ?? ""), entry.toolName);
+      if (secretCaptureMode && (
+        upstreamPending ||
+        extractMcpElicitationRequest(payloadRecord) ||
+        (Object.prototype.hasOwnProperty.call(payloadRecord, "result") && extractMcpElicitationRequest(payloadRecord.result))
+      )) {
+        throw refuseCaptureInteraction();
+      }
       if (upstreamPending) {
         await retainUpstreamHandoff(invocationId, upstreamPending);
         throw new ToolGatewayHttpError(409, "Complete the provider's authorization or approval before continuing. The original call has not been replayed.", "provider_interaction_required", { upstreamPending, invocationId });
@@ -10488,6 +10626,7 @@ export function createToolGatewayService(
         tool.name === "search_tools" &&
         tool.providerType === "paperclip_virtual"
       ) {
+        if (input.secretCapture) await preflightSecretCapture(input, session, tool);
         const argumentValidation = await validateToolContent({
           value: requestedParameters,
           direction: "arguments",
@@ -10607,6 +10746,12 @@ export function createToolGatewayService(
         requestedParameters = targetParameters;
       }
 
+      // Authorize and validate a capture before anything can reach the provider.
+      const captureDirective = input.secretCapture
+        ? await preflightSecretCapture(input, session, tool)
+        : null;
+      const captureSummary = captureDirective ? secretCaptureAuditSummary(captureDirective) : null;
+
       // Managed provider arguments are part of the governed call, not a
       // transport decoration. Project them before hashing, policy evaluation,
       // approval signing, previews, and audit summaries. Approved retries
@@ -10650,6 +10795,10 @@ export function createToolGatewayService(
           argumentsHash: toolRequestIdentityHash(requestedParameters, options.toolActionSigningSecret),
           parameters: requestedParameters,
         });
+        if (replay?.matched && captureDirective) {
+          // A replay never re-runs the provider and could return stored content.
+          throw secretCaptureError("replay_unsupported", { invocationId: replay.invocationId });
+        }
         if (replay?.matched) {
           let replayResult: unknown = replay.result;
           if (tool.providerType === "paperclip_github_chat" && ["comment", "update_comment", "submit_review"].includes(tool.upstreamToolName ?? "")) {
@@ -11067,6 +11216,17 @@ export function createToolGatewayService(
         if (accessDecision.allowed && tool.providerType === "paperclip_slack_chat" && SLACK_TOOLS.some(t => t.name === tool.upstreamToolName && t.risk === "approval")) {
           accessDecision = { ...accessDecision, allowed: false, decision: "require_approval", reasonCode: "requires_approval_policy", explanation: "Slack destructive actions, channel creation and invitations require approval." };
         }
+        if (captureDirective && accessDecision.decision === "require_approval") {
+          // Execute-on-approve runs later without the directive, so it would
+          // return the raw value. Refuse before an approval request exists.
+          await writeAudit({
+            session, companyId: session.companyId, agentId: session.agentId, runId: session.runId, issueId: session.issueId,
+            action: "tool_gateway.call_denied",
+            details: { decision: "deny", reasonCode: SECRET_CAPTURE_ERROR_CODE, tool: tool.name,
+              secretCapture: { ...captureSummary, captureReason: "approval_flow_unsupported" } },
+          });
+          throw secretCaptureError("approval_flow_unsupported");
+        }
         const recorded = await recordToolInvocation(
           decisionInput,
           accessDecision,
@@ -11113,6 +11273,9 @@ export function createToolGatewayService(
             if (!canRepeatPreflight || !exactRequest)
               throw new ToolGatewayHttpError(409, "The saved GitHub publication is not available yet", "github_publication_unavailable");
           }
+        }
+        if (recorded.replayed && captureDirective) {
+          throw secretCaptureError("replay_unsupported", { invocationId });
         }
         if (recorded.replayed && !retryingSlackRateLimit && !retryingGitHubPublication) {
           if (gitHubPublicationReplay && !gitHubReplayPolicyAllowed)
@@ -11217,6 +11380,7 @@ export function createToolGatewayService(
           targetToolName: virtualToolName ? tool.name : undefined,
           ...toolAuditMetadata(tool),
           argumentsSummary: effectiveArgumentsSummary,
+          ...(captureSummary ? { secretCapture: captureSummary } : {}),
         },
       });
 
@@ -11233,46 +11397,78 @@ export function createToolGatewayService(
             "agent_context_required",
           );
         }
-        const connectedMcpExecution =
-          (tool.providerType === "mcp_remote_http" || tool.providerType === "provider_rest")
-            ? await executeRemoteHttpTool(
-                session,
-                tool,
-                effectiveParameters,
-                executionTimeoutMs,
-                invocationId,
-                input.callerHeaders,
-                input.timeoutMs === undefined,
-              )
-            : tool.providerType === "mcp_local_stdio"
-              ? await executeLocalStdioTool(
+        const dispatchToProvider = async () => {
+          const connectedMcpExecution =
+            (tool.providerType === "mcp_remote_http" || tool.providerType === "provider_rest")
+              ? await executeRemoteHttpTool(
                   session,
                   tool,
                   effectiveParameters,
                   executionTimeoutMs,
+                  invocationId,
+                  input.callerHeaders,
                   input.timeoutMs === undefined,
+                  Boolean(captureDirective),
                 )
-              : null;
-        const result = recoveredGitHubPublication ?? (connectedMcpExecution
-          ? connectedMcpExecution.result
-          : tool.providerType === "paperclip_plugin"
-            ? await runWithTimeout(
-                pluginToolDispatcher!.executeTool(
-                  tool.name,
-                  effectiveParameters,
-                  {
-                    agentId: session.agentId!,
-                    runId: session.runId!,
-                    companyId: session.companyId,
-                    projectId: session.projectId ?? "",
-                  },
-                ),
-                executionTimeoutMs,
-              )
-            : await runWithTimeout(
-                executeBuiltinTool(session, tool, effectiveParameters, invocationId),
-                executionTimeoutMs,
-              ));
+              : tool.providerType === "mcp_local_stdio"
+                ? await executeLocalStdioTool(
+                    session,
+                    tool,
+                    effectiveParameters,
+                    executionTimeoutMs,
+                    input.timeoutMs === undefined,
+                  )
+                : null;
+          const result = recoveredGitHubPublication ?? (connectedMcpExecution
+            ? connectedMcpExecution.result
+            : tool.providerType === "paperclip_plugin"
+              ? await runWithTimeout(
+                  pluginToolDispatcher!.executeTool(
+                    tool.name,
+                    effectiveParameters,
+                    {
+                      agentId: session.agentId!,
+                      runId: session.runId!,
+                      companyId: session.companyId,
+                      projectId: session.projectId ?? "",
+                    },
+                  ),
+                  executionTimeoutMs,
+                )
+              : await runWithTimeout(
+                  executeBuiltinTool(session, tool, effectiveParameters, invocationId),
+                  executionTimeoutMs,
+                ));
+          return { connectedMcpExecution, result };
+        };
+        let dispatched: Awaited<ReturnType<typeof dispatchToProvider>>;
+        if (captureDirective) {
+          try {
+            dispatched = await dispatchToProvider();
+          } catch (error) {
+            // Provider failures can echo request or response text. Keep only codes.
+            throw secretCaptureError("provider_error", error instanceof ToolGatewayHttpError
+              ? { upstreamReasonCode: error.reasonCode }
+              : {});
+          }
+        } else {
+          dispatched = await dispatchToProvider();
+        }
+        const { connectedMcpExecution } = dispatched;
+        let result: unknown = dispatched.result;
+        let capturedProposal: Awaited<ReturnType<typeof captureSecretFromResult>>["proposal"] | null = null;
+        if (captureDirective) {
+          // Runs before validation, the classifier, persistence, events, audit
+          // and the response, so none of them can see the captured value.
+          try {
+            const captured = await captureSecretFromResult(session, captureDirective, result);
+            result = captured.result;
+            capturedProposal = captured.proposal;
+          } catch (error) {
+            if (error instanceof SecretCaptureFailure) throw secretCaptureError(error.reason);
+            throw secretCaptureError("proposal_failed");
+          }
+        }
 
         const resultValidation = await validateToolContent({
           value: result,
@@ -11349,6 +11545,9 @@ export function createToolGatewayService(
             ...(connectedMcpExecution
               ? { execution: connectedMcpExecution.execution }
               : {}),
+            ...(captureSummary && capturedProposal
+              ? { secretCapture: { ...captureSummary, proposalId: capturedProposal.id } }
+              : {}),
           },
           tool,
         });
@@ -11375,6 +11574,9 @@ export function createToolGatewayService(
             promptInjection: resultValidation.detectorMetadata,
             headerSummary: connectedMcpExecution?.headerSummary ?? undefined,
             execution: connectedMcpExecution?.execution ?? undefined,
+            ...(captureSummary && capturedProposal
+              ? { secretCapture: { ...captureSummary, proposalId: capturedProposal.id } }
+              : {}),
           },
         });
         // After the bookkeeping above: a throw there is caught below, overwrites
@@ -11387,6 +11589,9 @@ export function createToolGatewayService(
           tool: virtualToolName ?? tool.name,
           targetTool: virtualToolName ? tool.name : undefined,
           result: resultValidation.value,
+          ...(capturedProposal
+            ? { secretProposal: { id: capturedProposal.id, status: capturedProposal.status, name: capturedProposal.name, key: capturedProposal.key, marker: capturedProposal.marker } }
+            : {}),
         };
       } catch (err) {
         const normalizedError =
@@ -11483,6 +11688,7 @@ export function createToolGatewayService(
             ...(executionAuditFromError(normalizedError)
               ? { execution: executionAuditFromError(normalizedError) }
               : {}),
+            ...(captureSummary ? { secretCapture: { ...captureSummary, captureReason: normalizedError instanceof ToolGatewayHttpError ? normalizedError.details.captureReason ?? null : null } } : {}),
           },
           tool,
         });
@@ -11506,6 +11712,7 @@ export function createToolGatewayService(
             argumentsSummary: effectiveArgumentsSummary,
             durationMs: Date.now() - startedAt,
             error: message,
+            ...(captureSummary ? { secretCapture: { ...captureSummary, captureReason: normalizedError instanceof ToolGatewayHttpError ? normalizedError.details.captureReason ?? null : null } } : {}),
             ...(normalizedError instanceof ToolContentValidationError ? { promptInjection: normalizedError.detectorMetadata } : {}),
             ...(executionAuditFromError(normalizedError)
               ? { execution: executionAuditFromError(normalizedError) }

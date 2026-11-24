@@ -15,6 +15,7 @@ import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execut
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import { nativeSha256 } from "./canonical.js";
 import { reconciledInterveningExecutions } from "./native-reconstruction-intervening-executions.js";
+import { isOperatorHeldRecoveryAction } from "../recovery/recovery-owner-routing.js";
 
 const causes = ["native_workspace_sync_out_unrecoverable", "native_workspace_sync_out_retry_exhausted"];
 const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -55,7 +56,7 @@ export async function validateNativeWorkspaceReconstruction(db: Db, input: {
     || run.status !== "failed" || run.nativePhase !== "terminal_failure" || coordinator.issueId !== issue.id
     || coordinator.phase !== "terminal_failure" || coordinator.leaseOwner || coordinator.failureDetail?.successorRunId
     || object(run.runnerProfileJson).nativeWorkspaceFinalizationOwner
-    || action.kind !== "active_run_watchdog" || action.ownerType !== "board" || !causes.includes(action.cause)
+    || action.kind !== "active_run_watchdog" || !isOperatorHeldRecoveryAction(action) || !causes.includes(action.cause)
     || action.evidence.runId !== run.id || coordinator.failureCode !== action.cause
     || !["active", "escalated", "resolved"].includes(action.status)
     || (action.status === "resolved" && action.resolutionNote !== "new_source_execution_path" && !object(action.evidence.executionReconciliation).workspaceReconstruction)

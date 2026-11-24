@@ -35,6 +35,7 @@ import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { alias } from "drizzle-orm/pg-core";
+import { getExecutionBlocker } from "./execution-blocker.js";
 
 /**
  * BLA-2425 "approved advance": the stopped source run belongs to the reviewer
@@ -446,6 +447,25 @@ export async function deliverReconciledExecutions(
           })
           .where(pendingDecision);
         continue;
+      }
+      // Re-check immediately before waking: a decision withdrawn or delivered
+      // since this batch was read must not cause a stale wake.
+      const [stillPending] = await db.select({ id: issueRecoveryActions.id })
+        .from(issueRecoveryActions).where(pendingDecision).limit(1);
+      if (!stillPending) continue;
+      // An automatic settlement is bound to the verdict it verified. If the
+      // review has moved on, the continuation it planned is no longer the
+      // next step; a newer hold keeps it pending until that hold clears.
+      const automatic = action.evidence.automaticReconciliation as { decisionId?: unknown } | undefined;
+      if (automatic?.decisionId !== undefined) {
+        const state = parseIssueExecutionState(task.executionState);
+        if (state?.lastDecisionId !== automatic.decisionId) {
+          await db.update(issueRecoveryActions).set({
+            evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
+          }).where(pendingDecision);
+          continue;
+        }
+        if (await getExecutionBlocker(db, task.companyId, task.id, { admittingAgentId: continuationAgentId })) continue;
       }
       const run = await wake(continuationAgentId, {
         source: "automation",

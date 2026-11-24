@@ -1961,8 +1961,10 @@ function secretProposalStatusClasses(state: SecretProposalCardState) {
 
 function SecretProposalIdentityHeader({
   state,
+  bundle = false,
 }: {
   state: SecretProposalCardState;
+  bundle?: boolean;
 }) {
   const dimmed = state === "declined" || state === "expired";
   return (
@@ -1975,7 +1977,7 @@ function SecretProposalIdentityHeader({
       </div>
       <div className="min-w-0 flex-1">
         <div className="text-base font-bold leading-tight text-foreground">
-          Bind an existing secret
+          {bundle ? "Approve a new secret and its bindings" : "Bind an existing secret"}
         </div>
       </div>
     </div>
@@ -1987,6 +1989,34 @@ function SecretProposalDetails({
 }: {
   payload: NonNullable<RequestConfirmationInteraction["payload"]["secretProposal"]>;
 }) {
+  if (payload.kind === "secret_with_bindings") {
+    const bindings = payload.bindings ?? [];
+    return (
+      <dl className="grid gap-3 rounded-sm border border-border/70 bg-muted/30 p-3">
+        <div className="min-w-0 space-y-1">
+          <dt className="text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
+            Proposed secret
+          </dt>
+          <dd className="truncate text-sm font-medium text-foreground">{payload.sourceSecretLabel}</dd>
+        </div>
+        <div className="min-w-0 space-y-1">
+          <dt className="text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
+            {bindings.length === 1 ? "Binding" : `${bindings.length} bindings`}
+          </dt>
+          <dd>
+            <ul className="space-y-1">
+              {bindings.map((binding) => (
+                <li key={binding.proposalId} className="flex min-w-0 flex-wrap items-baseline gap-x-2 text-sm">
+                  <span className="font-medium text-foreground">{binding.targetAgentName}</span>
+                  <span className="break-all font-mono text-foreground">{binding.configPath}</span>
+                </li>
+              ))}
+            </ul>
+          </dd>
+        </div>
+      </dl>
+    );
+  }
   return (
     <dl className="grid gap-3 rounded-sm border border-border/70 bg-muted/30 p-3 sm:grid-cols-2">
       <div className="min-w-0 space-y-1">
@@ -2022,6 +2052,7 @@ function SecretProposalResolution({
 }) {
   const result = interaction.result?.secretProposal ?? null;
   const who = resolvedByLabel ?? "the board";
+  const bundle = interaction.payload.secretProposal?.kind === "secret_with_bindings";
   const when = interaction.resolvedAt
     ? formatDateTime(interaction.resolvedAt)
     : result?.updatedAt
@@ -2047,7 +2078,7 @@ function SecretProposalResolution({
       <div aria-live="polite" className="flex items-start gap-2 rounded-sm border border-green-500/50 bg-green-500/10 px-4 py-3 text-sm text-green-900 dark:text-green-100">
         <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
         <div>
-          <div className="font-medium">Binding created · approved by {who}</div>
+          <div className="font-medium">{bundle ? "Secret and bindings created" : "Binding created"} · approved by {who}</div>
           <p className="mt-1 text-green-900/80 dark:text-green-100/80">
             The target agent can now use the proposed config path{when ? ` · ${when}` : ""}.
           </p>
@@ -2091,7 +2122,7 @@ function SecretProposalResolution({
           <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
           <div>
             <div className="font-medium">Rejected by {who}</div>
-            <p className="mt-1 text-red-900/80 dark:text-red-100/80">The binding was not created.</p>
+            <p className="mt-1 text-red-900/80 dark:text-red-100/80">{bundle ? "The secret and its bindings were not created." : "The binding was not created."}</p>
           </div>
         </div>
         {reason ? (
@@ -2112,6 +2143,11 @@ function SecretProposalResolution({
       </div>
     </div>
   );
+}
+
+function sentence(text: string) {
+  const trimmed = text.trim();
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
 }
 
 function RequestSecretProposalCard({
@@ -2169,9 +2205,13 @@ function RequestSecretProposalCard({
     }
   }
 
+  const readiness = interaction.secretProposalReadiness ?? null;
+  const acceptBlocked = isPending && readiness?.canAccept === false;
+  const bundle = payload.kind === "secret_with_bindings";
+
   return (
     <div className="space-y-4">
-      <SecretProposalIdentityHeader state={state} />
+      <SecretProposalIdentityHeader state={state} bundle={bundle} />
       <SecretProposalDetails payload={payload} />
       <ProposalJustification justification={payload.justification} />
       <div className="flex items-center gap-2 text-(length:--text-micro) text-muted-foreground">
@@ -2179,10 +2219,31 @@ function RequestSecretProposalCard({
         Expires {formatDateTime(payload.expiresAt)}
       </div>
 
+      {isPending && readiness?.canAccept && readiness.approvesSecret && !bundle ? (
+        <p className="text-sm text-muted-foreground">
+          Approving also approves the pending secret proposal {payload.sourceSecretLabel}.
+        </p>
+      ) : null}
+      {acceptBlocked ? (
+        <div
+          role="status"
+          className="flex items-start gap-2 rounded-sm border border-amber-500/50 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-100"
+        >
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <div className="font-medium">You cannot approve this from the card</div>
+            <p className="mt-1 text-amber-900/80 dark:text-amber-100/80">
+              {sentence(readiness?.blockReason ?? "This secret proposal cannot be approved here")} You can still reject
+              it, or review it on Secrets › Proposals.
+            </p>
+          </div>
+        </div>
+      ) : null}
       {isPending ? (
         <ConfirmationActionRow
           footerSlot={footerSlot}
           resetKey={`${interaction.id}:${interaction.status}`}
+          approveDisabled={acceptBlocked}
           approveLabel={interaction.payload.acceptLabel ?? "Approve & bind"}
           reviseLabel="Add reason…"
           rejectLabel={interaction.payload.rejectLabel ?? "Reject"}
@@ -4044,9 +4105,22 @@ export function IssueThreadInteractionCard({
                 reader is the person who may consent. Rendering the summary here
                 as well would be the second body PAP-17859 removed. */}
             {interaction.summary && !connectionAuthorization && interaction.kind !== "connection_intent" ? (
-              <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-                {interaction.summary}
-              </p>
+              // Agents often write the summary in Markdown. It goes through the
+              // shared renderer (raw HTML ignored, unsafe URLs neutralised),
+              // with images shown as text references so a summary cannot load
+              // remote content into the card.
+              <div
+                className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground"
+                data-testid="interaction-summary"
+              >
+                <MarkdownBody
+                  className="text-sm leading-6 text-muted-foreground [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
+                  mediaMode="reference"
+                  externalReferences={externalReferences}
+                >
+                  {interaction.summary}
+                </MarkdownBody>
+              </div>
             ) : null}
             {interaction.status === "pending" ? (
               <InteractionAudienceLine audience={audience} className="mt-3" />

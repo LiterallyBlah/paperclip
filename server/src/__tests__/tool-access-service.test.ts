@@ -3215,6 +3215,166 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(stillBlocked!.status).toBe("disabled");
   });
 
+  it("fails the shared header-bearer health check when the organization grant lacks the header ref, and PATCH re-syncs the grant", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const secret = await secretService(db).create(company.id, {
+      name: `Shared health token ${randomUUID()}`,
+      key: `shared_health_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: "shared-health-test-token",
+    });
+    const authorizations: Array<string | null> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      authorizations.push(new Headers(init?.headers).get("authorization"));
+      return mcpSseResponse(catalogResponse([
+        { name: "kv_get", description: "Read a value.", annotations: { readOnlyHint: true } },
+      ]));
+    });
+    // API-created with header refs only, so the default organization grant
+    // (which invocation uses) carries no matching credential ref.
+    const connection = await service.createConnection(company.id, connectionInput({
+      name: "Shared bearer fixture",
+      transport: "mcp_remote",
+      config: { url: "http://127.0.0.1:8848/mcp" },
+      enabled: true,
+      status: "active",
+      credentialRefs: [{
+        name: "authorization", secretId: secret.id, version: "latest",
+        placement: "header", key: "Authorization", prefix: "Bearer ",
+      }],
+    }));
+
+    await expect(service.checkHealth(connection.id)).rejects.toMatchObject({
+      status: 422,
+      details: { code: "mcp_remote_missing_secret" },
+    });
+    // The probe must not succeed through a credential invocation cannot use.
+    expect(authorizations).toEqual([]);
+    const [unhealthy] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+    expect(unhealthy?.healthStatus).toBe("missing_secret");
+
+    // Editing the connection's credential refs repairs the execution grant.
+    await service.updateConnection(connection.id, {
+      credentialSecretRefs: [{
+        secretId: secret.id, versionSelector: "latest",
+        configPath: "credentials.authorization", required: true, label: "Bearer token",
+      }],
+    });
+    const [grant] = await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, connection.id),
+      eq(connectionGrants.kind, "organization"),
+      eq(connectionGrants.isDefault, true),
+    ));
+    expect(grant?.status).toBe("active");
+    expect(grant?.credentialSecretRefs).toEqual([
+      expect.objectContaining({ secretId: secret.id, configPath: "credentials.authorization" }),
+    ]);
+    const health = await service.checkHealth(connection.id);
+    expect(health.connection.healthStatus).toBe("ok");
+    expect(authorizations.length).toBeGreaterThan(0);
+    expect(new Set(authorizations)).toEqual(new Set(["Bearer shared-health-test-token"]));
+  });
+
+  it("does not reactivate a revoked organization grant when a connection is edited", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const secret = await secretService(db).create(company.id, {
+      name: `Revoked grant token ${randomUUID()}`,
+      key: `revoked_grant_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: "revoked-grant-test-token",
+    });
+    const connection = await service.createConnection(company.id, connectionInput({
+      name: "Revoked grant fixture",
+      transport: "mcp_remote",
+      config: { url: "http://127.0.0.1:8848/mcp" },
+    }));
+    await db.update(connectionGrants).set({ status: "revoked", revokedAt: new Date() })
+      .where(eq(connectionGrants.connectionId, connection.id));
+    await service.updateConnection(connection.id, {
+      credentialSecretRefs: [{ secretId: secret.id, versionSelector: "latest", configPath: "credentials.authorization" }],
+    });
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection.id));
+    expect(grant?.status).toBe("revoked");
+    expect(grant?.credentialSecretRefs).toEqual([
+      expect.objectContaining({ secretId: secret.id, configPath: "credentials.authorization" }),
+    ]);
+  });
+
+  it("round-trips credential refs on the same default organization grant without touching its identity, members or delegations", async () => {
+    // Exact-rollback route for the BLA-3923 repair: [] -> [ref] -> [] must
+    // edit the existing grant in place and leave everything else alone.
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const agent = await createAgent(db, company.id);
+    const secret = await secretService(db).create(company.id, {
+      name: `Rollback grant token ${randomUUID()}`,
+      key: `rollback_grant_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: "rollback-grant-test-token",
+    });
+    const connection = await service.createConnection(company.id, connectionInput({
+      name: "Rollback grant fixture",
+      transport: "mcp_remote",
+      config: { url: "http://127.0.0.1:8848/mcp" },
+    }));
+    const defaultGrants = () => db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, connection.id),
+      eq(connectionGrants.kind, "organization"),
+      eq(connectionGrants.isDefault, true),
+    ));
+    const [original] = await defaultGrants();
+    expect(original).toBeDefined();
+    expect(original!.credentialSecretRefs).toEqual([]);
+    await db.insert(connectionGrantMembers).values({
+      companyId: company.id,
+      grantId: original!.id,
+      subjectType: "user",
+      subjectId: "rollback-member",
+    });
+    await db.insert(connectionGrantDelegations).values({
+      companyId: company.id,
+      grantId: original!.id,
+      agentId: agent.id,
+      createdByUserId: "rollback-member",
+    });
+    const snapshot = async () => ({
+      members: await db.select().from(connectionGrantMembers)
+        .where(eq(connectionGrantMembers.grantId, original!.id)),
+      delegations: await db.select().from(connectionGrantDelegations)
+        .where(eq(connectionGrantDelegations.grantId, original!.id)),
+    });
+    const before = await snapshot();
+    expect(before.members).toHaveLength(1);
+    expect(before.delegations).toHaveLength(1);
+    const ref = {
+      secretId: secret.id, versionSelector: "latest" as const,
+      configPath: "credentials.authorization", required: true, label: "Bearer token",
+    };
+
+    await service.updateConnection(connection.id, { credentialSecretRefs: [ref] });
+    const afterApply = await defaultGrants();
+    expect(afterApply).toHaveLength(1);
+    expect(afterApply[0]!.id).toBe(original!.id);
+    expect(afterApply[0]!.credentialSecretRefs).toEqual([
+      expect.objectContaining({ secretId: secret.id, configPath: "credentials.authorization" }),
+    ]);
+
+    await service.updateConnection(connection.id, { credentialSecretRefs: [] });
+    const afterRollback = await defaultGrants();
+    expect(afterRollback).toHaveLength(1);
+    const rolledBack = afterRollback[0]!;
+    expect(rolledBack.id).toBe(original!.id);
+    expect(rolledBack.credentialSecretRefs).toEqual([]);
+    expect(rolledBack.isDefault).toBe(original!.isDefault);
+    expect(rolledBack.status).toBe(original!.status);
+    expect(await snapshot()).toEqual(before);
+    const allGrants = await db.select().from(connectionGrants)
+      .where(eq(connectionGrants.connectionId, connection.id));
+    expect(allGrants.map((grant) => grant.id)).toEqual([original!.id]);
+  });
+
   it("sends the MCP Streamable HTTP Accept header and decodes an SSE catalog response", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
@@ -18434,6 +18594,35 @@ describeEmbeddedPostgres("tool access service", () => {
     ]);
   });
 
+  it("syncs a newly added shared reconnect key onto the default organization grant", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([readTool("list_zaps", "List")]);
+    const actor = { actorType: "user" as const, actorId: "board" };
+    const connect = await withGalleryServerUrl("github", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(company.id, {
+        galleryKey: "github", connectionMethodKey: "mcp-key", name: "GitHub shared reconnect",
+        credentialValues: { "credentials.authorization": "old-secret" },
+      }, actor));
+    // A shared connection without a stored key (as in the US-8 e2e fixture):
+    // reconnect must create a new secret rather than rotate an existing one.
+    await db.update(toolConnections).set({ credentialRefs: [], credentialSecretRefs: [] })
+      .where(eq(toolConnections.id, connect.connectionId));
+    await db.update(connectionGrants).set({ credentialSecretRefs: [] })
+      .where(and(eq(connectionGrants.connectionId, connect.connectionId), eq(connectionGrants.kind, "organization")));
+
+    const result = await service.reconnectGalleryApp(connect.connectionId, company.id,
+      { credentialValues: { "credentials.authorization": "new-secret" } }, actor);
+
+    expect(result.connection.healthStatus).toBe("ok");
+    const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connect.connectionId));
+    const [grant] = await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, connect.connectionId),
+      eq(connectionGrants.kind, "organization"), eq(connectionGrants.isDefault, true)));
+    expect(row!.credentialSecretRefs).toEqual([expect.objectContaining({ configPath: "credentials.authorization" })]);
+    expect(grant).toMatchObject({ status: "active", credentialSecretRefs: row!.credentialSecretRefs });
+  });
+
   it("orders static-key reconnect with concurrent personal grant revocation", async () => {
     const company = await createCompany(db);
     await createAgent(db, company.id);
@@ -20425,8 +20614,11 @@ describeEmbeddedPostgres("tool access service", () => {
         actorId: "board",
       }),
     ).rejects.toMatchObject({
+      // The ref exists only on the connection row, so the default organization
+      // grant that invocation uses cannot supply it: health fails with the
+      // same code invocation would, before touching the secret store.
       status: 422,
-      details: expect.objectContaining({ code: "secret_missing" }),
+      details: expect.objectContaining({ code: "mcp_remote_missing_secret" }),
     });
     const [updatedConnection] = await db
       .select()
@@ -20444,7 +20636,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(audit).toMatchObject({
       action: "tool_connection.health_check",
       outcome: "failure",
-      reasonCode: "secret_missing",
+      reasonCode: "mcp_remote_missing_secret",
       details: { status: "missing_secret", transport: "mcp_remote" },
     });
     expect(JSON.stringify(audit)).not.toContain("Bearer ");

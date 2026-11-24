@@ -218,11 +218,19 @@ describe("CreateOS command protocol", () => {
     const create = fake.calls.find((call) => call.path.endsWith("/processes"))!;
     expect(create.body).toMatchObject({ cmd: "/bin/bash", cwd: "/work dir" });
     expect(create.body).not.toHaveProperty("env");
-    expect((create.body.args as string[])[1]).toContain("MESSAGE='$(touch /bad)'");
+    // Env values are staged through the files API, never in the command text (BLA-3999).
+    expect((create.body.args as string[])[1]).not.toContain("touch /bad)");
+    expect((create.body.args as string[])[1]).toMatch(/paperclip-env '\/tmp\/paperclip-env-[0-9a-f-]+' /);
+    const envUpload = fake.calls.find((call) => call.method === "PUT" && call.path.includes("paperclip-env-"))!;
+    expect(String(envUpload.init.body)).toContain("__paperclip_env_0='$(touch /bad)'");
+    expect(String(envUpload.init.body)).toContain('export MESSAGE="$__paperclip_env_0"');
     expect((create.body.args as string[])[1]).toContain("'a'\"'\"'; touch /bad; echo '\"'\"''");
     expect((create.body.args as string[])[1]).not.toContain("secret input");
     expect(fake.calls.some((call) => call.path.endsWith("/input"))).toBe(false);
-    expect(fake.calls.at(-1)?.body).toMatchObject({ cmd: "/bin/rm" });
+    expect(fake.calls.at(-1)?.body).toMatchObject({
+      cmd: "/bin/rm",
+      args: ["-f", "--", expect.stringMatching(/^\/tmp\/paperclip-env-/), expect.stringMatching(/^\/tmp\/paperclip-stdin-/)],
+    });
   });
 
   it("replays the same process after disconnect without duplicate logs, preserving split UTF-8", async () => {

@@ -50,6 +50,7 @@ import type {
   PluginEnvironmentValidationResult,
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
+import { buildCallerEnvScript, CALLER_ENV_FILE_EXEC } from "./caller-env.js";
 import { performSyncIn, performSyncOut, withProviderSpan } from "./file-sync.js";
 import { DEFAULT_DAYTONA_OPERATION_TIMEOUT_MS } from "./manifest.js";
 import { withLeaseSpan, leaseStateAttributes, type LeaseSpanName } from "./lease-tracing.js";
@@ -1034,6 +1035,20 @@ function isGitNetworkCommand(command: string, args: string[]): boolean {
   return false;
 }
 
+// Validate caller env and render it as the staged env script, or null when
+// there is no caller env to send (BLA-4139).
+function buildDaytonaCallerEnvScript(env: Record<string, string> | undefined): string | null {
+  const entries = Object.entries(env ?? {});
+  for (const [key] of entries) {
+    if (!isValidShellEnvKey(key)) {
+      throw new Error(`Invalid sandbox environment variable key: ${key}`);
+    }
+  }
+  return buildCallerEnvScript(
+    entries.filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
+}
+
 // Build the one-shot exec command. Daytona's `executeCommand` runs the script
 // in a non-login shell, so it does not source `/etc/profile` on its own. The
 // Daytona reference image puts `node`, `claude`, and the other CLIs on the PATH
@@ -1047,28 +1062,33 @@ function buildLoginShellScript(input: {
   args: string[];
   cwd?: string;
   env?: Record<string, string>;
+  envPath?: string;
   stdinPath?: string;
 }): string {
   const callerEnv = input.env ?? {};
-  for (const key of Object.keys(callerEnv)) {
-    if (!isValidShellEnvKey(key)) {
-      throw new Error(`Invalid sandbox environment variable key: ${key}`);
-    }
-  }
-  // Caller env takes priority over noninteractive git credential defaults
-  const env = { ...NONINTERACTIVE_GIT_ENV, ...callerEnv };
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+  // Only the fixed, non-secret git defaults that the caller does not override
+  // stay in the command text. Caller env (which carries the agent's
+  // PAPERCLIP_API_KEY) comes only from the staged env file at `envPath`, so no
+  // caller value is in the command text or in any argv (BLA-4139).
+  const defaultArgs = Object.entries(NONINTERACTIVE_GIT_ENV)
+    .filter(([key]) => !Object.prototype.hasOwnProperty.call(callerEnv, key))
     .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
-  const redirectedCommand = input.stdinPath
-    ? `${commandParts} < ${shellQuote(input.stdinPath)}`
+  // The caller env is applied after the login profiles, in a fresh `/bin/sh`
+  // that sources none (CALLER_ENV_FILE_EXEC), so it still wins over anything a
+  // profile exports or marks readonly. The fresh shell removes the env file
+  // before it execs the target.
+  const target = input.envPath
+    ? `/bin/sh -c ${shellQuote(CALLER_ENV_FILE_EXEC)} paperclip-env ${shellQuote(input.envPath)} ${commandParts}`
     : commandParts;
+  const redirectedCommand = input.stdinPath
+    ? `${target} < ${shellQuote(input.stdinPath)}`
+    : target;
   // Each `executeCommand` call runs in its own shell, so we don't `exec`-
   // replace it; running the command as the last `&&`-chained line is enough to
   // surface the right exit code.
-  const finalLine = envArgs.length > 0
-    ? `env ${envArgs.join(" ")} ${redirectedCommand}`
+  const finalLine = defaultArgs.length > 0
+    ? `env ${defaultArgs.join(" ")} ${redirectedCommand}`
     : redirectedCommand;
   const lines = [
     'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
@@ -1951,6 +1971,7 @@ async function executeOneShot(
   const effectiveTimeoutMs = gitNet ? Math.min(timeoutMs, GIT_NETWORK_TIMEOUT_MS) : timeoutMs;
   const timeoutSeconds = toTimeoutSeconds(effectiveTimeoutMs);
   const stdinPath = params.stdin != null ? `/tmp/paperclip-stdin-${randomUUID()}` : null;
+  let envPath: string | null = null;
 
   // Marks the start of the `executeCommand` REST round-trip. Hoisted out of the
   // try so the timeout path below can still attribute the exec wall-time it spent
@@ -1960,6 +1981,13 @@ async function executeOneShot(
   let execStart: number | null = null;
 
   try {
+    // Caller env is staged through the Daytona file API, never the command
+    // text. Validate it before any upload (BLA-4139).
+    const envScript = buildDaytonaCallerEnvScript(params.env);
+    if (envScript != null) {
+      envPath = `/tmp/paperclip-env-${randomUUID()}`;
+      await sandbox.fs.uploadFile(Buffer.from(envScript, "utf8"), envPath, timeoutSeconds);
+    }
     if (stdinPath) {
       await sandbox.fs.uploadFile(Buffer.from(params.stdin ?? "", "utf8"), stdinPath, timeoutSeconds);
     }
@@ -1971,6 +1999,7 @@ async function executeOneShot(
       args: params.args ?? [],
       cwd: params.cwd,
       env: params.env,
+      envPath: envPath ?? undefined,
       stdinPath: stdinPath ?? undefined,
     });
 
@@ -2032,6 +2061,11 @@ async function executeOneShot(
     if (stdinPath) {
       await withLivenessTimeout("fs.deleteFile", LIVENESS_START_TIMEOUT_MARGIN_MS,
         () => sandbox.fs.deleteFile(stdinPath)).catch(() => undefined);
+    }
+    // The fresh shell removes the env file before exec; this covers a failed
+    // upload, an early exit or a timeout.
+    if (envPath) {
+      await sandbox.fs.deleteFile(envPath).catch(() => undefined);
     }
   }
 }
@@ -2399,6 +2433,7 @@ async function executeInSession(
   const effectiveTimeoutMs = gitNet ? Math.min(timeoutMs, GIT_NETWORK_TIMEOUT_MS) : timeoutMs;
   const timeoutSeconds = toTimeoutSeconds(effectiveTimeoutMs);
   const stdinPath = params.stdin != null ? `/tmp/paperclip-stdin-${randomUUID()}` : null;
+  let envPath: string | null = null;
 
   // Marks the start of the session dispatch and poll. The timeout paths report
   // the exec wall-time spent before the abort, so a slow command is still
@@ -2409,6 +2444,13 @@ async function executeInSession(
   const streamBuffer = createSessionStreamBuffer((stream, text) => pluginContext?.execution.log(stream, text));
 
   try {
+    // Caller env is staged through the Daytona file API, never the command
+    // text. Validate it before any upload (BLA-4139).
+    const envScript = buildDaytonaCallerEnvScript(params.env);
+    if (envScript != null) {
+      envPath = `/tmp/paperclip-env-${randomUUID()}`;
+      await sandbox.fs.uploadFile(Buffer.from(envScript, "utf8"), envPath, timeoutSeconds);
+    }
     if (stdinPath) {
       await sandbox.fs.uploadFile(Buffer.from(params.stdin ?? "", "utf8"), stdinPath, timeoutSeconds);
     }
@@ -2418,6 +2460,7 @@ async function executeInSession(
       args: params.args ?? [],
       cwd: params.cwd,
       env: params.env,
+      envPath: envPath ?? undefined,
       stdinPath: stdinPath ?? undefined,
     });
     // Subshell wrap: a top-level `exit` in the user command exits only the
@@ -2564,6 +2607,11 @@ async function executeInSession(
     commandDeadline?.clear();
     if (stdinPath) {
       await sandbox.fs.deleteFile(stdinPath).catch(() => undefined);
+    }
+    // The fresh shell removes the env file before exec; this covers a failed
+    // upload, an early exit or a timeout.
+    if (envPath) {
+      await sandbox.fs.deleteFile(envPath).catch(() => undefined);
     }
   }
 }

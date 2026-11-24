@@ -650,6 +650,10 @@ describeDatabase("assembled maintenance server production wiring", () => {
       await writeback(card.generatingIssueId, true); await server.advance(30_000); await settleClock(server);
       const [compiled] = await fixture.$client`select state, query_version, generating_issue_id from status_cards where id=${card.id}`;
       expect(compiled).toMatchObject({ state: "active", query_version: 1, generating_issue_id: null });
+      // Fork (#44, live reactive spacing): reactive cards wait 20 minutes after their last
+      // summary. Backdate the compile summary past that window so this upstream wiring test
+      // still measures first-change ingress (spacing is covered by status-card-refresh-coalescing).
+      await fixture.$client`update status_cards set last_generated_at = last_generated_at - interval '1 hour' where id=${card.id}`;
       const changed = await server.api<{ id: string }>("POST", `/companies/${company.id}/issues`, {
         title: "Ordinary new blocker", status: "blocked",
       });

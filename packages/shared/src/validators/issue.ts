@@ -676,6 +676,9 @@ export const resolveIssueRecoveryActionSchema = z
       // A retained-source repair records evidence without changing task state.
       // The route verifies the exact server-owned source and unchanged status.
       if (value.executionReconciliation?.workspaceRepairEvidence) return;
+      // A stopped pending stage that its own automatic no-replay settlement
+      // blocked keeps `blocked`; the route proves that projection (BLA-4186).
+      if (value.executionReconciliation && value.sourceIssueStatus === "blocked") return;
       if (
         value.sourceIssueStatus !== "todo" &&
         value.sourceIssueStatus !== "done" &&
@@ -1685,8 +1688,16 @@ export const requestConfirmationToolActionPayloadSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
+export const requestConfirmationSecretProposalBindingSchema = z.object({
+  proposalId: z.string().guid(),
+  configPath: z.string().trim().min(1).max(500),
+  targetAgentId: z.string().guid(),
+  targetAgentName: z.string().trim().min(1).max(500),
+});
+
 export const requestConfirmationSecretProposalPayloadSchema = z.object({
   version: z.literal(1),
+  kind: z.enum(["binding", "secret_with_bindings"]).optional(),
   proposalId: z.string().guid(),
   sourceSecretLabel: z.string().trim().min(1).max(500),
   configPath: z.string().trim().min(1).max(500),
@@ -1694,6 +1705,7 @@ export const requestConfirmationSecretProposalPayloadSchema = z.object({
   targetAgentName: z.string().trim().min(1).max(500),
   justification: z.string().trim().min(1).max(20000),
   expiresAt: z.string().datetime({ offset: true }),
+  bindings: z.array(requestConfirmationSecretProposalBindingSchema).max(100).optional(),
 });
 
 const qualityReviewBindingSchema = z.object({

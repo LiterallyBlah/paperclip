@@ -455,7 +455,8 @@ describe("automatic retained workspace recovery", () => {
     } finally { await restored.cleanup(); }
     expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
       .toMatchObject({ status: "blocked", executionWorkspaceId: currentWorkspace.id });
-    expect(await action(laterAction.id)).toEqual(expect.objectContaining({ status: "active", evidence: { runId: later.id } }));
+    // Fork (#76): routed actions also record recoveryOwnerRouting evidence.
+    expect(await action(laterAction.id)).toEqual(expect.objectContaining({ status: "active", evidence: expect.objectContaining({ runId: later.id }) }));
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0])
       .toMatchObject({ phase: "terminal_failure", resultId: f.resultId });
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual([]);

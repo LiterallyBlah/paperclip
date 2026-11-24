@@ -46,6 +46,7 @@ import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { JsonRpcCallError } from "@paperclipai/plugin-sdk";
 import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 import { requestTaskRetry } from "../services/task-retry.js";
+import { agentExecutionsHaveStopped } from "../services/agent-execution-stop.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
@@ -3784,6 +3785,65 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(mockAdapterExecute).not.toHaveBeenCalled();
       const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
       expect(task.executionRunId).toBeNull();
+    });
+  });
+
+  it("records executor-owned stop proof when a legacy local Stop wins before adapter entry", async () => {
+    await withTempPaperclipHome(async () => {
+      const { agentId, issueId, runId } = await seedQueuedIssueRunFixture();
+      await db.update(heartbeatRuns).set({ invocationSource: "automation" }).where(eq(heartbeatRuns.id, runId));
+      let reachedSelection = false;
+      const heartbeat = heartbeatService(db, {
+        // Preparation is complete; the locked provider handoff has not run.
+        beforeChatControlRecoveryCheck: async ({ stage, runId: id }) => {
+          if (stage !== "dispatch") return;
+          reachedSelection = true;
+          await heartbeat.cancelRun(id);
+          // Same missing-acknowledgement block as the captured Summarizer row.
+          const stopped = await heartbeat.getRun(id);
+          expect(stopped).toMatchObject({ status: "cancelled", runtimeMode: "legacy", processPid: null });
+          expect(stopped?.resultJson?.executionCancellation).toBeUndefined();
+          expect(await agentExecutionsHaveStopped(db, [agentId])).toBe(false);
+        },
+      });
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      expect(reachedSelection).toBe(true);
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      const run = await heartbeat.getRun(runId);
+      expect(run).toMatchObject({ status: "cancelled", runtimeMode: "legacy", executionStage: "settled",
+        processPid: null, processGroupId: null, sessionIdAfter: null, exitCode: null,
+        resultJson: { cancellation: { source: "control_plane" },
+          legacyStartupCancellation: { version: 1, runId, controllerBootId: run?.controllerBootId,
+            providerDispatchStarted: false, cancellationRecordedAt: (run?.resultJson?.cancellation as { recordedAt?: string })?.recordedAt } } });
+      expect(run?.usageJson?.budgetDispatch).toBeUndefined();
+      expect(run?.resultJson?.executionCancellation).toBeUndefined();
+      expect(run?.resultJson?.startupPreparationSettledAt).toBeUndefined();
+      expect(await agentExecutionsHaveStopped(db, [agentId])).toBe(true);
+      const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(task.executionRunId).toBeNull();
+    });
+  });
+
+  it("records no pre-adapter stop proof once the legacy adapter was entered", async () => {
+    await withTempPaperclipHome(async () => {
+      const { agentId, runId } = await seedQueuedIssueRunFixture();
+      let heartbeat!: ReturnType<typeof heartbeatService>;
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        // Stop lands after the locked handoff but before any adapter owner or
+        // PID is registered: the same unacknowledged row shape, after entry.
+        await heartbeat.cancelRun(runId);
+        return { exitCode: null, signal: null, timedOut: false, errorMessage: "stopped", provider: "test", model: "test-model" };
+      });
+      heartbeat = heartbeatService(db);
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      const run = await heartbeat.getRun(runId);
+      expect(run).toMatchObject({ status: "cancelled", runtimeMode: "legacy", processPid: null });
+      expect(run?.usageJson?.budgetDispatch).toMatchObject({ handedOffAt: expect.any(String) });
+      expect(run?.resultJson?.legacyStartupCancellation).toBeUndefined();
+      expect(await agentExecutionsHaveStopped(db, [agentId])).toBe(false);
     });
   });
 
@@ -8445,6 +8505,83 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         _previous: { status: "in_progress" },
         recoveryActionId: action!.id,
       }),
+    });
+  });
+
+  it("routes exhausted source-owner repair to the recovery coordinator with a coordinator wake", async () => {
+    const { companyId, agentId, runId, issueId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "issue_continuation_waiting_on_review",
+      });
+    const coordinatorId = randomUUID();
+    await db.insert(agents).values(recoveryAgentRow(coordinatorId, companyId, "Coordinator", "ceo", "idle"));
+    await db.update(agents).set({ reportsTo: coordinatorId }).where(eq(agents.id, agentId));
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    const state = await collectDispositionRepairSourceState(db, { issue: sourceIssue });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_disposition_repair",
+          retryReason: "issue_disposition_repair",
+          dispositionRepairFingerprint: state.fingerprint,
+          dispositionRepairAttempt: 5,
+          dispositionRepairMaxAttempts: 5,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(result).toMatchObject({ dispositionRepairRequeued: 0, escalated: 1 });
+
+    const [sourceAfter, action, coordinatorWakes, sourceAttemptSix] = await Promise.all([
+      selectRecoveryIssueById(issueId),
+      selectRecoveryActionForIssue(companyId, issueId),
+      db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.agentId, coordinatorId),
+      )),
+      db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.agentId, agentId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'dispositionRepairAttempt' = '6'`,
+      )),
+    ]);
+    expect(sourceAfter).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+    expect(action).toMatchObject({
+      kind: "deliberate_wait_without_target",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: coordinatorId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      maxAttempts: null,
+      resolutionNote: "unchanged_source_state_exhausted",
+      evidence: expect.objectContaining({
+        recoveryOwnerRouting: expect.objectContaining({ coordinator: "assigned", agentId: coordinatorId }),
+      }),
+    });
+    expect(coordinatorWakes).toHaveLength(1);
+    expect(coordinatorWakes[0]).toMatchObject({
+      reason: "source_scoped_recovery_action",
+      payload: expect.objectContaining({ issueId, recoveryActionId: action!.id }),
+    });
+    expect(sourceAttemptSix).toHaveLength(0);
+    const notices = await selectRecoveryCommentsForIssue(issueId);
+    const notice = notices.find(comment => comment.metadata?.recovery?.kind === "disposition_repair_escalated");
+    expect(notice?.body).toContain("Recovery owner: recovery coordinator agent");
+    const escalationActivity = await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, issueId),
+      eq(activityLog.action, "issue.disposition_repair_escalated"),
+    ));
+    expect(escalationActivity[0]!.details).toMatchObject({
+      recoveryOwnerType: "agent",
+      recoveryOwnerAgentId: coordinatorId,
     });
   });
 

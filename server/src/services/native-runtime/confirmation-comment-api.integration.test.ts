@@ -17,11 +17,11 @@ describe("confirmation reply through the native API tool", () => {
     f: Awaited<ReturnType<typeof server.fixture>>,
     idempotencyKey: string,
     prompt: string,
-    resolverPolicy?: "human_only",
+    resolverPolicy: "human_only" | "anyone" = "anyone",
   ) {
     const result = await f.authority.execute({ tool: "request_human_input", callId: randomUUID(), arguments: {
       idempotencyKey, interactionKind: "confirmation", title: "Approve child task", prompt,
-      continuationPolicy: "wake_assignee", ...(resolverPolicy === undefined ? {} : { resolverPolicy }),
+      continuationPolicy: "wake_assignee", resolverPolicy,
       payload: { version: 1, supersedeOnUserComment: false, acceptLabel: "Approve", rejectLabel: "Revise", rejectRequiresReason: true },
     } });
     const [card] = await server.db.select().from(issueThreadInteractions).where(and(
@@ -40,7 +40,7 @@ describe("confirmation reply through the native API tool", () => {
   }
   it("advertises and executes the real authenticated route, including retry", async () => {
     const { f, card, comment, call } = await seed();
-    expect(card).toMatchObject({ requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "inherited" });
+    expect(card).toMatchObject({ requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "explicit" });
     const first = await f.authority.execute(call);
     expect(first).toMatchObject({ status: 200, data: { deduplicated: false, interaction: {
       id: card.id, status: "accepted", result: { outcome: "accepted", commentId: comment.id },

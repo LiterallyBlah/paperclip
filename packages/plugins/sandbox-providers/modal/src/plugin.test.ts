@@ -567,7 +567,9 @@ describe("Modal sandbox provider plugin", () => {
       timeoutMs: 12_000,
     });
 
-    expect(sandbox.execCalls).toHaveLength(1);
+    // One user exec plus the best-effort cleanup of the staged env file.
+    expect(sandbox.execCalls).toHaveLength(2);
+    expect(sandbox.execCalls[1]?.argv[2]).toMatch(/^rm -f '\/tmp\/paperclip-env-/);
     const call = sandbox.execCalls[0]!;
     expect(call.argv[0]).toBe("sh");
     expect(call.argv[1]).toBe("-c");
@@ -577,7 +579,11 @@ describe("Modal sandbox provider plugin", () => {
     expect(script).not.toMatch(/nvm\.sh/);
     expect(script).not.toMatch(/NVM_DIR/);
     expect(script).toMatch(/cd '\/srv\/work'/);
-    expect(script).toMatch(/&& exec env FOO='bar' 'printf' 'hello'$/);
+    // Env is staged through `sandbox.open` and sourced; only its path is in the argv (BLA-3978).
+    expect(script).not.toContain("bar");
+    expect(script).toMatch(/&& cd '\/srv\/work' && exec \/bin\/sh -c '\. "\$1" \|\| exit 125\n[\s\S]*\nexit 126' paperclip-env '\/tmp\/paperclip-env-[^']+' 'printf' 'hello'$/);
+    expect(sandbox.openedFiles[0]?.path).toMatch(/^\/tmp\/paperclip-env-/);
+    expect(new TextDecoder().decode(sandbox.openedFiles[0]!.written!)).toBe("__paperclip_env_0='bar'\n__paperclip_env_apply() { export FOO=\"$__paperclip_env_0\"; }\n__paperclip_env_export() { export __paperclip_env_0; }\n__paperclip_env_unset() { unset __paperclip_env_0; }\n__paperclip_env_names='1 FOO'\n__paperclip_env_split='-u __paperclip_env_0 -- FOO=${__paperclip_env_0}'\n");
     expect(call.params).toMatchObject({
       timeoutMs: 12_000,
       stdout: "pipe",

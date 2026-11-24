@@ -6,7 +6,7 @@ import { parseObject } from "../../adapters/utils.js";
 import { isConversation } from "../agent-conversations.js";
 import { chatCompletionInstruction } from "../chat-completion-delivery.js";
 import { getConversationConfirmationContext } from "../conversation-confirmation-context.js";
-import { buildExecutionContinuation } from "../execution-continuation.js";
+import { buildExecutionContinuation, continuationHistoryModeForAdapter } from "../execution-continuation.js";
 import { getIssueContinuationSummaryDocument } from "../issue-continuation-summary.js";
 import type { issueService } from "../issues.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
@@ -144,6 +144,7 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
           previousContextRunId: taskSession?.lastRunId,
           summary: safeContinuationSummary?.body ?? null,
           exposeLowTrustRaw,
+          historyMode: continuationHistoryModeForAdapter(agent.adapterType),
         })
       : null;
   context.executionContinuation = executionContinuation;
