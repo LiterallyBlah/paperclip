@@ -1486,6 +1486,192 @@ describeEmbeddedPostgres("secretService", () => {
     });
   });
 
+  // Binding and declaration IDs are authority-bearing (rotate_bound grants,
+  // run-manifest allowedBindingIds). A config sync must reconcile, so an
+  // unchanged row keeps its id. Dummy secret values only.
+  describe("syncSecretRefsForTarget keeps unchanged binding ids", () => {
+    async function seedSecrets(companyId: string, count: number) {
+      const svc = secretService(db);
+      const created = [];
+      for (let index = 0; index < count; index += 1) {
+        created.push(await svc.create(companyId, {
+          name: `id-stable-${index}-${randomUUID()}`,
+          provider: "local_encrypted",
+          value: `dummy-value-${index}`,
+        }));
+      }
+      return created;
+    }
+
+    async function bindingIdsByPath(targetId: string) {
+      const rows = await db
+        .select()
+        .from(companySecretBindings)
+        .where(eq(companySecretBindings.targetId, targetId));
+      return Object.fromEntries(rows.map((row) => [row.configPath, row]));
+    }
+
+    it("keeps existing ids when a ref is added", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const [a, b, c] = await seedSecrets(companyId, 3);
+      const target = { targetType: "agent" as const, targetId: "agent-ids-add" };
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: a.id, configPath: "env.A" },
+        { secretId: b.id, configPath: "env.B" },
+      ], { replaceAll: true });
+      const before = await bindingIdsByPath(target.targetId);
+
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: a.id, configPath: "env.A" },
+        { secretId: b.id, configPath: "env.B" },
+        { secretId: c.id, configPath: "env.C" },
+      ], { replaceAll: true });
+      const after = await bindingIdsByPath(target.targetId);
+
+      expect(Object.keys(after).sort()).toEqual(["env.A", "env.B", "env.C"]);
+      expect(after["env.A"].id).toBe(before["env.A"].id);
+      expect(after["env.B"].id).toBe(before["env.B"].id);
+      expect(after["env.C"].secretId).toBe(c.id);
+    });
+
+    it("keeps the other ids and deletes the row when a ref is removed", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const [a, b] = await seedSecrets(companyId, 2);
+      const target = { targetType: "agent" as const, targetId: "agent-ids-remove" };
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: a.id, configPath: "env.A" },
+        { secretId: b.id, configPath: "env.B" },
+      ], { replaceAll: true });
+      const before = await bindingIdsByPath(target.targetId);
+
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: a.id, configPath: "env.A" },
+      ], { replaceAll: true });
+      const after = await bindingIdsByPath(target.targetId);
+
+      expect(Object.keys(after)).toEqual(["env.A"]);
+      expect(after["env.A"].id).toBe(before["env.A"].id);
+      const removed = await db
+        .select()
+        .from(companySecretBindings)
+        .where(eq(companySecretBindings.id, before["env.B"].id));
+      expect(removed).toEqual([]);
+    });
+
+    it("updates version and projection in place for the same secret", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const [a, b] = await seedSecrets(companyId, 2);
+      const target = { targetType: "agent" as const, targetId: "agent-ids-update" };
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: a.id, configPath: "env.SLACK_BOT_TOKEN" },
+        { secretId: b.id, configPath: "env.B" },
+      ], { replaceAll: true });
+      const before = await bindingIdsByPath(target.targetId);
+
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: a.id, configPath: "env.SLACK_BOT_TOKEN", versionSelector: 1, projectionClass: "class_3_static_lease", projectionAllowlistKey: "slack.bot_token", label: "Pinned" },
+        { secretId: b.id, configPath: "env.B" },
+      ], { replaceAll: true });
+      const after = await bindingIdsByPath(target.targetId);
+
+      expect(after["env.SLACK_BOT_TOKEN"].id).toBe(before["env.SLACK_BOT_TOKEN"].id);
+      expect(after["env.SLACK_BOT_TOKEN"]).toMatchObject({
+        secretId: a.id,
+        versionSelector: "1",
+        projectionClass: "class_3_static_lease",
+        projectionAllowlistKey: "slack.bot_token",
+        label: "Pinned",
+      });
+      expect(after["env.B"]).toEqual(before["env.B"]);
+    });
+
+    it("gives a re-pointed path a new id and keeps the unrelated ids", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const [a, b, c] = await seedSecrets(companyId, 3);
+      const target = { targetType: "agent" as const, targetId: "agent-ids-repoint" };
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: a.id, configPath: "env.A" },
+        { secretId: b.id, configPath: "env.B" },
+      ], { replaceAll: true });
+      const before = await bindingIdsByPath(target.targetId);
+
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: a.id, configPath: "env.A" },
+        { secretId: c.id, configPath: "env.B" },
+      ], { replaceAll: true });
+      const after = await bindingIdsByPath(target.targetId);
+
+      expect(after["env.A"].id).toBe(before["env.A"].id);
+      expect(after["env.B"].secretId).toBe(c.id);
+      expect(after["env.B"].id).not.toBe(before["env.B"].id);
+    });
+
+    it("reconciles only in-scope rows in path-prefix mode", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const [a, b, c] = await seedSecrets(companyId, 3);
+      const target = { targetType: "agent" as const, targetId: "agent-ids-prefix" };
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: a.id, configPath: "env.A" },
+        { secretId: b.id, configPath: "env.B" },
+        { secretId: c.id, configPath: "access.C" },
+      ], { replaceAll: true });
+      const before = await bindingIdsByPath(target.targetId);
+
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: a.id, configPath: "env.A" },
+      ]);
+      const after = await bindingIdsByPath(target.targetId);
+
+      expect(Object.keys(after).sort()).toEqual(["access.C", "env.A"]);
+      expect(after["env.A"].id).toBe(before["env.A"].id);
+      expect(after["access.C"].id).toBe(before["access.C"].id);
+    });
+
+    it("keeps unchanged user secret declaration ids", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      await svc.createUserSecretDefinition(companyId, { key: "dummy_one", name: "Dummy one", provider: "local_encrypted" });
+      await svc.createUserSecretDefinition(companyId, { key: "dummy_two", name: "Dummy two", provider: "local_encrypted" });
+      await svc.createUserSecretDefinition(companyId, { key: "dummy_three", name: "Dummy three", provider: "local_encrypted" });
+      const target = { targetType: "agent" as const, targetId: "agent-decl-ids" };
+      const declarationsByPath = async () => Object.fromEntries(
+        (await db.select().from(userSecretDeclarations).where(eq(userSecretDeclarations.targetId, target.targetId)))
+          .map((row) => [row.configPath, row]),
+      );
+      await svc.syncUserSecretDeclarationsForTarget(companyId, target, [
+        { definitionKey: "dummy_one", configPath: "env.ONE", envKey: "ONE" },
+        { definitionKey: "dummy_two", configPath: "env.TWO", envKey: "TWO" },
+      ], { replaceAll: true });
+      const before = await declarationsByPath();
+
+      // Add one, change a field on another: both existing ids stay.
+      await svc.syncUserSecretDeclarationsForTarget(companyId, target, [
+        { definitionKey: "dummy_one", configPath: "env.ONE", envKey: "ONE", required: false },
+        { definitionKey: "dummy_two", configPath: "env.TWO", envKey: "TWO" },
+        { definitionKey: "dummy_three", configPath: "env.THREE", envKey: "THREE" },
+      ], { replaceAll: true });
+      const added = await declarationsByPath();
+      expect(added["env.ONE"].id).toBe(before["env.ONE"].id);
+      expect(added["env.ONE"].required).toBe(false);
+      expect(added["env.TWO"].id).toBe(before["env.TWO"].id);
+
+      // Remove one and re-point another to a different definition.
+      await svc.syncUserSecretDeclarationsForTarget(companyId, target, [
+        { definitionKey: "dummy_one", configPath: "env.ONE", envKey: "ONE", required: false },
+        { definitionKey: "dummy_three", configPath: "env.TWO", envKey: "TWO" },
+      ], { replaceAll: true });
+      const after = await declarationsByPath();
+      expect(Object.keys(after).sort()).toEqual(["env.ONE", "env.TWO"]);
+      expect(after["env.ONE"].id).toBe(before["env.ONE"].id);
+      expect(after["env.TWO"].id).not.toBe(before["env.TWO"].id);
+    });
+  });
+
   it("reports reference counts and resolves binding target labels", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);
