@@ -4,7 +4,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agents,
   agentWakeupRequests,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issueRecoveryActions,
@@ -23,6 +25,17 @@ import {
   resolveRecoveryOwner,
 } from "../services/recovery/recovery-owner-routing.js";
 import { backfillRecoveryCoordinatorOwners } from "../services/recovery/recovery-owner-backfill.js";
+
+async function seedCompanyUser(
+  db: ReturnType<typeof createDb>,
+  companyId: string,
+  membershipRole: string,
+  userId = `user-${randomUUID()}`,
+) {
+  await db.insert(authUsers).values({ id: userId, name: "Synthetic user", email: `${randomUUID()}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+  await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, membershipRole, status: "active" });
+  return userId;
+}
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -78,7 +91,9 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
+    await db.delete(authUsers);
   });
 
   afterAll(async () => {
@@ -120,6 +135,9 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
       issuePrefix: prefix,
       requireBoardApprovalForNewAgents: false,
     });
+    // Dispatch acts on behalf of a responsible user; with no direct one it
+    // falls back to the company owner, so every synthetic company has one.
+    await seedCompanyUser(db, companyId, "owner");
     const rows = [
       agentRow({ id: otherId, companyId, name: "Ops Lead", role: "cto" }),
       agentRow({ id: workerId, companyId, name: "Worker", role: "engineer", reportsTo: otherId }),
@@ -258,6 +276,7 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
       kind: "active_run_watchdog",
       cause: "process_lost",
       requestedOwnerType: "board",
+      sourceIssueId: fixture.sourceIssueId,
     });
     expect(owner).toMatchObject({
       ownerType: "board",
@@ -636,6 +655,7 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
       kind: held!.kind,
       cause: held!.cause,
       requestedOwnerType: "board",
+      sourceIssueId: fixture.sourceIssueId,
       sourceAgentId: fixture.workerId,
     });
     expect(resolved.ownerType).toBe("board");

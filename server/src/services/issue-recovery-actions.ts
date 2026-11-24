@@ -4,7 +4,7 @@ import { notifyNativeRecoveryNotices } from "./native-recovery-notice-notificati
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { writeExecutionControl } from "./execution-control-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
-import { and, desc, eq, inArray, isNull, isNotNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, isNotNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issueRecoveryActions, workspaceOperations } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
@@ -322,6 +322,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   function routeOwner(
     input: {
       companyId: string;
+      sourceIssueId: string;
       kind: string;
       cause: string;
       returnOwnerAgentId?: string | null;
@@ -339,6 +340,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       requestedOwnerType: ownerType,
       requestedOwnerAgentId: ownerAgentId ?? null,
       requestedOwnerUserId: ownerUserId ?? null,
+      sourceIssueId: input.sourceIssueId,
       sourceAgentId: input.returnOwnerAgentId ?? input.previousOwnerAgentId ?? null,
       now,
     });
@@ -711,6 +713,74 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     resolveActiveForIssue,
     upsertSourceScoped,
   };
+}
+
+/** Resolution note on actions closed because their source issue closed. */
+export const SOURCE_ISSUE_TERMINAL_RESOLUTION_NOTE = "source_issue_terminal";
+
+/**
+ * A native workspace finalization whose owner is still unverified settles an
+ * accepted result after the source issue closed; its native finalizer owns
+ * it (recovery reconciliation already skips it). Terminal closure leaves it
+ * open; it is never woken while the source is terminal.
+ */
+const TERMINAL_SURVIVING_RECOVERY_CAUSES: ReadonlySet<string> = new Set([
+  "native_workspace_finalization_owner_unverified",
+]);
+
+export function survivesTerminalSourceIssue(cause: string) {
+  return TERMINAL_SURVIVING_RECOVERY_CAUSES.has(cause);
+}
+
+/**
+ * Close every open recovery action of a source issue that is now `done` or
+ * `cancelled`: `cancelled` source closes them `cancelled`/`cancelled`, a
+ * `done` source closes them `resolved`/`owner_completed`, both with the note
+ * {@link SOURCE_ISSUE_TERMINAL_RESOLUTION_NOTE}. Runs inside the caller's
+ * transaction. Only the action rows change: the source issue, its runs and
+ * wakes are left alone, so nothing is reopened or replayed.
+ */
+export async function closeRecoveryActionsForTerminalSourceIssue(
+  dbOrTx: DbOrTransaction,
+  input: {
+    companyId: string;
+    sourceIssueId: string;
+    sourceStatus: string;
+    actionId?: string | null;
+    /** Left open: the caller resolves it itself in the same transaction. */
+    exceptActionId?: string | null;
+    now?: Date;
+  },
+): Promise<IssueRecoveryActionRow[]> {
+  if (input.sourceStatus !== "done" && input.sourceStatus !== "cancelled") return [];
+  const now = input.now ?? new Date();
+  const cancelled = input.sourceStatus === "cancelled";
+  const predicates = [
+    eq(issueRecoveryActions.companyId, input.companyId),
+    eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId),
+    inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+    sql`${issueRecoveryActions.cause} not in (${sql.join(
+      [...TERMINAL_SURVIVING_RECOVERY_CAUSES].map((cause) => sql`${cause}`),
+      sql`, `,
+    )})`,
+  ];
+  if (input.actionId) predicates.push(eq(issueRecoveryActions.id, input.actionId));
+  if (input.exceptActionId) predicates.push(ne(issueRecoveryActions.id, input.exceptActionId));
+  return writeExecutionControl(
+    dbOrTx,
+    [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation],
+    (tx) => tx
+      .update(issueRecoveryActions)
+      .set({
+        status: cancelled ? "cancelled" : "resolved",
+        outcome: cancelled ? "cancelled" : "owner_completed",
+        resolutionNote: SOURCE_ISSUE_TERMINAL_RESOLUTION_NOTE,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(...predicates))
+      .returning(),
+  );
 }
 
 export { toReadModel as issueRecoveryActionReadModel };

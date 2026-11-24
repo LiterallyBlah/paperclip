@@ -383,10 +383,23 @@ describe("issue validators", () => {
       sourceIssueStatus: "in_review",
     });
 
+    // Action-only cancellation: any valid status is accepted by the schema;
+    // the route enforces equality with the source's current status under the
+    // source lock (see recovery-terminal-and-access-routing.test.ts).
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "cancelled",
+        sourceIssueStatus: "blocked",
+      }),
+    ).toMatchObject({
+      outcome: "cancelled",
+      sourceIssueStatus: "blocked",
+    });
+
     expect(
       resolveIssueRecoveryActionSchema.safeParse({
         outcome: "cancelled",
-        sourceIssueStatus: "blocked",
+        sourceIssueStatus: "not_a_status",
       }).success,
     ).toBe(false);
 

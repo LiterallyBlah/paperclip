@@ -709,7 +709,12 @@ export const resolveIssueRecoveryActionSchema = z
       return;
     }
 
-    if (value.outcome === "false_positive" || value.outcome === "cancelled") {
+    // Cancelling may also be action-only: a sourceIssueStatus other than
+    // done or in_review must equal the source's current status (checked
+    // by the route under the source lock), so no source transition occurs.
+    if (value.outcome === "cancelled") return;
+
+    if (value.outcome === "false_positive") {
       if (
         value.sourceIssueStatus !== "done" &&
         value.sourceIssueStatus !== "in_review"
