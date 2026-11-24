@@ -309,7 +309,7 @@ export function claudeOAuthClaimRejectedError(): HttpError {
 }
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type SecretBindingDb = Pick<Db | DbTransaction, "select" | "delete" | "insert">;
+type SecretBindingDb = Pick<Db | DbTransaction, "select" | "delete" | "insert" | "update">;
 
 function isUniqueConstraintViolation(error: unknown, constraintName: string) {
   const seen = new Set<unknown>();
@@ -4173,28 +4173,63 @@ export function secretService(db: Db | DbTransaction) {
       }
 
       const pathPrefix = target.pathPrefix ?? "env";
+      // Reconcile rather than replace (same rule as syncSecretRefsForTarget):
+      // declaration IDs are checked against run-manifest `allowedBindingIds`,
+      // so a declaration whose configPath and definition are unchanged keeps
+      // its id and is updated in place. A configPath re-pointed to a different
+      // definition is deleted and re-inserted with a new id, so a manifest
+      // entry that named the old declaration stops covering it.
       const writeDeclarations = async (executor: SecretBindingDb) => {
-        if (options?.replaceAll) {
-          await executor
-            .delete(userSecretDeclarations)
-            .where(and(
-              eq(userSecretDeclarations.companyId, companyId),
-              eq(userSecretDeclarations.targetType, target.targetType),
-              eq(userSecretDeclarations.targetId, target.targetId),
-            ));
-        } else {
-          await executor
-            .delete(userSecretDeclarations)
-            .where(and(
-              eq(userSecretDeclarations.companyId, companyId),
-              eq(userSecretDeclarations.targetType, target.targetType),
-              eq(userSecretDeclarations.targetId, target.targetId),
-              like(userSecretDeclarations.configPath, `${pathPrefix}.%`),
-            ));
+        const existingRows = await executor
+          .select()
+          .from(userSecretDeclarations)
+          .where(and(
+            eq(userSecretDeclarations.companyId, companyId),
+            eq(userSecretDeclarations.targetType, target.targetType),
+            eq(userSecretDeclarations.targetId, target.targetId),
+          ));
+        const inScope = (configPath: string) =>
+          Boolean(options?.replaceAll) || configPath.startsWith(`${pathPrefix}.`);
+        const existingByPath = new Map(
+          existingRows.filter((row) => inScope(row.configPath)).map((row) => [row.configPath, row]),
+        );
+        const deleteIds: string[] = [];
+        const updates: Array<{ id: string; set: Partial<typeof userSecretDeclarations.$inferInsert> }> = [];
+        const inserts: typeof normalizedRefs = [];
+        for (const ref of normalizedRefs) {
+          const row = existingByPath.get(ref.configPath);
+          if (!row) {
+            inserts.push(ref);
+            continue;
+          }
+          existingByPath.delete(ref.configPath);
+          if (row.userSecretDefinitionId !== ref.definitionId) {
+            deleteIds.push(row.id);
+            inserts.push(ref);
+            continue;
+          }
+          const set: Partial<typeof userSecretDeclarations.$inferInsert> = {};
+          if (row.envKey !== ref.envKey) set.envKey = ref.envKey;
+          if (row.versionSelector !== String(ref.versionSelector)) set.versionSelector = String(ref.versionSelector);
+          if (row.required !== ref.required) set.required = ref.required;
+          if (row.allowMissingOverride !== ref.allowMissingOverride) set.allowMissingOverride = ref.allowMissingOverride;
+          if (row.label !== ref.label) set.label = ref.label;
+          if (Object.keys(set).length > 0) updates.push({ id: row.id, set });
         }
-        if (normalizedRefs.length === 0) return;
+        for (const row of existingByPath.values()) deleteIds.push(row.id);
+
+        if (deleteIds.length > 0) {
+          await executor.delete(userSecretDeclarations).where(inArray(userSecretDeclarations.id, deleteIds));
+        }
+        for (const update of updates) {
+          await executor
+            .update(userSecretDeclarations)
+            .set({ ...update.set, updatedAt: new Date() })
+            .where(eq(userSecretDeclarations.id, update.id));
+        }
+        if (inserts.length === 0) return;
         await executor.insert(userSecretDeclarations).values(
-          normalizedRefs.map((ref) => ({
+          inserts.map((ref) => ({
             companyId,
             userSecretDefinitionId: ref.definitionId,
             targetType: target.targetType,
@@ -4823,47 +4858,73 @@ export function secretService(db: Db | DbTransaction) {
 
       const pathPrefixes = [...new Set(normalizedRefs.map((ref) => ref.configPath.split(".")[0]))];
 
+      // Reconcile rather than replace, so unchanged bindings keep their `id`.
+      // Binding IDs are authority-bearing: `secrets:rotate_bound` grants and
+      // run manifests (`allowedBindingIds`) are scoped to an exact binding id.
+      // Rules, matched by configPath within the target and the sync scope:
+      // - same configPath and same secretId: keep the row and its id, and
+      //   update only the changed fields in place;
+      // - same configPath and a different secretId: delete the old row and
+      //   insert a new one with a new id, so a grant or manifest entry that
+      //   named the old binding stops covering the newly bound secret;
+      // - new configPath: insert; in-scope rows not wanted: delete.
       await db.transaction(async (tx) => {
-        if (options?.replaceAll) {
-          await tx
-            .delete(companySecretBindings)
-            .where(
-              and(
-                eq(companySecretBindings.companyId, companyId),
-                eq(companySecretBindings.targetType, target.targetType),
-                eq(companySecretBindings.targetId, target.targetId),
-              ),
-            );
-        } else if (pathPrefixes.length > 0) {
-          for (const pathPrefix of pathPrefixes) {
-            await tx
-              .delete(companySecretBindings)
-              .where(
-                and(
-                  eq(companySecretBindings.companyId, companyId),
-                  eq(companySecretBindings.targetType, target.targetType),
-                  eq(companySecretBindings.targetId, target.targetId),
-                  or(
-                    eq(companySecretBindings.configPath, pathPrefix),
-                    like(companySecretBindings.configPath, `${pathPrefix}.%`),
-                  ),
-                ),
-              );
+        const existingRows = await tx
+          .select()
+          .from(companySecretBindings)
+          .where(
+            and(
+              eq(companySecretBindings.companyId, companyId),
+              eq(companySecretBindings.targetType, target.targetType),
+              eq(companySecretBindings.targetId, target.targetId),
+            ),
+          );
+        const scopeAll = Boolean(options?.replaceAll) || pathPrefixes.length === 0;
+        const inScope = (configPath: string) =>
+          scopeAll ||
+          pathPrefixes.some((prefix) => configPath === prefix || configPath.startsWith(`${prefix}.`));
+        const existingByPath = new Map(
+          existingRows.filter((row) => inScope(row.configPath)).map((row) => [row.configPath, row]),
+        );
+        const deleteIds: string[] = [];
+        const updates: Array<{ id: string; set: Partial<typeof companySecretBindings.$inferInsert> }> = [];
+        const inserts: typeof normalizedRefs = [];
+        for (const ref of normalizedRefs) {
+          const row = existingByPath.get(ref.configPath);
+          if (!row) {
+            inserts.push(ref);
+            continue;
           }
-        } else {
-          await tx
-            .delete(companySecretBindings)
-            .where(
-              and(
-                eq(companySecretBindings.companyId, companyId),
-                eq(companySecretBindings.targetType, target.targetType),
-                eq(companySecretBindings.targetId, target.targetId),
-              ),
-            );
+          existingByPath.delete(ref.configPath);
+          if (row.secretId !== ref.secretId) {
+            deleteIds.push(row.id);
+            inserts.push(ref);
+            continue;
+          }
+          const set: Partial<typeof companySecretBindings.$inferInsert> = {};
+          if (row.versionSelector !== String(ref.versionSelector)) set.versionSelector = String(ref.versionSelector);
+          if (row.required !== ref.required) set.required = ref.required;
+          if (row.label !== ref.label) set.label = ref.label;
+          if (row.projectionClass !== ref.projectionClass) set.projectionClass = ref.projectionClass;
+          if (row.projectionAllowlistKey !== ref.projectionAllowlistKey) {
+            set.projectionAllowlistKey = ref.projectionAllowlistKey;
+          }
+          if (Object.keys(set).length > 0) updates.push({ id: row.id, set });
         }
-        if (normalizedRefs.length === 0) return;
+        for (const row of existingByPath.values()) deleteIds.push(row.id);
+
+        if (deleteIds.length > 0) {
+          await tx.delete(companySecretBindings).where(inArray(companySecretBindings.id, deleteIds));
+        }
+        for (const update of updates) {
+          await tx
+            .update(companySecretBindings)
+            .set({ ...update.set, updatedAt: new Date() })
+            .where(eq(companySecretBindings.id, update.id));
+        }
+        if (inserts.length === 0) return;
         await tx.insert(companySecretBindings).values(
-          normalizedRefs.map((ref) => ({
+          inserts.map((ref) => ({
             companyId,
             secretId: ref.secretId,
             targetType: target.targetType,

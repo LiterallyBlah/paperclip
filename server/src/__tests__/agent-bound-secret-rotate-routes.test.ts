@@ -30,6 +30,7 @@ import { createHttpLogger, logger } from "../middleware/logger.js";
 import { HttpError } from "../errors.js";
 import { secretRoutes } from "../routes/secrets.js";
 import { accessService } from "../services/access.js";
+import { agentService } from "../services/agents.js";
 import { authorizationService, parseBoundSecretRotationScope } from "../services/authorization.js";
 import { secretService } from "../services/secrets.js";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
@@ -411,6 +412,48 @@ describeEmbeddedPostgres("agent bound-secret rotate route", () => {
     expect(JSON.stringify(run.contextSnapshot)).not.toContain(NEW_VALUE);
     expect((run.contextSnapshot as { paperclipSecretRedactions?: Array<{ fingerprintSha256: string }> }).paperclipSecretRedactions)
       .toEqual(expect.arrayContaining([expect.objectContaining({ fingerprintSha256: fingerprint })]));
+  });
+
+  it("keeps a grant on an unchanged env binding working after unrelated adapterConfig edits, and denies it after a re-point", async () => {
+    const companyId = await seedCompany();
+    const caller = await seedAgent(companyId, "Rotator");
+    const svc = secretService(db);
+    const make = (key: string, value: string) => svc.create(companyId, {
+      key, name: `${key} name`, description: "Rotation fixture", provider: "local_encrypted", value,
+    });
+    const target = await make("ENV_TARGET", OLD_VALUE);
+    const other = await make("ENV_OTHER", OTHER_VALUE);
+    const replacement = await make("ENV_REPLACEMENT", OTHER_VALUE);
+    const ref = (secretId: string) => ({ type: "secret_ref" as const, secretId, version: "latest" as const });
+    const setEnv = (env: Record<string, unknown>) => agentService(db).update(caller.agentId, { adapterConfig: { env } });
+
+    await setEnv({ ENV_TARGET: ref(target.id) });
+    const [binding] = await db.select().from(companySecretBindings)
+      .where(eq(companySecretBindings.targetId, caller.agentId));
+    await grant(caller, { secretId: target.id, bindingId: binding.id });
+
+    // Unrelated add, then unrelated remove: the granted binding keeps its id.
+    await setEnv({ ENV_TARGET: ref(target.id), ENV_OTHER: ref(other.id) });
+    expect((await rotate(agentApp(caller), "env_target")).status).toBe(200);
+    await setEnv({ ENV_TARGET: ref(target.id) });
+    expect((await rotate(agentApp(caller), "env_target", { value: "fixture-third-rotate-value" })).status).toBe(200);
+    expect(await resolvedValue(companyId, target.id)).toBe("fixture-third-rotate-value");
+    const [kept] = await db.select().from(companySecretBindings)
+      .where(eq(companySecretBindings.targetId, caller.agentId));
+    expect(kept.id).toBe(binding.id);
+
+    // Re-point the granted path to another secret: a new binding id, so the
+    // old grant covers neither the new binding nor the unbound old secret.
+    await setEnv({ ENV_TARGET: ref(replacement.id) });
+    const [repointed] = await db.select().from(companySecretBindings)
+      .where(eq(companySecretBindings.targetId, caller.agentId));
+    expect(repointed.id).not.toBe(binding.id);
+    const replacementBefore = await secretState(replacement.id);
+    const denyNew = await rotate(agentApp(caller), "env_replacement");
+    expect(denyNew.status).toBe(403);
+    expect((await secretState(replacement.id)).versionCount).toBe(replacementBefore.versionCount);
+    expect((await rotate(agentApp(caller), "env_target")).status).toBe(403);
+    expect(await resolvedValue(companyId, target.id)).toBe("fixture-third-rotate-value");
   });
 
   it("denies a second bound record outside the grant scope and changes nothing", async () => {
