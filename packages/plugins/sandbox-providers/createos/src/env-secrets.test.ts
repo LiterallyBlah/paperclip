@@ -30,7 +30,7 @@ const PROBE = [
   "process.exit(Number(process.env.PROBE_EXIT??0));",
 ].join("");
 
-const config = { apiUrl: "https://createos.example.test", apiKey: "test-secret", shape: "test-shape", timeoutMs: 30_000 };
+const config = { apiUrl: "https://createos.example.test", apiKey: "test-secret", shape: "test-shape", rootfs: null, region: null, timeoutMs: 30_000, reuseLease: false };
 const success = (data: unknown = {}) => Response.json({ status: "success", data });
 const failure = (status: number) => Response.json({ status: "fail", data: "x" }, { status });
 

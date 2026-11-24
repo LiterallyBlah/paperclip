@@ -79,7 +79,7 @@ function expectNoSecretIn(texts: unknown[], secrets: string[]) {
   for (const secret of secrets) expect(haystack).not.toContain(secret);
 }
 
-const staged = () => fs.readdirSync(root).filter((n) => n.startsWith(".paperclip-bridge-"));
+const staged = () => fs.readdirSync(root).filter((n: string) => n.startsWith(".paperclip-bridge-"));
 
 describe("Cloudflare bridge exec keeps env secrets out of the command string and argv (BLA-4139)", () => {
   beforeEach(() => {
