@@ -419,6 +419,11 @@ export function createSecretProposalsService(db: Db) {
         secretProposalId: dependency.id,
       },
     });
+    await publishInteractionCreatedPluginEvent(
+      interaction,
+      { agentId: binding.proposedByAgentId, runId: binding.originRunId },
+      txDb,
+    );
     return linkedBinding;
   }
 
