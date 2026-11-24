@@ -167,7 +167,7 @@ export async function backfillRecoveryCoordinatorOwners(
     const terminalSourceIds = new Set<string>();
     for (const { action, sourceStatus } of openRows) {
       if (isTerminalStatus(sourceStatus)) {
-        if (survivesTerminalSourceIssue(action.cause)) continue;
+        if (survivesTerminalSourceIssue(action)) continue;
         terminalSourceIds.add(action.id);
         result.terminalSourceActionIds.push(action.id);
       } else if (await isUnreadableRoutedOwner(db, action)) {
@@ -202,7 +202,7 @@ export async function backfillRecoveryCoordinatorOwners(
           .for("update");
         if (!current || !isOpen(current)) return false;
         const status = await sourceIssueStatus(tx, current);
-        if (!isTerminalStatus(status) || survivesTerminalSourceIssue(current.cause)) return false;
+        if (!isTerminalStatus(status) || survivesTerminalSourceIssue(current)) return false;
         const rows = await closeRecoveryActionsForTerminalSourceIssue(tx, {
           companyId: current.companyId,
           sourceIssueId: current.sourceIssueId,

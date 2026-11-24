@@ -2739,15 +2739,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const systemEscalated = await seedTerminalAction({ status: "escalated", ownerType: "system", ownerAgentId: null });
     const systemInFlight = await seedTerminalAction({ ownerType: "system", ownerAgentId: null,
       evidence: { runId: f.runId, systemRecovery: createSystemRecovery(f.runId) } });
+    const ownerUnprovable = await seedTerminalAction({ ownerType: "board", ownerAgentId: null,
+      cause: "ownership_owner_unprovable" });
 
     await heartbeatService(db).reconcileStrandedAssignedIssues();
 
     for (const action of [agentNative, systemEscalated]) {
       expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)))[0])
-        .toMatchObject({ status: "resolved", outcome: "restored", resolutionNote: "source_terminal" });
+        .toMatchObject({ status: "resolved", outcome: "owner_completed", resolutionNote: "source_issue_terminal" });
     }
-    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, systemInFlight.id)))[0])
-      .toMatchObject({ status: "active", resolvedAt: null });
+    for (const action of [systemInFlight, ownerUnprovable]) {
+      expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)))[0])
+        .toMatchObject({ status: "active", resolvedAt: null });
+    }
   });
 
   it.each(["settled", "rejected", "late_callback", "provider_transport_failed"] as const)(

@@ -8,6 +8,7 @@ import { and, desc, eq, inArray, isNull, isNotNull, ne, or, sql } from "drizzle-
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issueRecoveryActions, workspaceOperations } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
+import { OWNER_UNPROVABLE_CAUSE } from "./recovery/owner-gone-attestation.js";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -719,17 +720,36 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
 export const SOURCE_ISSUE_TERMINAL_RESOLUTION_NOTE = "source_issue_terminal";
 
 /**
- * A native workspace finalization whose owner is still unverified settles an
- * accepted result after the source issue closed; its native finalizer owns
- * it (recovery reconciliation already skips it). Terminal closure leaves it
- * open; it is never woken while the source is terminal.
+ * Open recovery actions that a closed source issue does not settle. Terminal
+ * closure (the status transition, reconciliation and the owner backfill)
+ * leaves them open; none of them is woken while the source is terminal.
+ *
+ * - A native workspace finalization whose owner is still unverified settles
+ *   an accepted result after the source closed; its native finalizer owns it.
+ * - An owner-unprovable hold: the reserved resource stays reserved however
+ *   the task ends. Only the board's stop confirmation, or the resource's own
+ *   release, settles it.
  */
 const TERMINAL_SURVIVING_RECOVERY_CAUSES: ReadonlySet<string> = new Set([
   "native_workspace_finalization_owner_unverified",
+  OWNER_UNPROVABLE_CAUSE,
 ]);
 
-export function survivesTerminalSourceIssue(cause: string) {
-  return TERMINAL_SURVIVING_RECOVERY_CAUSES.has(cause);
+/** System recovery still in flight keeps its action open past a terminal source. */
+const TERMINAL_HELD_SYSTEM_RECOVERY_STATES = ["scheduled", "running", "awaiting_evidence"] as const;
+
+function systemRecoveryInFlight(evidence: Record<string, unknown> | null | undefined) {
+  const system = evidence?.systemRecovery;
+  if (!system || typeof system !== "object" || Array.isArray(system)) return false;
+  const state = (system as Record<string, unknown>).state;
+  return typeof state === "string"
+    && (TERMINAL_HELD_SYSTEM_RECOVERY_STATES as readonly string[]).includes(state.trim());
+}
+
+export function survivesTerminalSourceIssue(
+  action: { cause: string; evidence?: Record<string, unknown> | null },
+) {
+  return TERMINAL_SURVIVING_RECOVERY_CAUSES.has(action.cause) || systemRecoveryInFlight(action.evidence);
 }
 
 /**
@@ -761,6 +781,10 @@ export async function closeRecoveryActionsForTerminalSourceIssue(
     inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
     sql`${issueRecoveryActions.cause} not in (${sql.join(
       [...TERMINAL_SURVIVING_RECOVERY_CAUSES].map((cause) => sql`${cause}`),
+      sql`, `,
+    )})`,
+    sql`coalesce(btrim(${issueRecoveryActions.evidence} -> 'systemRecovery' ->> 'state'), '') not in (${sql.join(
+      TERMINAL_HELD_SYSTEM_RECOVERY_STATES.map((state) => sql`${state}`),
       sql`, `,
     )})`,
   ];

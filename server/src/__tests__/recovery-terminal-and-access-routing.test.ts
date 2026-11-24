@@ -17,6 +17,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { createSystemRecovery } from "../services/system-recovery-state.js";
+import { OWNER_UNPROVABLE_CAUSE } from "../services/recovery/owner-gone-attestation.js";
 import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { resolveRecoveryOwner } from "../services/recovery/recovery-owner-routing.js";
@@ -208,6 +210,52 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
       expect((await issueRow(fixture.sourceIssueId)).status).toBe("cancelled");
       expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
     });
+  });
+
+  describe("case 1b: guarded rows outlive a terminal source", () => {
+    async function insertGuardedAction(fixture: Fixture, sourceIssueId: string, guard: "owner_unprovable" | "system_in_flight") {
+      const runId = randomUUID();
+      const [row] = await db.insert(issueRecoveryActions).values({
+        companyId: fixture.companyId,
+        sourceIssueId,
+        kind: "active_run_watchdog",
+        status: "active",
+        ownerType: "board",
+        cause: guard === "owner_unprovable" ? OWNER_UNPROVABLE_CAUSE : "process_lost",
+        fingerprint: `guarded:${sourceIssueId}`,
+        evidence: guard === "system_in_flight"
+          ? { runId, systemRecovery: createSystemRecovery(runId) }
+          : { runId },
+        nextAction: "Keep this hold open.",
+      }).returning();
+      return row!;
+    }
+
+    for (const guard of ["owner_unprovable", "system_in_flight"] as const) {
+      for (const terminal of ["done", "cancelled"] as const) {
+        it(`keeps a ${guard} row open when the source moves to ${terminal}, and through reconciliation`, async () => {
+          const fixture = await seed();
+          const guarded = await insertGuardedAction(fixture, fixture.sourceIssueId, guard);
+          // An unguarded row on another source still closes in the same pass.
+          const otherSourceId = await insertIssue(fixture.companyId, fixture.prefix, { assigneeAgentId: fixture.workerId });
+          const unguarded = await boardUpsert(fixture, { sourceIssueId: otherSourceId });
+
+          await issueService(db).update(fixture.sourceIssueId, { status: terminal });
+          expect(await actionRow(guarded.id)).toMatchObject({ status: "active", resolvedAt: null });
+
+          // A row left open on an already-terminal source, as the reconcile loop sees it.
+          await db.update(issues).set({ status: terminal }).where(eq(issues.id, otherSourceId));
+          const enqueueWakeup = vi.fn(async () => null);
+          await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+
+          expect(await actionRow(guarded.id)).toMatchObject({ status: "active", resolvedAt: null });
+          expect(await actionRow(unguarded.id)).toMatchObject({
+            status: terminal === "cancelled" ? "cancelled" : "resolved",
+            resolutionNote: "source_issue_terminal",
+          });
+        });
+      }
+    }
   });
 
   describe("case 2: owner must be able to read the source issue", () => {

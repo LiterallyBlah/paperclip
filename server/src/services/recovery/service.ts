@@ -3789,9 +3789,12 @@ export function recoveryService(
       // A terminal source closes its open actions before anything can wake
       // their owner, whoever owns them. This also settles rows left open by
       // terminal transitions that predate closing them in the transition.
+      // Guarded rows (owner-unprovable holds, an unverified native owner,
+      // system recovery in flight) are not closed here; they take the
+      // guarded path below, which keeps them open.
       if (
         (issue.status === "done" || issue.status === "cancelled") &&
-        !survivesTerminalSourceIssue(row.action.cause)
+        !survivesTerminalSourceIssue(row.action)
       ) {
         const closed = await closeRecoveryActionsForTerminalSourceIssue(db, {
           companyId: row.action.companyId,
