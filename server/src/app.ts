@@ -118,6 +118,7 @@ import { onboardingSeedRoutes } from "./routes/onboarding-seed.js";
 import { boardChatRoutes } from "./routes/board-chat.js";
 import { approvalRoutes } from "./routes/approvals.js";
 import { secretRoutes } from "./routes/secrets.js";
+import { agentSecretRotationGrantRoutes } from "./routes/agent-secret-rotation-grant.js";
 import { toolAccessRoutes } from "./routes/tool-access.js";
 import {
   chatChannelRoutes,
@@ -878,6 +879,7 @@ export async function createApp(
   api.use(voiceSessionRoutes(db, chatChannels.voice));
   api.use(approvalRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(secretRoutes(db));
+  api.use(agentSecretRotationGrantRoutes(db));
   api.use(managedAgentProfileRoutes(db));
   api.use(remoteAgentProfileRoutes(db));
   api.use(
