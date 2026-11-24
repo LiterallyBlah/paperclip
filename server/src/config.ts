@@ -92,6 +92,8 @@ export interface Config extends StorageConfig {
   nestedCloneMigrationDryRun: boolean;
   workspaceReaperCooldownDays: number;
   workspaceCompactionDelayHours: number | null;
+  isolatedCopyReclaimEnabled: boolean;
+  isolatedCopyReclaimDryRun: boolean;
   skillVersionRetentionEnabled: boolean;
   skillVersionRetentionDryRun: boolean;
   skillVersionRetentionKeepNewest: number;
@@ -397,6 +399,10 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
     nestedCloneMigrationDryRun: process.env.PAPERCLIP_NESTED_CLONE_MIGRATION_DRY_RUN === "true",
     workspaceReaperCooldownDays,
     workspaceCompactionDelayHours,
+    // Reclaims finished per-task copy directories (isolated-workspaces/) after
+    // 48 hours. "false" turns it off; DRY_RUN=true only logs each decision.
+    isolatedCopyReclaimEnabled: process.env.PAPERCLIP_ISOLATED_COPY_RECLAIM_ENABLED !== "false",
+    isolatedCopyReclaimDryRun: process.env.PAPERCLIP_ISOLATED_COPY_RECLAIM_DRY_RUN === "true",
     skillVersionRetentionEnabled: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_ENABLED !== "false",
     skillVersionRetentionDryRun: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_DRY_RUN === "true",
     skillVersionRetentionKeepNewest,
