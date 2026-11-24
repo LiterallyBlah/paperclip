@@ -230,6 +230,26 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
     }
   }
 
+  // A later migration may add a nullable column. Retained rows must keep
+  // every value they had; a new column that is still null is not a rewrite.
+  function withoutAddedNullColumns<T extends Record<string, unknown>>(after: T, before: T | undefined): T {
+    if (!before) return after;
+    const result: Record<string, unknown> = {};
+    for (const [table, row] of Object.entries(after)) {
+      const prior = before[table];
+      if (!row || typeof row !== "object" || !prior || typeof prior !== "object") {
+        result[table] = row;
+        continue;
+      }
+      result[table] = Object.fromEntries(
+        Object.entries(row as Record<string, unknown>).filter(
+          ([column, value]) => column in (prior as Record<string, unknown>) || value !== null,
+        ),
+      );
+    }
+    return result as T;
+  }
+
   async function seedRetainedRows(sql: ReturnType<typeof postgres>, withMuse: boolean) {
     const userId = randomUUID(), clientId = `migration-client-${randomUUID()}`;
     const [company] = await sql`INSERT INTO companies (name, issue_prefix) VALUES ('Retained migration company', 'MRG') RETURNING id`;
@@ -319,7 +339,7 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
         const currentHash = await migrationHash(entry.file);
         expect(afterHistory.filter(row => row.hash === currentHash)).toHaveLength(1);
       }
-      if (retainedRows) expect(await retainedRows()).toEqual(beforeRows);
+      if (retainedRows) expect(withoutAddedNullColumns(await retainedRows(), beforeRows)).toEqual(beforeRows);
       const indexes = await sql`
         SELECT c.relname, i.indisvalid, i.indisready, pg_get_indexdef(c.oid) AS definition
         FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -336,7 +356,7 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
       expect((await inspectMigrations(connectionString)).status).toBe("upToDate");
       expect(await historyRows(sql)).toEqual(afterHistory);
       expect(await schemaShape(sql)).toEqual(finalShape);
-      if (retainedRows) expect(await retainedRows()).toEqual(beforeRows);
+      if (retainedRows) expect(withoutAddedNullColumns(await retainedRows(), beforeRows)).toEqual(beforeRows);
     } finally {
       await Promise.all([sql.end(), reference.end()]);
     }

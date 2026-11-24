@@ -22,6 +22,7 @@ function makeCompany(overrides: Partial<Company>): Company {
     logoAssetId: null,
     logoUrl: null,
     defaultResponsibleUserId: null,
+    recoveryCoordinatorAgentId: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,

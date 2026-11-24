@@ -290,7 +290,13 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   // (usually "board"); the resolver decides whether a routine kind goes to the
   // company's recovery coordinator agent instead.
   function routeOwner(
-    input: { companyId: string; kind: string; cause: string },
+    input: {
+      companyId: string;
+      kind: string;
+      cause: string;
+      returnOwnerAgentId?: string | null;
+      previousOwnerAgentId?: string | null;
+    },
     ownerType: IssueRecoveryActionOwnerType,
     ownerAgentId: string | null | undefined,
     ownerUserId: string | null | undefined,
@@ -303,6 +309,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       requestedOwnerType: ownerType,
       requestedOwnerAgentId: ownerAgentId ?? null,
       requestedOwnerUserId: ownerUserId ?? null,
+      sourceAgentId: input.returnOwnerAgentId ?? input.previousOwnerAgentId ?? null,
       now,
     });
   }

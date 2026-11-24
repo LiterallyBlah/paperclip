@@ -68,7 +68,15 @@ const RESERVED_CAUSE_WORDS = [
   "publishing",
   "approval",
 ] as const;
-const RESERVED_CAUSE_PHRASES = ["sign_in", "auth_required", "provider_refusal", "human_approval"] as const;
+const RESERVED_CAUSE_PHRASES = [
+  "sign_in",
+  "auth_required",
+  "provider_refusal",
+  "human_approval",
+  // Missing secrets, an unavailable AI connection or an unready provider
+  // plugin: the fix is a credential or sign-in step, so the board keeps it.
+  "configuration_incomplete",
+] as const;
 
 export type RecoveryOwnerRouteClass = "routine" | "reserved" | "unlisted";
 
@@ -174,6 +182,11 @@ export async function resolveRecoveryOwner(
     requestedOwnerType: IssueRecoveryActionOwnerType;
     requestedOwnerAgentId?: string | null;
     requestedOwnerUserId?: string | null;
+    /**
+     * The source work's own agent. When a person paused that agent, the
+     * pause is a human decision and the board keeps the action.
+     */
+    sourceAgentId?: string | null;
     now?: Date;
   },
 ): Promise<ResolvedRecoveryOwner> {
@@ -185,6 +198,9 @@ export async function resolveRecoveryOwner(
   };
   if (input.requestedOwnerType !== "board") return unchanged;
   if (classifyRecoveryOwnerRoute(input) !== "routine") return unchanged;
+  if (input.sourceAgentId && (await isPausedAgent(db, input.companyId, input.sourceAgentId))) {
+    return unchanged;
+  }
   const routedAt = (input.now ?? new Date()).toISOString();
   const coordinator = await resolveRecoveryCoordinator(db, input.companyId);
   if (coordinator.status === "unavailable") {
@@ -201,6 +217,15 @@ export async function resolveRecoveryOwner(
     ownerUserId: null,
     routing: { coordinator: "assigned", agentId: coordinator.agentId, source: coordinator.source, routedAt },
   };
+}
+
+async function isPausedAgent(db: DbOrTransaction, companyId: string, agentId: string) {
+  const agent = await db
+    .select({ status: agents.status })
+    .from(agents)
+    .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  return agent?.status === "paused";
 }
 
 export function readRecoveryOwnerRouting(

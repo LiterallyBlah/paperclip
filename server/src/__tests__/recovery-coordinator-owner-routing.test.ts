@@ -42,11 +42,12 @@ describe("recovery owner route classification", () => {
       "credential_missing",
       "workspace_deletion_requested",
       "publish_requires_human_approval",
+      "configuration_incomplete",
     ]) {
       expect(classifyRecoveryOwnerRoute({ kind: "active_run_watchdog", cause })).toBe("reserved");
     }
     expect(classifyRecoveryOwnerRoute({ kind: "workspace_validation", cause: "workspace_missing" })).toBe("unlisted");
-    expect(classifyRecoveryOwnerRoute({ kind: "configuration_validation", cause: "configuration_incomplete" })).toBe("unlisted");
+    expect(classifyRecoveryOwnerRoute({ kind: "configuration_validation", cause: "configuration_incomplete" })).toBe("reserved");
   });
 
   it("treats only board or coordinator-routed actions as operator-held", () => {
@@ -235,6 +236,18 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
     const action = await boardUpsert(fixture);
     expect(action).toMatchObject({ ownerType: "board", ownerAgentId: null });
     expect(action.evidence.recoveryOwnerRouting).toMatchObject({ coordinator: "unavailable", reason });
+  });
+
+  it("keeps the board owner when a person paused the source agent", async () => {
+    const fixture = await seed();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, fixture.workerId));
+    const action = await boardUpsert(fixture, { kind: "stranded_assigned_issue", cause: "stranded_assigned_issue" });
+    expect(action).toMatchObject({
+      ownerType: "board",
+      ownerAgentId: null,
+      returnOwnerAgentId: fixture.workerId,
+    });
+    expect(action.evidence).not.toHaveProperty("recoveryOwnerRouting");
   });
 
   it("treats a paused configured coordinator as unavailable", async () => {

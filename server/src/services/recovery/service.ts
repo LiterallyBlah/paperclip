@@ -3796,6 +3796,7 @@ export function recoveryService(
       kind: action.kind,
       cause: action.cause,
       requestedOwnerType: "board",
+      sourceAgentId: action.returnOwnerAgentId ?? action.previousOwnerAgentId ?? null,
       now,
     });
     await db
