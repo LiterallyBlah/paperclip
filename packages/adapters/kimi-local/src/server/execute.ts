@@ -335,11 +335,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return asStringArray(config.args);
   })();
   let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
+  let releaseRemoteWorkspaceSnapshot: (() => Promise<void>) | null = null;
   let localSkillsDir: string | null = null;
   let remoteSkillsDir: string | null = null;
   let remoteRuntimeRootDir: string | null = null;
   let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
 
+  try {
   if (executionTargetIsRemote) {
     try {
       localSkillsDir = await buildKimiSkillsDir(config);
@@ -363,8 +365,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           followSymlinks: true,
         }],
       });
+      let remoteWorkspaceRestore: Promise<void> | null = null;
       restoreRemoteWorkspace = () =>
-        preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line));
+        (remoteWorkspaceRestore = preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line)));
+      releaseRemoteWorkspaceSnapshot = async () => {
+        await remoteWorkspaceRestore?.catch(() => {});
+        await preparedExecutionTargetRuntime.cleanupWorkspaceSnapshot?.();
+      };
       effectiveExecutionCwd = preparedExecutionTargetRuntime.workspaceRemoteDir ?? effectiveExecutionCwd;
       refreshPaperclipWorkspaceEnvForExecution({
         env,
@@ -768,5 +775,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
       ]);
     }
+  }
+  } catch (error) {
+    await releaseRemoteWorkspaceSnapshot?.().catch(() => {});
+    throw error;
   }
 }
