@@ -1438,6 +1438,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/attention/history",
   "GET /api/companies/{companyId}/attention/summary",
   "GET /api/companies/{companyId}/attention/tasks",
+  "GET /api/agents/{id}/secret-rotation-grant",
+  "PUT /api/agents/{id}/secret-rotation-grant",
+  "DELETE /api/agents/{id}/secret-rotation-grant",
   "POST /api/issues/{id}/interactions/{interactionId}/dismiss",
   "POST /api/issues/{id}/retry",
   "GET /api/companies/{companyId}/prompt-injection-prevention",
@@ -3782,6 +3785,71 @@ registry.registerPath({
     },
     401: r.unauthorized,
     403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+const secretRotationGrantViewSchema = z.object({
+  id: z.string().uuid(),
+  permissionKey: z.literal("secrets:rotate_bound"),
+  scope: z.union([z.object({ secretId: z.string(), bindingId: z.string() }), z.unknown()]),
+  scopeValid: z.boolean(),
+  grantedByUserId: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+const secretRotationGrantBodyDoc = z.object({ secretId: z.string().uuid(), bindingId: z.string().uuid() }).strict();
+
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/{id}/secret-rotation-grant",
+  tags: ["agents"],
+  summary: "Read an agent's secrets:rotate_bound grant",
+  description: "Board users only. Returns the one rotate grant of this agent, or null. Never returns secret values.",
+  request: { params: z.object({ id: z.string().uuid() }) },
+  responses: {
+    200: r.ok(z.object({ grant: secretRotationGrantViewSchema.nullable() })),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/agents/{id}/secret-rotation-grant",
+  tags: ["agents"],
+  summary: "Grant an agent secrets:rotate_bound for exactly one directly bound secret",
+  description:
+    "Board users only. The secret must be an active company secret and the binding a direct binding of that secret to this agent. Insert only: an identical board grant returns 200, any other existing rotate grant returns 409 and is never overwritten. Other grants are not changed.",
+  request: { params: z.object({ id: z.string().uuid() }), body: jsonBody(secretRotationGrantBodyDoc) },
+  responses: {
+    200: r.ok(z.object({ created: z.literal(false), grant: secretRotationGrantViewSchema })),
+    201: {
+      description: "Grant created",
+      content: { "application/json": { schema: z.object({ created: z.literal(true), grant: secretRotationGrantViewSchema }) } },
+    },
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/agents/{id}/secret-rotation-grant",
+  tags: ["agents"],
+  summary: "Remove an agent's secrets:rotate_bound grant when its scope matches exactly",
+  description: "Board users only. Deletes only this agent's rotate grant, and only when its scope equals the body. Other grants are not changed.",
+  request: { params: z.object({ id: z.string().uuid() }), body: jsonBody(secretRotationGrantBodyDoc) },
+  responses: {
+    200: r.ok(z.object({ removed: z.literal(true), grantId: z.string().uuid() })),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
     409: r.conflict,
     422: r.unprocessable,
   },
