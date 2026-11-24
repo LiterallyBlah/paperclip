@@ -84,6 +84,8 @@ export interface Config {
   gitCacheExpirationDryRun: boolean;
   workspaceReaperCooldownDays: number;
   workspaceCompactionDelayHours: number | null;
+  isolatedCopyReclaimEnabled: boolean;
+  isolatedCopyReclaimDryRun: boolean;
   skillVersionRetentionEnabled: boolean;
   skillVersionRetentionDryRun: boolean;
   skillVersionRetentionKeepNewest: number;
@@ -394,6 +396,10 @@ export function loadConfig(): Config {
     gitCacheExpirationDryRun: process.env.PAPERCLIP_GIT_CACHE_EXPIRATION_DRY_RUN !== "false",
     workspaceReaperCooldownDays,
     workspaceCompactionDelayHours,
+    // Reclaims finished per-task copy directories (isolated-workspaces/) after
+    // 48 hours. "false" turns it off; DRY_RUN=true only logs each decision.
+    isolatedCopyReclaimEnabled: process.env.PAPERCLIP_ISOLATED_COPY_RECLAIM_ENABLED !== "false",
+    isolatedCopyReclaimDryRun: process.env.PAPERCLIP_ISOLATED_COPY_RECLAIM_DRY_RUN === "true",
     skillVersionRetentionEnabled: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_ENABLED !== "false",
     skillVersionRetentionDryRun: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_DRY_RUN === "true",
     skillVersionRetentionKeepNewest,

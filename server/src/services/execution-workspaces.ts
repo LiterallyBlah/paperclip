@@ -24,6 +24,7 @@ import { authorizationService, executionWorkspaceReadSqlCondition, projectReadSq
 import type { SQL } from "drizzle-orm";
 import { createWorkspaceGitInspectionCache } from "./workspace-git-inspection-cache.js";
 import { notifyTerminalWorkspaceWork, TERMINAL_WORKSPACE_RETRY_MS } from "./terminal-workspace-work.js";
+import { decideIsolatedCopyReclaim, inspectIsolatedCopyDir, isIsolatedCopyWorkspace, ISOLATED_COPY_RECLAIM_MIN_IDLE_MS } from "./isolated-copy-workspace-reclaim.js";
 import {
   deleteWorkspaceCompactionTrash,
   findRegenerableWorkspaceDirs,
@@ -31,6 +32,7 @@ import {
   moveWorkspaceDirsToTrash,
   purgeStaleWorkspaceCompactionTrash,
   restoreWorkspaceDirsFromTrash,
+  WORKSPACE_COMPACTION_TRASH_DIR,
 } from "./workspace-compaction.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -319,6 +321,10 @@ export type ExecutionWorkspaceServiceOptions = {
   // Test hook. Runs after compaction moves directories out of the worktree and
   // before it re-checks the guard under the lifecycle lock.
   afterWorkspaceCompactionMove?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
+  // Reclaims per-task copy directories (`isolated-workspaces/<company>/<issue>`)
+  // of finished trees. Unset disables it. `dryRun` logs each decision and
+  // changes nothing. `minIdleMs` never goes below 48 hours.
+  isolatedCopyReclaim?: { enabled: boolean; dryRun?: boolean; minIdleMs?: number };
   inspectGitCloseReadiness?: (workspace: ExecutionWorkspace) => Promise<{
     git: ExecutionWorkspaceCloseGitReadiness | null;
     warnings: string[];
@@ -2314,6 +2320,200 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     return "compacted";
   }
 
+  // Per-task copy directories: the decision for each directory is cached until
+  // the tree's latest terminal time changes or the retry time passes.
+  const isolatedCopyReclaimMemo = new Map<string, { terminalAt: number; nextAt: number }>();
+  const ISOLATED_COPY_RECHECK_MS = 12 * 60 * 60 * 1000;
+
+  // Reclaims one `isolated-workspaces/<company>/<issue>` copy directory. Every
+  // active row that points at the directory must belong to a terminal tree, no
+  // open issue may use any of those rows, and the latest terminal time must be
+  // older than the idle limit. Then the directory loses its regenerable files,
+  // or, when nothing in it would be lost, the rows are archived and the
+  // directory is removed. Returns what it did.
+  async function reclaimIsolatedCopyWorkspace(
+    workspace: ExecutionWorkspaceRow,
+    signal: AbortSignal | undefined,
+    compact: boolean,
+  ): Promise<{ outcome: "archived" | "compacted" | "kept" | "pending" | "not_terminal" | "deferred"; reasons: string[] }> {
+    const config = opts.isolatedCopyReclaim!;
+    const minIdleMs = Math.max(ISOLATED_COPY_RECLAIM_MIN_IDLE_MS, config.minIdleMs ?? 0);
+    const dir = path.resolve(workspace.cwd!);
+    const sharing = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(and(
+        eq(executionWorkspaces.companyId, workspace.companyId),
+        eq(executionWorkspaces.cwd, workspace.cwd!),
+        inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+        isNull(executionWorkspaces.closedAt),
+      ));
+    if (sharing.length === 0) return { outcome: "not_terminal", reasons: ["no_active_row"] };
+    let latestTerminalAt = 0;
+    for (const row of sharing) {
+      if (!isIsolatedCopyWorkspace(row)) return { outcome: "not_terminal", reasons: ["shared_with_other_layout"] };
+      if (metadataHasReopenPendingConsumption(row.metadata as Record<string, unknown> | null)) {
+        return { outcome: "not_terminal", reasons: ["reopen_pending"] };
+      }
+      const tree = await listWorkspaceIssueTree(row);
+      if (!tree.some((issue) => issue.id === row.sourceIssueId)
+        || tree.some((issue) => !TERMINAL_ISSUE_STATUSES.has(issue.status))) {
+        return { outcome: "not_terminal", reasons: ["open_task"] };
+      }
+      latestTerminalAt = Math.max(latestTerminalAt, ...tree.map((issue) => issueTerminalTimestamp(issue)!.getTime()));
+    }
+    const dueAt = latestTerminalAt + minIdleMs;
+    if (dueAt > now().getTime()) {
+      terminalWorkspaceDeadlines.set(workspace.id, dueAt);
+      return { outcome: "pending", reasons: ["under_48h"] };
+    }
+    const memo = isolatedCopyReclaimMemo.get(dir);
+    if (memo && memo.terminalAt === latestTerminalAt && memo.nextAt > now().getTime()) {
+      return { outcome: "deferred", reasons: ["recently_inspected"] };
+    }
+    for (const row of sharing) {
+      if (await workspaceHasActiveRun(row)) return { outcome: "kept", reasons: ["live_run"] };
+    }
+    const exists = await fs.lstat(dir).then((stat) => stat.isDirectory(), () => false);
+    const inspection = exists
+      ? await inspectIsolatedCopyDir(dir, { signal })
+      : { repos: [], protectedFiles: [], unversionedPaths: [], regenerableDirs: [], truncated: false };
+    const decision = decideIsolatedCopyReclaim(inspection);
+    const logBase = {
+      event: "execution_workspace.isolated_copy_reclaim",
+      executionWorkspaceIds: sharing.map((row) => row.id),
+      sourceIssueId: workspace.sourceIssueId,
+      dir,
+      dryRun: config.dryRun === true,
+      action: decision.action,
+      reasons: decision.reasons,
+      regenerableDirs: inspection.regenerableDirs.length,
+    };
+    if (config.dryRun || !compact) {
+      if (config.dryRun) {
+        logger.info(logBase, "isolated copy workspace reclaim inspected (dry run)");
+        rememberIsolatedCopy(dir, latestTerminalAt);
+      }
+      return { outcome: "kept", reasons: decision.reasons };
+    }
+
+    // Trash left by an interrupted reclaim sits beside the copy directories.
+    const trashParent = path.dirname(dir);
+    const lastPurgedAt = compactionTrashPurgedAt.get(trashParent);
+    if (lastPurgedAt === undefined || now().getTime() - lastPurgedAt >= WORKSPACE_COMPACTION_TRASH_PURGE_INTERVAL_MS) {
+      compactionTrashPurgedAt.set(trashParent, now().getTime());
+      await purgeStaleWorkspaceCompactionTrash(trashParent, WORKSPACE_COMPACTION_TRASH_STALE_MS).catch(() => {});
+    }
+    const sharingIds = sharing.map((row) => row.id).sort();
+    // Runs the guard for every sharing row under all their lifecycle locks.
+    const guarded = async <T>(body: (tx: DbTransaction) => Promise<T>): Promise<T | null> =>
+      db.transaction(async (tx) => {
+        for (const id of sharingIds) await acquireExecutionWorkspaceLifecycleLock(tx, id);
+        const fresh = await tx
+          .select({ id: executionWorkspaces.id, status: executionWorkspaces.status, closedAt: executionWorkspaces.closedAt, metadata: executionWorkspaces.metadata })
+          .from(executionWorkspaces)
+          .where(and(eq(executionWorkspaces.companyId, workspace.companyId), eq(executionWorkspaces.cwd, workspace.cwd!), isNull(executionWorkspaces.closedAt), inArray(executionWorkspaces.status, ["active", "idle", "in_review"])));
+        if (fresh.length !== sharingIds.length || fresh.some((row) => !sharingIds.includes(row.id)
+          || metadataHasReopenPendingConsumption(row.metadata as Record<string, unknown> | null))) return null;
+        for (const row of sharing) {
+          if (!(await terminalWorkspaceCompactionGuardPasses(tx, row))) return null;
+        }
+        const openUsers = await tx.execute(sql`
+          SELECT 1 FROM ${issues}
+          WHERE ${issues.companyId} = ${workspace.companyId}
+            AND ${issues.executionWorkspaceId} IN (${sql.join(sharingIds.map((id) => sql`${id}`), sql`, `)})
+            AND ${issues.status} NOT IN ('done', 'cancelled')
+          LIMIT 1`);
+        if ((openUsers as unknown as unknown[]).length > 0) return null;
+        return body(tx);
+      });
+
+    if (decision.action === "archive") {
+      const trashDir = path.join(path.dirname(dir), WORKSPACE_COMPACTION_TRASH_DIR, `${path.basename(dir)}-${Date.now()}`);
+      const archived = await guarded(async (tx) => {
+        if (exists) {
+          await fs.mkdir(path.dirname(trashDir), { recursive: true });
+          await fs.rename(dir, trashDir);
+        }
+        try {
+          const closedAt = now();
+          const rows = await tx
+            .update(executionWorkspaces)
+            .set({ status: "archived", closedAt, cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | isolated_copy_reclaimed`, updatedAt: closedAt })
+            .where(and(eq(executionWorkspaces.companyId, workspace.companyId), inArray(executionWorkspaces.id, sharingIds)))
+            .returning({ id: executionWorkspaces.id });
+          await tx
+            .update(issues)
+            .set({ executionWorkspaceId: null, updatedAt: closedAt })
+            .where(and(eq(issues.companyId, workspace.companyId), inArray(issues.executionWorkspaceId, sharingIds)));
+          return rows;
+        } catch (error) {
+          if (exists) await fs.rename(trashDir, dir).catch(() => {});
+          throw error;
+        }
+      }).catch(async (error) => {
+        // The transaction did not commit, so the rows stay active: put the
+        // directory back before anything can delete the trash.
+        if (exists) await fs.rename(trashDir, dir).catch(() => {});
+        throw error;
+      });
+      if (!archived) return { outcome: "kept", reasons: ["busy"] };
+      if (exists) {
+        await deleteWorkspaceCompactionTrash(trashDir).catch((error) => {
+          logger.warn({ err: error, trashDir }, "failed to delete reclaimed isolated copy workspace; a later sweep retries");
+        });
+      }
+      for (const row of archived) {
+        terminalWorkspaceDeadlines.delete(row.id);
+        await logActivity(db, {
+          companyId: workspace.companyId,
+          actorType: "system",
+          actorId: "workspace_terminality_reaper",
+          action: "execution_workspace.issue_terminal_archived",
+          entityType: "execution_workspace",
+          entityId: row.id,
+          details: { sourceIssueId: workspace.sourceIssueId, reclaim: "isolated_copy", dir, cleanupReason: ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON },
+        });
+      }
+      isolatedCopyReclaimMemo.delete(dir);
+      logger.info(logBase, "isolated copy workspace removed");
+      return { outcome: "archived", reasons: decision.reasons };
+    }
+
+    if (decision.action === "compact") {
+      // Each move is one rename to trash beside the copy directory.
+      const removed: string[] = [];
+      const moves = await guarded(() => moveWorkspaceDirsToTrash(dir, inspection.regenerableDirs));
+      if (!moves) return { outcome: "kept", reasons: ["busy"] };
+      removed.push(...moves.moved.map((entry) => entry.relativePath));
+      await deleteWorkspaceCompactionTrash(moves.trashDir).catch((error) => {
+        logger.warn({ err: error, trashDir: moves.trashDir }, "failed to delete compacted isolated copy files; a later sweep retries");
+      });
+      rememberIsolatedCopy(dir, latestTerminalAt);
+      if (removed.length > 0) {
+        await logActivity(db, {
+          companyId: workspace.companyId,
+          actorType: "system",
+          actorId: "workspace_terminality_reaper",
+          action: "execution_workspace.regenerable_files_removed",
+          entityType: "execution_workspace",
+          entityId: workspace.id,
+          details: { sourceIssueId: workspace.sourceIssueId, reclaim: "isolated_copy", keptBecause: decision.reasons, removedPaths: removed },
+        });
+      }
+      logger.info({ ...logBase, removed: removed.length }, "isolated copy workspace compacted and kept");
+      return { outcome: removed.length > 0 ? "compacted" : "kept", reasons: decision.reasons };
+    }
+
+    rememberIsolatedCopy(dir, latestTerminalAt);
+    return { outcome: "kept", reasons: decision.reasons };
+  }
+
+  function rememberIsolatedCopy(dir: string, terminalAt: number) {
+    if (isolatedCopyReclaimMemo.size >= 8192) isolatedCopyReclaimMemo.delete(isolatedCopyReclaimMemo.keys().next().value!);
+    isolatedCopyReclaimMemo.set(dir, { terminalAt, nextAt: now().getTime() + ISOLATED_COPY_RECHECK_MS });
+  }
+
   async function cleanupTerminalWorkspace(
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
@@ -3307,6 +3507,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         compactionFailed: 0,
       };
       const readinessByWorkingTree = new Map<string, ReturnType<typeof inspectGitCloseReadiness>>();
+      const isolatedCopyOutcomes = new Map<string, string>();
 
       for (const workspace of candidates) {
         signal?.throwIfAborted();
@@ -3314,6 +3515,28 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // also leaves leftover trash for a later sweep.
         if (options.compact !== false) await purgeCompactionTrashIfDue(workspace);
         else deferCompactionTrashPurge(workspace);
+        if (opts.isolatedCopyReclaim?.enabled && isIsolatedCopyWorkspace(workspace)) {
+          const dir = path.resolve(workspace.cwd!);
+          let outcome = isolatedCopyOutcomes.get(dir);
+          if (outcome === undefined) {
+            try {
+              const reclaim = await reclaimIsolatedCopyWorkspace(workspace, signal, options.compact !== false);
+              outcome = reclaim.outcome;
+              if (outcome === "archived") result.archived += 1;
+              else if (outcome === "compacted") result.compacted += 1;
+              else if (outcome === "kept") result.skippedUndelivered += 1;
+            } catch (error) {
+              if (signal?.aborted) throw error;
+              outcome = "failed";
+              result.compactionFailed += 1;
+              logger.warn({ err: error, executionWorkspaceId: workspace.id, dir }, "isolated copy workspace reclaim failed; a later sweep retries");
+            }
+            isolatedCopyOutcomes.set(dir, outcome);
+          }
+          // An open or recent tree keeps the existing handling. Every other
+          // outcome already covered this directory.
+          if (outcome !== "not_terminal" && outcome !== "pending") continue;
+        }
         const issueTree = await listWorkspaceIssueTree(workspace);
         const sourceIssue = issueTree.find((issue) => issue.id === workspace.sourceIssueId);
         const reopenPending = metadataHasReopenPendingConsumption(
