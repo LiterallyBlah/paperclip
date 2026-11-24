@@ -129,11 +129,11 @@ describeEmbeddedPostgres("issue coverage honesty: deferred wakes behind a recove
   }
 
   async function reviewAttention(companyId: string, issueId: string) {
-    return (await svc.list(companyId, { status: "in_review" })).find((row) => row.id === issueId)?.reviewAttention;
+    return ((await svc.list(companyId, { status: "in_review" })).find((row) => row.id === issueId) as { reviewAttention?: unknown } | undefined)?.reviewAttention;
   }
 
   async function blockerAttention(companyId: string, issueId: string) {
-    return (await svc.list(companyId, { status: "blocked" })).find((row) => row.id === issueId)?.blockerAttention;
+    return ((await svc.list(companyId, { status: "blocked" })).find((row) => row.id === issueId) as { blockerAttention?: unknown } | undefined)?.blockerAttention;
   }
 
   it("identifies only the deferred wake a recovery hold keeps from running", async () => {

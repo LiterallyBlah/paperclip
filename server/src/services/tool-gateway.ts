@@ -134,7 +134,6 @@ import type {
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { publishInteractionCreatedPluginEvent } from "./plugin-decision-events.js";
 import { secretService } from "./secrets.js";
-import type { AuthorizationActor } from "./authorization.js";
 import { createSecretProposalsService } from "./secret-proposals.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {

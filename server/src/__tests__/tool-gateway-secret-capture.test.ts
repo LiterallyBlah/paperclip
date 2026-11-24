@@ -285,7 +285,7 @@ async function fixture(options: { permissions?: Record<string, unknown>; reply?:
     }
     // A client reply to a server request (for example an elicitation cancel).
     if (message.method === undefined) return new Response(null, { status: 202 });
-    const next = reply();
+    const next: ProviderReply = reply();
     if (next.status && next.status >= 400) return new Response(`upstream failure ${SENTINEL}`, { status: next.status });
     if (next.sse) return new Response(next.sse(message.id), { headers: { "content-type": "text/event-stream" } });
     return Response.json({ jsonrpc: "2.0", id: message.id, ...(next.error ? { error: next.error } : { result: next.result }), ...next.extra });

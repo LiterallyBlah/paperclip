@@ -20,7 +20,7 @@ const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
 vi.mock("../middleware/logger.js", () => ({
   logger: {
-    child: vi.fn(function child() { return this; }),
+    child: vi.fn(function child(this: unknown) { return this; }),
     trace: vi.fn(), debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn(),
   },
   httpLogger: vi.fn(),
@@ -72,7 +72,7 @@ describeEmbeddedPostgres("SSH pending-cleanup reconciliation", () => {
       issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
     await db.insert(agents).values({ id: agentId, companyId, name: "PT", role: "engineer", status: "idle",
       adapterType: "claude_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
-    await db.insert(environments).values({ id: environmentId, companyId, name: "SSH host", driver: "ssh",
+    await db.insert(environments).values({ id: environmentId, name: `SSH host ${environmentId}`, driver: "ssh",
       status: "active", config: { host: "build.invalid", port: 22, username: "agent", remoteWorkspacePath: "/srv/work" } });
     return { companyId, agentId, environmentId };
   }

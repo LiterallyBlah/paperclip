@@ -3233,7 +3233,7 @@ describeEmbeddedPostgres("tool access service", () => {
     });
     // API-created with header refs only, so the default organization grant
     // (which invocation uses) carries no matching credential ref.
-    const connection = await service.createConnection(company.id, {
+    const connection = await service.createConnection(company.id, connectionInput({
       name: "Shared bearer fixture",
       transport: "mcp_remote",
       config: { url: "http://127.0.0.1:8848/mcp" },
@@ -3243,7 +3243,7 @@ describeEmbeddedPostgres("tool access service", () => {
         name: "authorization", secretId: secret.id, version: "latest",
         placement: "header", key: "Authorization", prefix: "Bearer ",
       }],
-    });
+    }));
 
     await expect(service.checkHealth(connection.id)).rejects.toMatchObject({
       status: 422,
@@ -3285,11 +3285,11 @@ describeEmbeddedPostgres("tool access service", () => {
       provider: "local_encrypted",
       value: "revoked-grant-test-token",
     });
-    const connection = await service.createConnection(company.id, {
+    const connection = await service.createConnection(company.id, connectionInput({
       name: "Revoked grant fixture",
       transport: "mcp_remote",
       config: { url: "http://127.0.0.1:8848/mcp" },
-    });
+    }));
     await db.update(connectionGrants).set({ status: "revoked", revokedAt: new Date() })
       .where(eq(connectionGrants.connectionId, connection.id));
     await service.updateConnection(connection.id, {
@@ -3314,11 +3314,11 @@ describeEmbeddedPostgres("tool access service", () => {
       provider: "local_encrypted",
       value: "rollback-grant-test-token",
     });
-    const connection = await service.createConnection(company.id, {
+    const connection = await service.createConnection(company.id, connectionInput({
       name: "Rollback grant fixture",
       transport: "mcp_remote",
       config: { url: "http://127.0.0.1:8848/mcp" },
-    });
+    }));
     const defaultGrants = () => db.select().from(connectionGrants).where(and(
       eq(connectionGrants.connectionId, connection.id),
       eq(connectionGrants.kind, "organization"),

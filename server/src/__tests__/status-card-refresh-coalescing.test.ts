@@ -102,7 +102,7 @@ describeEmbeddedPostgres("status card refresh coalescing", () => {
       companyId: company.id,
       createdByUserId: "board-user",
       interestPrompt: "Watched work",
-      queries: [WATCHED_QUERY],
+      queries: [WATCHED_QUERY as unknown as (typeof statusCards.$inferSelect.queries)[number]],
       queryVersion: 1,
       refreshPolicy,
       state: "active",

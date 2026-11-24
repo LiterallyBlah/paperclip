@@ -202,7 +202,7 @@ describeEmbeddedPostgres("secret proposal card cascade", () => {
   /** Rewrites a bundle card into the single-binding card shape that deployed builds raised. */
   async function toLegacyBindingCard(secretProposalId: string, bindingProposalId: string, interactionId: string) {
     const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
-    const payload = card!.payload as Record<string, unknown>;
+    const payload = card!.payload as unknown as Record<string, unknown>;
     const linked = payload.secretProposal as Record<string, unknown>;
     const { kind: _kind, bindings: _bindings, ...legacy } = linked;
     await db.update(issueThreadInteractions).set({

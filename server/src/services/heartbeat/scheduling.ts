@@ -13,7 +13,6 @@ import {
   agentSessionGoalActions,
   agents,
   activityLog,
-  agentWakeupRequests,
 } from "@paperclipai/db";
 import {
   type IssueExecutionMonitorPolicy,
