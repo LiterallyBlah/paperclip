@@ -395,12 +395,24 @@ describeEmbeddedPostgres("review stage participant behind the executor's handed-
       .where(eq(issues.id, s.issueId));
     expect(await getExecutionBlocker(db, s.companyId, s.issueId, { admittingAgentId: s.executorId }))
       .toMatchObject({ cause: HOLD_CAUSE, runId: s.executorRunId });
+    // Continuing or retrying the stopped run stays held.
+    expect(await getExecutionBlocker(db, s.companyId, s.issueId, { admittingAgentId: s.executorId,
+      wake: { wakeId: null, sourceRunIds: [s.executorRunId] } })).toMatchObject({ cause: HOLD_CAUSE, runId: s.executorRunId });
+    const holdBefore = await holdsFor(s);
+    // A new wake is new work, not a replay: it runs, and the stopped run stays stopped.
     await heartbeatService(db).wakeup(s.executorId, {
       source: "automation", triggerDetail: "system", reason: "issue_commented",
       payload: { issueId: s.issueId }, contextSnapshot: { issueId: s.issueId, taskId: s.issueId },
       requestedByActorType: "system", requestedByActorId: "test",
     });
-    expect((await runsFor(s, s.executorId)).map(run => run.id)).toEqual([s.executorRunId]);
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    const executorRuns = await runsFor(s, s.executorId);
+    const newRuns = executorRuns.filter(run => run.id !== s.executorRunId);
+    expect(newRuns.filter(run => !run.retryOfRunId)).toHaveLength(1);
+    expect(newRuns.filter(run => run.retryOfRunId === s.executorRunId)).toEqual([]);
+    expect(executorRuns.find(run => run.id === s.executorRunId)).toMatchObject({ status: "cancelled" });
+    // The executor's hold itself is untouched.
+    expect((await holdsFor(s)).filter(hold => hold.id === holdBefore[0]!.id)).toEqual(holdBefore);
     // Nor does the hold stop gating another agent once it is no longer the stage participant.
     expect(await getExecutionBlocker(db, s.companyId, s.issueId, { admittingAgentId: s.participantId }))
       .toMatchObject({ cause: HOLD_CAUSE });
