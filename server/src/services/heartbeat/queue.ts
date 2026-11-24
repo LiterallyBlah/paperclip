@@ -229,6 +229,9 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 
 export const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+// How long a deferred wake without saved input waits after its holder is gone
+// before the periodic stranded-queue pass releases it through the drain.
+export const STRANDED_CONTENTLESS_WAKE_GRACE_MS = 2 * 60 * 1000;
 
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -1903,15 +1906,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        // A card addressee or a mentioned agent need not own the task. A
+        // former owner's ordinary messages stay for the assignment handoff.
         or(eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
-          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`)))
+          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`,
+          sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
-        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`),
+        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
+        // A wake with no saved input is revisited only after the holder has
+        // been gone for a while, so an ordinary release settles it first.
+        lte(agentWakeupRequests.requestedAt, new Date(Date.now() - STRANDED_CONTENTLESS_WAKE_GRACE_MS))),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
@@ -1921,8 +1930,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const { wake } of strandedQueues) {
-      if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
-          !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
+      const strandedIssueId = String(wake.payload?.issueId);
+      const savedInput = queuedCommentIdsFromWakePayload(wake.payload).length > 0 ||
+        Boolean(await readQueuedInteractionResponse(db, wake.companyId, strandedIssueId, wake.payload));
+      // A card still waiting for its addressee is live input too. The same
+      // stored-row check admits the run, so a resolved card never revives it.
+      const addressedCard = !savedInput && wake.payload?.mutation === "interaction" &&
+        Boolean(await readAddressedInteractionForWake(db, { companyId: wake.companyId, issueId: strandedIssueId,
+          agentId: wake.agentId, contextSnapshot: parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]) }));
+      const contentless = !queuedCommentIdsFromWakePayload(wake.payload).length && wake.payload?.mutation !== "interaction";
+      if (!savedInput && !addressedCard && !(contentless && wake.requestedAt <= new Date(Date.now() - STRANDED_CONTENTLESS_WAKE_GRACE_MS))) continue;
       const [latest] = await db.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, wake.companyId),
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
