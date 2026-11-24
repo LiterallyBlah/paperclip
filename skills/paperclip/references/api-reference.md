@@ -1523,7 +1523,6 @@ Terminal states: `done`, `cancelled`
 | DELETE | `/api/agents/me/secret-proposals/:id` | Withdraw one pending proposal created by the agent |
 | GET    | `/api/agents/me/secrets`             | List secrets accessible to the current run (metadata only) |
 | POST   | `/api/agents/me/secrets/:key/value`  | Fetch one granted secret value; request body is empty |
-| POST   | `/api/agents/me/secrets/:key/rotate` | Rotate one bound secret you hold the exact `secrets:rotate_bound` grant for; run JWT required; body is `{ "value": "..." }` only. Also reachable through the queue and HTTP/2 sandbox bridges |
 
 #### Agent secret proposals
 
