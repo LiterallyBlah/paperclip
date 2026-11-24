@@ -21,6 +21,12 @@ export type LockedIssueExecution = {
    * work stays put and no recovery is planned for it.
    */
   handoffAssigneeAgentId?: string;
+  /**
+   * Set when a settled no-replay hold is the only execution gate. It reports
+   * whether one deferred wake is still held by it: the lost run's own wake,
+   * or a retry or continuation of that run. Other wakes drain normally.
+   */
+  replayHeldWake?: (wake: DeferredWakeCandidate) => boolean;
   primaryIssue: IssueSnapshot;
   run: RunSnapshot;
 };
