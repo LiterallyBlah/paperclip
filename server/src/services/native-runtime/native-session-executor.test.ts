@@ -801,6 +801,12 @@ describe("remote runner process supervision", () => {
     const fixture = join(root, "listener.cjs");
     await writeFile(fixture, 'require("node:net").createServer().listen(0,"127.0.0.1",()=>process.stdout.write("ready\\n"));');
     let child: ReturnType<typeof spawn> | undefined;
+    // The fixture is a direct child of this worker, so after SIGTERM it stays a zombie
+    // (kill -0 succeeds, /proc/<pid>/cmdline is empty) until Node reaps it. A remote
+    // runner is detached and reaped by init, so wait for the reap before probing.
+    let childReaped: Promise<void> | undefined;
+    let terminated = false;
+    let probeInFlight: Promise<unknown> = Promise.resolve();
     let probes = 0;
     let settled = false;
     const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
@@ -808,6 +814,7 @@ describe("remote runner process supervision", () => {
       const label = input.args?.[2];
       if (label === "paperclip-runner-launch") {
         child = spawn(process.execPath, [fixture, "--runner-id", "runner-health"], { stdio: ["ignore", "pipe", "pipe"] });
+        childReaped = new Promise<void>(resolve => child!.once("exit", () => resolve()));
         await new Promise<void>((resolve, reject) => {
           child!.stdout!.once("data", () => resolve());
           child!.once("error", reject);
@@ -817,12 +824,15 @@ describe("remote runner process supervision", () => {
         return ok;
       }
       if (label === "paperclip-runner-monitor" && ++probes === 1) return { ...ok, exitCode: null, timedOut: true };
-      return await new Promise<{ exitCode: number | null; signal: null; timedOut: boolean; stdout: string; stderr: string }>(resolve => {
+      if (label === "paperclip-runner-monitor" && terminated) await childReaped;
+      const probe = new Promise<{ exitCode: number | null; signal: null; timedOut: boolean; stdout: string; stderr: string }>(resolve => {
         execFile(input.command, input.args ?? [], { timeout: 2_000 }, (error, stdout, stderr) => resolve({
           exitCode: error ? typeof error.code === "number" ? error.code : null : 0,
           signal: null, timedOut: !!error?.killed, stdout, stderr,
         }));
       });
+      if (label === "paperclip-runner-monitor") probeInFlight = probe;
+      return await probe;
     });
     const handle = createRemoteRunnerProcessLauncher({
       target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: root },
@@ -837,6 +847,8 @@ describe("remote runner process supervision", () => {
       expect(() => process.kill(child!.pid!, 0)).not.toThrow();
       expect((await readFile(marker, "utf8")).split("\n")[1]).toBe(String(child!.pid));
       expect(execute.mock.calls.filter(([x]) => x.args?.[2] === "paperclip-runner-launch")).toHaveLength(1);
+      terminated = true;
+      await probeInFlight.catch(() => undefined);
       child!.kill("SIGTERM");
       await handle.completion;
       expect(handle.isExitConfirmed?.()).toBe(true);
