@@ -13,6 +13,7 @@ import { copybackOwnerOnAnotherHost, proveCopybackOwnerGone } from "./native-wor
 import { readWorkspaceRecovery } from "../workspace-recovery-receipt.js";
 import { updateSystemRecovery } from "../system-recovery.js";
 import { createSystemRecovery, readSystemRecovery } from "../system-recovery-state.js";
+import { isOperatorHeldRecoveryAction } from "../recovery/recovery-owner-routing.js";
 
 const OWNER_KEY = "nativeWorkspaceFinalizationOwner";
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -62,7 +63,7 @@ export async function resumeNativeWorkspaceAfterOwnerStop(input: {
     if (issue && run && action && readWorkspaceRecovery(action.evidence))
       return confirmRetainedCopybackOwnerStop(tx as unknown as Db, { ...input, confirmation, run, coordinator, action });
     if (!issue || !run || !coordinator || !action || action.evidence?.runId !== run.id
-      || action.cause !== "native_workspace_finalization_owner_unverified" || action.ownerType !== "board"
+      || action.cause !== "native_workspace_finalization_owner_unverified" || !isOperatorHeldRecoveryAction(action)
       || action.kind !== "active_run_watchdog" || !["active", "escalated"].includes(action.status)
       || (coordinator.leaseOwner && (!coordinator.leaseExpiresAt || coordinator.leaseExpiresAt.getTime() > Date.now()))) throw changed();
     const result = await currentNativeWorkspaceRecoveryResult(tx as unknown as Db, {

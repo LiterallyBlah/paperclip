@@ -4,11 +4,12 @@ import { and, desc, eq, or, sql } from "drizzle-orm";
 import { parseObject } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
 import { RESTRICTED_WORKSPACE_SOURCE_REASON } from "./workspace-source-restriction.js";
+import { isOperatorHeldRecoveryAction } from "./recovery/recovery-owner-routing.js";
 
 export async function prepareRestrictedWorkspaceRetry(db: Db, issue: typeof issues.$inferSelect,
   action: IssueRecoveryAction): Promise<{ selection: TaskWorkspaceSelection | null } | null> {
   const sourceRunId = action.evidence?.latestRunId ?? action.evidence?.runId;
-  if (action.ownerType !== "board" || typeof sourceRunId !== "string" || !isUuidLike(sourceRunId)) return null;
+  if (!isOperatorHeldRecoveryAction(action) || typeof sourceRunId !== "string" || !isUuidLike(sourceRunId)) return null;
   const [run] = await db.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,
     contextSnapshot: heartbeatRuns.contextSnapshot, resultJson: heartbeatRuns.resultJson,
     errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error,
@@ -22,7 +23,7 @@ export async function prepareRestrictedWorkspaceRetry(db: Db, issue: typeof issu
   if (!restricted) return null;
   const context = parseObject(run.contextSnapshot);
   const execution = parseObject(result.executionRecovery);
-  if (issue.status !== "blocked" || action.status !== "active" || action.ownerType !== "board"
+  if (issue.status !== "blocked" || action.status !== "active" || !isOperatorHeldRecoveryAction(action)
     || !issue.assigneeAgentId || issue.assigneeAgentId !== action.returnOwnerAgentId
     || run.agentId !== issue.assigneeAgentId || run.status !== "failed"
     || context.issueId !== issue.id || (context.projectId ?? null) !== issue.projectId

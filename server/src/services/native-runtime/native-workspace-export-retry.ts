@@ -16,6 +16,7 @@ import type { EnvironmentRuntimeService } from "../environment-runtime.js";
 import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
 import { readSystemRecovery } from "../system-recovery-state.js";
 import { readWorkspaceRecovery } from "../workspace-recovery-receipt.js";
+import { isOperatorHeldRecoveryAction } from "../recovery/recovery-owner-routing.js";
 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const changed = () => conflict("The recorded export repair is no longer current. Refresh the task and inspect its run.", { code: "workspace_export_retry_stale" });
@@ -35,7 +36,7 @@ export async function retryNativeWorkspaceExport(input: {
     const action = await one(db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId), eq(issueRecoveryActions.id, input.actionId))).limit(1));
     const system = action && readSystemRecovery(action.evidence);
     const recovery = action && readWorkspaceRecovery(action.evidence);
-    const repairOwner = action?.ownerType === "board" || (action?.ownerType === "system"
+    const repairOwner = (action && isOperatorHeldRecoveryAction(action)) || (action?.ownerType === "system"
       && system?.sourceRunId === run?.id && recovery?.runId === run?.id);
     if (!issue || !run || !coordinator || !action || action.evidence?.runId !== run.id
       || action.kind !== "active_run_watchdog" || !isNativeWorkspaceExportRepairCause(action.cause) || !repairOwner
