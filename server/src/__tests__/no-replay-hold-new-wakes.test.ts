@@ -13,6 +13,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
@@ -309,6 +310,28 @@ describeEmbeddedPostgres("a settled no-replay hold blocks only replay of its los
     await comment(s, "Please carry on with the task.");
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     expect(await newRunsFor(s, s.agentA)).toEqual([]);
+    await expectNoReplay(s);
+  });
+
+  it("(5) answering a card raised by the lost run gives the agent one run", async () => {
+    const s = await seed();
+    // The card's sourceRunId names the run that raised it, not a run to retry.
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId, companyId: s.companyId, issueId: s.issueId,
+      kind: "request_confirmation", status: "pending", createdByAgentId: s.agentA, sourceRunId: s.lostRunId,
+      continuationPolicy: "wake_assignee", requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only", resolverPolicyProvenance: "explicit",
+      payload: { version: 1, prompt: "Carry on?", detailsMarkdown: "Answer from the board." },
+    });
+    await request(app(s.companyId)).post(`/api/issues/${s.issueId}/interactions/${interactionId}/accept`)
+      .send({}).expect(200);
+    const runs = await waitFor(() => newRunsFor(s, s.agentA), rows => rows.length > 0);
+    expect(runs).toHaveLength(1);
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    const settled = await newRunsFor(s, s.agentA);
+    expect(settled.map(run => [run.status, run.retryOfRunId])).toEqual([["succeeded", null]]);
+    expect(settled[0]!.contextSnapshot).toMatchObject({ interactionId, sourceRunId: s.lostRunId });
     await expectNoReplay(s);
   });
 });
