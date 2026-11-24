@@ -359,11 +359,12 @@ describe("issue validators", () => {
     const input = { outcome: "restored", sourceIssueStatus };
     expect(resolveIssueRecoveryActionSchema.safeParse(input).success).toBe(false);
     // BLA-4186: a reconciled stopped pending stage may keep `blocked`; the
-    // route admits it only for the settlement's own projection.
+    // route admits it only for the settlement's own projection. BLA-4737: a
+    // cancelled task's retained no-replay hold may be settled as a record only.
     expect(resolveIssueRecoveryActionSchema.safeParse({ ...input, executionReconciliation: {
       runId: "11111111-1111-4111-8111-111111111111", providerStopped: true, actionOutcome: "mixed",
       outcomeEvidence: "Observed and reconciled the source run action outcomes.",
-    } }).success).toBe(sourceIssueStatus === "blocked");
+    } }).success).toBe(sourceIssueStatus === "blocked" || sourceIssueStatus === "cancelled");
     expect(resolveIssueRecoveryActionSchema.safeParse({ ...input, executionReconciliation: {
       runId: "11111111-1111-4111-8111-111111111111", providerStopped: true, actionOutcome: "mixed",
       outcomeEvidence: "Observed and reconciled the source run action outcomes.",

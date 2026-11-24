@@ -110,6 +110,11 @@ export async function validateExecutionReconciliation(input: {
   admission?: { continuationAgentId?: string };
   /** Stopped-stage recovery only: also admit the verified approved-advance source (BLA-2425). */
   admitApprovedAdvance?: boolean;
+  /**
+   * BLA-4737 record-only settlement: verify the same source, owner and
+   * stopped provider, but authorize no continuation (none will be built).
+   */
+  withoutContinuation?: boolean;
 }) {
   const { db, companyId, issueId, agentId, decision } = input;
   if (!decision || decision.runId !== input.sourceRunId || (!agentId && !input.workspaceRepairOnly)) {
@@ -242,7 +247,7 @@ export async function validateExecutionReconciliation(input: {
     throw conflict(
       "The previous execution environment has not finished releasing its authority.",
     );
-  if (!repairOnly) await buildExecutionContinuation({
+  if (!repairOnly && !input.withoutContinuation) await buildExecutionContinuation({
     db,
     companyId,
     issueId,
@@ -286,11 +291,24 @@ export async function markExecutionReconciliation(
   deliveryOwner?:
     | { kind: "chat_failed_run_retry"; actionId: string }
     | PendingStageParticipantDeliveryOwner,
-  options?: { workspaceRepairOnly?: boolean; continuationAgentId?: string },
+  options?: {
+    workspaceRepairOnly?: boolean;
+    continuationAgentId?: string;
+    /**
+     * BLA-4737 record-only settlement: clear a retained no-replay hold on a
+     * done, cancelled or stage-less blocked task without any continuation.
+     * The prior automatic disposition is kept as `previousAutomaticRecovery`.
+     */
+    withoutContinuation?: boolean;
+  },
 ) {
   if (options?.workspaceRepairOnly && (deliveryOwner || !hasRequiredWorkspaceRecovery(action.evidence))) {
     throw conflict("Workspace repair must target the retained source without a continuation owner.");
   }
+  if (options?.withoutContinuation && (deliveryOwner || options.continuationAgentId)) {
+    throw conflict("A record-only settlement cannot name a continuation owner.");
+  }
+  const notRequested = options?.workspaceRepairOnly || options?.withoutContinuation;
   if (deliveryOwner?.kind === "pending_stage_participant") {
     // The route delivers this continuation itself through the stage wake.
     // The generic reconciled-execution worker never delivers "delegated".
@@ -340,12 +358,14 @@ export async function markExecutionReconciliation(
         evidence: {
           ...action.evidence,
           automaticRecovery: undefined,
+          ...(options?.withoutContinuation && action.evidence.automaticRecovery !== undefined
+            ? { previousAutomaticRecovery: action.evidence.automaticRecovery } : {}),
           executionReconciliation: {
             ...decision,
             actorId,
             recordedAt: new Date().toISOString(),
           },
-          continuationDelivery: options?.workspaceRepairOnly ? "not_requested" : deliveryOwner ? "delegated" : "pending",
+          continuationDelivery: notRequested ? "not_requested" : deliveryOwner ? "delegated" : "pending",
           ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
           ...(options?.continuationAgentId ? { continuationAgentId: options.continuationAgentId } : {}),
         },
