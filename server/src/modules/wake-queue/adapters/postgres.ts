@@ -4,7 +4,7 @@ import { readRunCancellation } from "../../../services/run-cancellation.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
-import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
+import { getExecutionBlocker, hasPendingRunCleanup, replaySourceRunIds, wakeClearsReplayOnlyHold, type ReplayOnlyHold } from "../../../services/execution-blocker.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { extractIssueReferenceIdentifiers, isUuidLike } from "@paperclipai/shared";
@@ -904,6 +904,11 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            // A continuation parked behind a recovery hold may never run. New
+            // input must not join it, or the hold would keep that input too.
+            sql`not (coalesce(${agentWakeupRequests.payload} -> 'executionWait' ->> 'reason', '') = 'execution_recovery'
+              and (${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ?| array['previousRunId', 'retryOfRunId', 'failedRunId']
+                or ${agentWakeupRequests.payload} ?| array['previousRunId', 'retryOfRunId', 'failedRunId']))`,
             ...(chatConversationId
               ? [
                   sql`coalesce(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ->> ${CHAT_CONVERSATION_ID_KEY}::text, ${chatConversationId}) = ${chatConversationId}`,
@@ -1234,7 +1239,12 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // A release must leave deferred messages intact while execution is held.
         // The finishing conversation may still own its lease until finally cleanup.
         // Allow only bounded retry planning in that case; admission stays gated.
-        const executionBlocker = await getExecutionBlocker(tx, issueRow.companyId, issueRow.id);
+        // A settled no-replay hold blocks only its lost run. The drain judges
+        // each deferred wake against it instead of stopping the whole task.
+        const replayHolds: ReplayOnlyHold[] = [];
+        const executionBlocker = await getExecutionBlocker(tx, issueRow.companyId, issueRow.id, {
+          onReplayOnlyHold: hold => { replayHolds.push(hold); return true; },
+        });
         const recoveryOnly = Boolean(executionBlocker &&
           executionBlocker.cause === "execution_owner_active" && executionBlocker.runId === run.id &&
           runSnapshot.conversationContinuation && ["failed", "timed_out", "interrupted"].includes(run.status));
@@ -1249,7 +1259,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
-        const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly };
+        const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly,
+          ...(replayHolds.length ? { replayHeldWake: (wake: DeferredWakeCandidate) => {
+            const scope = { wakeId: wake.id, sourceRunIds: replaySourceRunIds(wake.payload, wake.deferredContextSeed) };
+            return replayHolds.some(hold => !wakeClearsReplayOnlyHold(hold, scope));
+          } } : {}) };
         const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
         // Explicit retry admission requires the exact source's task claim.
         // Preserve it only when the existing queue-first recovery policy

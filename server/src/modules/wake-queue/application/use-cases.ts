@@ -178,6 +178,12 @@ async function runReleaseDrain(
       continue;
     }
 
+    // A no-replay hold keeps its lost run's own input and retries in place.
+    if (locked.replayHeldWake?.(candidate)) {
+      preservedWakeIds.push(candidate.id);
+      continue;
+    }
+
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
     // comment ID so coalesced human or unrelated input is never hidden.
@@ -323,6 +329,10 @@ async function runReleaseDrain(
     if (!promoted) continue;
     return promoted;
   }
+
+  // Automatic recovery of the finishing run stays off while a no-replay hold
+  // exists, exactly as before newer wakes could drain past it.
+  if (locked.replayHeldWake) return { outcome: { kind: "released" }, postCommitEffects };
 
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }

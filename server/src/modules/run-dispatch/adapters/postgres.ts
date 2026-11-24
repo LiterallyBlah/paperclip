@@ -1,5 +1,5 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
-import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { getExecutionBlocker, replaySourceRunIds } from "../../../services/execution-blocker.js";
 import { validateReconstructedWorkspaceDispatch } from "../../../services/native-runtime/native-workspace-reconstruction.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
@@ -1055,8 +1055,11 @@ export function createPostgresRunDispatchAdapter(
         } };
       }
     }
+    // A settled no-replay hold still stops its lost run and any retry of it.
     const recovery = await getExecutionBlocker(tx, run.companyId, issueId, {
       conversationResetCommentId: deriveCommentId(contextSnapshot), admittingAgentId: run.agentId,
+      wake: { wakeId: run.wakeupRequestId,
+        sourceRunIds: [run.id, ...(run.retryOfRunId ? [run.retryOfRunId] : []), ...replaySourceRunIds(contextSnapshot)] },
     });
     if (recovery) return { issueId, facts: null, executionBlocker: recovery, decision: { stale: true as const,
       errorCode: "execution_reconciliation_required" as const, reason: recovery.nextAction,

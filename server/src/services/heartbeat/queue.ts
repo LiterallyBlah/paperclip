@@ -35,7 +35,7 @@ import {
   undeliveredLegacyUserCommentIds,
 } from "../explicit-native-continuation.js";
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
-import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.js";
+import { getExecutionBlocker, hasPendingRunCleanup, replaySourceRunIds, wakeClearsReplayOnlyHold, type ReplayOnlyHold } from "../execution-blocker.js";
 import { validateNativeWorkspaceReconstruction } from "../native-runtime/native-workspace-reconstruction.js";
 import { isConversationAdapter } from "../conversation-continuation.js";
 import { recordExecutionWait } from "../execution-wait.js";
@@ -3504,9 +3504,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "deferred" as const };
           };
           const explicitContinuationRunId = randomUUID();
+          // A settled no-replay hold blocks only replay of its lost run. New
+          // input that does not continue that run is admitted normally.
+          const admittedWake = { wakeId: executionWaitRequestId ?? null,
+            sourceRunIds: replaySourceRunIds(enrichedContextSnapshot, payload, { failedRunId: opts.failedRunId }) };
           const executionBlocker = await getExecutionBlocker(
             tx as unknown as Db, issue.companyId, issue.id,
-            { conversationResetCommentId: opts.requestedByActorType === "user" ? wakeCommentId : null, admittingAgentId: agentId },
+            { conversationResetCommentId: opts.requestedByActorType === "user" ? wakeCommentId : null, admittingAgentId: agentId,
+              wake: admittedWake },
           );
           // Prove eligibility without retiring the hold. Later gates can still
           // decline this wake; hold retirement and successor creation stay atomic.
@@ -4373,10 +4378,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // A resumed receipt already passed admission under this issue lock.
           // Consume it with its successor even when chat keeps other messages
           // in separate turns, or finalization will deliver it a second time.
+          const replayHolds: ReplayOnlyHold[] = [];
           const pendingComments =
             (executionWaitRequestId || canCoalesceComments) &&
             (ownsReconstructionContinuation || !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id,
-              { admittingAgentId: agentId })))
+              { admittingAgentId: agentId, onReplayOnlyHold: hold => {
+                replayHolds.push(hold);
+                return wakeClearsReplayOnlyHold(hold, admittedWake);
+              } })))
               ? await tx
                   .select()
                   .from(agentWakeupRequests)
@@ -4398,6 +4407,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             const deferredContext = parseObject(
               deferredPayload[DEFERRED_WAKE_CONTEXT_KEY],
             );
+            // A retry or continuation of a no-replay hold's lost run stays with that hold.
+            const deferredWake = { wakeId: wake.id, sourceRunIds: replaySourceRunIds(deferredPayload, deferredContext) };
+            if (replayHolds.some(hold => !wakeClearsReplayOnlyHold(hold, deferredWake))) return false;
             // Dedicated interaction wakes carry their own source and session
             // contract. ID-only adoption must not erase that continuation.
             return (
