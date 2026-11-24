@@ -419,8 +419,9 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         status: "expired", valueCiphertext: null, ciphertextScrubbedAt: expect.any(Date),
       });
       expect(await proposals.getById(fixture.companyId, binding.id)).toMatchObject({ status: "rejected" });
+      // #53: the binding shares its secret's bundle card, and only the secret resolves it, so the card expires with the secret.
       expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, binding.interactionId!)))
-        .toEqual([expect.objectContaining({ status: "rejected" })]);
+        .toEqual([expect.objectContaining({ status: "expired" })]);
       await quiet();
     });
 
