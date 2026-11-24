@@ -493,6 +493,19 @@ async function createSshAuthArgs(
   };
 }
 
+/**
+ * Local-only entries that never travel to an SSH workspace, at any depth:
+ * dependency installs and agent scratch folders (BLA-4495). They are excluded
+ * from every upload, from the restore baseline and the pull-back, and are
+ * preserved untouched in the local workspace on restore. Each pattern works
+ * both as a GNU/bsd tar `--exclude` (unanchored, `*` matches `/`) and as a
+ * `shouldExcludePath` segment pattern.
+ */
+export const SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES = ["*/node_modules", "*/.scratch-*"] as const;
+
+/** Remote run copies older than this are pruned after each SSH run. */
+export const SSH_RUN_COPY_RETENTION_MINUTES = 48 * 60;
+
 function tarExcludeArgs(exclude: string[] | undefined): string[] {
   const combined = ["._*", ...(exclude ?? [])];
   return combined.flatMap((entry) => ["--exclude", entry]);
@@ -510,7 +523,9 @@ function tarSpawnEnv(): NodeJS.ProcessEnv {
 // We only need approximate fidelity here (the estimate feeds a clamped percent),
 // so we support the literal names and `*`/`?` globs used in practice.
 function tarPatternToRegExp(pattern: string): RegExp {
+  // A leading "*/" means "at any depth"; the walk also tests each basename.
   const escaped = pattern
+    .replace(/^\*\//, "")
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*/g, "[^/]*")
     .replace(/\?/g, "[^/]");
@@ -670,15 +685,39 @@ async function runSshScript(
 async function clearLocalDirectory(
   localDir: string,
   preserveEntries: string[] = [],
+  preserveAnyDepth: readonly string[] = [],
 ): Promise<void> {
   await fs.mkdir(localDir, { recursive: true });
   const preserve = new Set(preserveEntries);
   const entries = await fs.readdir(localDir);
-  await Promise.all(
-    entries
-      .filter((entry) => !preserve.has(entry))
-      .map((entry) => fs.rm(path.join(localDir, entry), { recursive: true, force: true })),
-  );
+  if (preserveAnyDepth.length === 0) {
+    await Promise.all(
+      entries
+        .filter((entry) => !preserve.has(entry))
+        .map((entry) => fs.rm(path.join(localDir, entry), { recursive: true, force: true })),
+    );
+    return;
+  }
+  // Keep entries whose name matches a pattern at any depth: walk real
+  // directories instead of removing them whole, and drop only what is emptied.
+  const keep = preserveAnyDepth.map(tarPatternToRegExp);
+  const clear = async (dir: string, names: string[], top: boolean): Promise<void> => {
+    for (const name of names) {
+      if ((top && preserve.has(name)) || keep.some((regex) => regex.test(name))) continue;
+      const full = path.join(dir, name);
+      const stats = await fs.lstat(full).catch(() => null);
+      if (!stats) continue;
+      if (!stats.isDirectory()) {
+        await fs.rm(full, { force: true });
+        continue;
+      }
+      await clear(full, await fs.readdir(full), false);
+      await fs.rmdir(full).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOTEMPTY" && error.code !== "EEXIST" && error.code !== "ENOENT") throw error;
+      });
+    }
+  };
+  await clear(localDir, entries, true);
 }
 
 async function copyDirectoryContents(sourceDir: string, targetDir: string): Promise<void> {
@@ -1218,7 +1257,7 @@ async function transportGitWorkspaceToSsh(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir: input.remoteDir,
-    exclude: [".git", ".paperclip-runtime", ...(input.exclude ?? [])],
+    exclude: [".git", ".paperclip-runtime", ...SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES, ...(input.exclude ?? [])],
     onProgress: input.onProgress,
     progressLabel: input.progressLabel,
   });
@@ -1599,6 +1638,8 @@ export async function syncDirectoryFromSsh(input: {
   localDir: string;
   exclude?: string[];
   preserveLocalEntries?: string[];
+  /** Local entry-name patterns ("any-depth/name" or "name") kept untouched at any depth. */
+  preserveLocalAnyDepth?: readonly string[];
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<void> {
@@ -1699,7 +1740,7 @@ export async function syncDirectoryFromSsh(input: {
     });
     await progress?.finish();
 
-    await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
+    await clearLocalDirectory(input.localDir, input.preserveLocalEntries, input.preserveLocalAnyDepth);
     await copyDirectoryContents(stagingDir, input.localDir);
   } catch (error) {
     await progress?.fail();
@@ -1760,7 +1801,11 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+    exclude: [
+      ".paperclip-runtime",
+      ...SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES,
+      ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : []),
+    ],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
@@ -1894,8 +1939,9 @@ async function restoreWorkspaceRootFromSsh(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ".paperclip-runtime", ...projectRepositoryEntries],
+      exclude: [".git", ".paperclip-runtime", ...SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES, ...projectRepositoryEntries],
       preserveLocalEntries: [".git", ...projectRepositoryEntries],
+      preserveLocalAnyDepth: SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES,
       onProgress: input.onProgress,
       progressLabel: input.progressLabel,
     });
@@ -1906,10 +1952,35 @@ async function restoreWorkspaceRootFromSsh(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [".paperclip-runtime", ...SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES],
+    preserveLocalAnyDepth: SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES,
     onProgress: input.onProgress,
     progressLabel: input.progressLabel,
   });
+}
+
+/**
+ * Removes run copies (direct children of `runsDir`) older than the retention
+ * window, never `currentRunId`, never anything outside `runsDir`. Best effort:
+ * a failure logs a warning and never fails the run.
+ */
+export async function pruneSshRunCopies(input: {
+  spec: SshConnectionConfig;
+  runsDir: string;
+  currentRunId: string;
+  retentionMinutes?: number;
+}): Promise<void> {
+  const minutes = Math.max(1, Math.floor(input.retentionMinutes ?? SSH_RUN_COPY_RETENTION_MINUTES));
+  const runsDir = shellQuote(input.runsDir);
+  const script = [
+    `[ -d ${runsDir} ] || exit 0`,
+    `find ${runsDir} -mindepth 1 -maxdepth 1 -type d -mmin +${minutes} ! -name ${shellQuote(input.currentRunId)} -exec rm -rf -- {} +`,
+  ].join("\n");
+  try {
+    await runSshScript(input.spec, script, { timeoutMs: 120_000, maxBuffer: 256 * 1024 });
+  } catch (error) {
+    console.warn(`[paperclip] Could not prune old SSH run copies in ${input.runsDir}; continuing. ${String(error)}`);
+  }
 }
 
 export async function ensureSshWorkspaceReady(

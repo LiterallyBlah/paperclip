@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const {
   prepareWorkspaceForSshExecution,
+  pruneSshRunCopies,
   restoreWorkspaceFromSshExecution,
   runSshCommand,
   syncDirectoryToSsh,
@@ -16,13 +17,16 @@ const {
     stderr: "",
   })),
   syncDirectoryToSsh: vi.fn(async (_input: { localDir: string }) => undefined),
+  pruneSshRunCopies: vi.fn(async () => undefined),
 }));
 
 vi.mock("./ssh.js", () => ({
   prepareWorkspaceForSshExecution,
+  pruneSshRunCopies,
   restoreWorkspaceFromSshExecution,
   runSshCommand,
   syncDirectoryToSsh,
+  SSH_WORKSPACE_LOCAL_ONLY_EXCLUDES: ["*/node_modules", "*/.scratch-*"],
 }));
 
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
@@ -32,7 +36,7 @@ import { setExpensiveWorkspaceGitExecutor } from "./git-workspace-sync.js";
 describe("remote managed runtime", () => {
   const cleanupDirs: string[] = [];
 
-  it("stages all files over SSH without Git or cache exclusions and restores the same baseline", async () => {
+  it("stages all files over SSH without Git exclusions, but never node_modules or .scratch-* (BLA-4495), and restores the same baseline", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-plain-"));
     cleanupDirs.push(root);
     await mkdir(path.join(root, "node_modules"));
@@ -50,12 +54,16 @@ describe("remote managed runtime", () => {
     await prepared.restoreWorkspace();
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({
       restoreGitHistory: false, baselineSnapshot: expect.objectContaining({
-        exclude: [".paperclip-runtime", "explicitly-excluded"],
+        exclude: [".paperclip-runtime", "*/node_modules", "*/.scratch-*", "explicitly-excluded"],
         entries: expect.any(Map),
       }),
     }));
     const args = vi.mocked(restoreWorkspaceFromSshExecution).mock.calls[0] as unknown as [{ baselineSnapshot: { entries: Map<string, unknown> } }];
-    expect(args[0].baselineSnapshot.entries.has("node_modules/personal.bin")).toBe(true);
+    expect(args[0].baselineSnapshot.entries.has("node_modules/personal.bin")).toBe(false);
+    expect(args[0].baselineSnapshot.entries.has(".gitignore")).toBe(true);
+    expect(pruneSshRunCopies).toHaveBeenCalledWith(expect.objectContaining({
+      runsDir: "/app/.paperclip-runtime/runs", currentRunId: "plain",
+    }));
   });
 
 
