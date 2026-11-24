@@ -136,6 +136,8 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/agents\/[^/]+\/skills$/ },
   { method: "POST", path: /^\/api\/agents\/[^/]+\/skills\/sync$/ },
   { method: "PATCH", path: /^\/api\/agents\/[^/]+\/instructions-path$/ },
+  // Self-rotate of a bound secret; the controller enforces live-run auth, the exact-secret/direct-binding grant, the strict value-only body and log suppression.
+  { method: "POST", path: /^\/api\/agents\/me\/secrets\/[^/]+\/rotate$/ },
 
   // Read-only schema discovery for validated control-plane requests.
   { method: "GET", path: /^\/api\/openapi\.json$/ },
