@@ -237,7 +237,7 @@ test("the real routing step uses pinned trusted definitions and defaults to full
     writeFileSync(path.join(directory, "git"), `#!/usr/bin/env node
 const {spawnSync}=require('node:child_process');
 if(process.env.TEST_GIT_FAILURE==='true')process.exit(1);
-const args=process.argv.slice(2).map(a=>a==='https://github.com/paperclipai/paperclip.git'?process.env.TEST_GIT_REPOSITORY:a);
+const args=process.argv.slice(2).map(a=>a==='https://github.com/'+process.env.PLAN_REPOSITORY+'.git'?process.env.TEST_GIT_REPOSITORY:a);
 const r=spawnSync(${JSON.stringify(gitBin)},args,{stdio:'inherit'});process.exit(r.status??1);
 `);
     chmodSync(path.join(directory, "git"), 0o755);
@@ -245,8 +245,9 @@ const r=spawnSync(${JSON.stringify(gitBin)},args,{stdio:'inherit'});process.exit
     writeFileSync(gh, `#!/usr/bin/env node
 const fs = require('node:fs'), path = require('node:path');
 const endpoint = process.argv.find(arg => arg.startsWith('/repos/'));
-if (endpoint?.endsWith('/git/ref/heads/master')) console.log('a'.repeat(40));
-else if (endpoint?.includes('/contents/')) {
+if (!endpoint?.startsWith('/repos/' + process.env.PLAN_REPOSITORY + '/')) process.exit(4);
+if (endpoint.endsWith('/git/ref/heads/' + process.env.PLAN_BASE_REF)) console.log('a'.repeat(40));
+else if (endpoint.includes('/contents/')) {
   if (process.env.TEST_FETCH_FAILURE === 'true') process.exit(1);
   const [file, query] = endpoint.split('/contents/')[1].split('?');
   if (query !== 'ref=' + 'a'.repeat(40)) process.exit(2);
@@ -255,19 +256,19 @@ else if (endpoint?.includes('/contents/')) {
 else process.exit(3);
 `);
     chmodSync(gh, 0o755);
-    for (const overrides of [{}, { TEST_FETCH_FAILURE: "true" }, { TEST_GIT_FAILURE: "true" }, { PROFILE_CI: "true" }, { STACK_JSON: "{}" }, { FULL_CI: "false" }]) {
+    for (const overrides of [{}, { TEST_FETCH_FAILURE: "true" }, { TEST_GIT_FAILURE: "true" }, { PROFILE_CI: "true" }, { STACK_JSON: "{}" }, { FULL_CI: "false" }, { PLAN_BASE_REF: "" }, { PLAN_BASE_REF: "bad ref" }]) {
       const output = path.join(directory, "output");
       writeFileSync(output, "");
       const result = spawnSync("bash", ["-c", shell], { encoding: "utf8", env: {
         ...process.env, PATH: `${directory}:${process.env.PATH}`, TEST_TRUSTED_ROOT: root.pathname,
         RUNNER_TEMP: directory, FULL_CI: "true", PROFILE_CI: "false", FORCE_FULL_CI: "false",
         CI_INCREMENTAL_MODE: "enabled", STACK_JSON: "null", EVENT_BASE_SHA: "b".repeat(40), EVENT_HEAD_SHA: prHead, EVENT_MERGE_SHA: merge,
-        TEST_GIT_REPOSITORY: repository,
+        TEST_GIT_REPOSITORY: repository, PLAN_REPOSITORY: "LiterallyBlah/paperclip", PLAN_BASE_REF: "blahsec-integration",
         GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: "", ...overrides,
       } });
       assert.equal(result.status, 0, result.stderr);
       const value = readFileSync(output, "utf8").trim();
-      if (overrides.TEST_FETCH_FAILURE || overrides.TEST_GIT_FAILURE || overrides.FULL_CI === "false") assert.equal(value, "plan=");
+      if (overrides.TEST_FETCH_FAILURE || overrides.TEST_GIT_FAILURE || overrides.FULL_CI === "false" || "PLAN_BASE_REF" in overrides) assert.equal(value, "plan=");
       else {
         assert.notEqual(value, "plan=", `${JSON.stringify(overrides)}: ${result.stderr}`);
         const resultPlan = JSON.parse(value.slice("plan=".length));
