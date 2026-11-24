@@ -163,6 +163,7 @@ import {
   carryRecoveryCoordinatorDelivery,
   isAvailableRecoveryCoordinatorStatus,
   isCoordinatorRoutedRecoveryAction,
+  isOrphanedCoordinatorRoutedRecoveryAction,
   isOperatorHeldRecoveryAction,
   readRecoveryOwnerRouting,
   RECOVERY_COORDINATOR_REWAKE_MS,
@@ -3625,9 +3626,14 @@ export function recoveryService(
     action: typeof issueRecoveryActions.$inferSelect,
     now = new Date(),
   ) {
-    if (!isCoordinatorRoutedRecoveryAction(action) || !action.ownerAgentId) return action;
-    const coordinatorAgent = await getAgent(action.ownerAgentId);
+    const orphaned = isOrphanedCoordinatorRoutedRecoveryAction(action);
+    if (!orphaned && (!isCoordinatorRoutedRecoveryAction(action) || !action.ownerAgentId)) return action;
+    const previousRouting = readRecoveryOwnerRouting(action.evidence);
+    const previousCoordinatorAgentId = action.ownerAgentId
+      ?? (previousRouting?.coordinator === "assigned" ? previousRouting.agentId : undefined);
+    const coordinatorAgent = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
     if (
+      !orphaned &&
       coordinatorAgent &&
       coordinatorAgent.companyId === action.companyId &&
       isAvailableRecoveryCoordinatorStatus(coordinatorAgent.status)
@@ -3652,7 +3658,7 @@ export function recoveryService(
         coordinator: "unavailable",
         reason: resolved.routing?.coordinator === "unavailable" ? resolved.routing.reason : unavailableReason,
         routedAt: now.toISOString(),
-        previousCoordinatorAgentId: action.ownerAgentId,
+        previousCoordinatorAgentId,
       };
     const [updated] = await db
       .update(issueRecoveryActions)
@@ -3667,7 +3673,9 @@ export function recoveryService(
         eq(issueRecoveryActions.id, action.id),
         eq(issueRecoveryActions.companyId, action.companyId),
         eq(issueRecoveryActions.ownerType, "agent"),
-        eq(issueRecoveryActions.ownerAgentId, action.ownerAgentId),
+        action.ownerAgentId
+          ? eq(issueRecoveryActions.ownerAgentId, action.ownerAgentId)
+          : isNull(issueRecoveryActions.ownerAgentId),
         inArray(issueRecoveryActions.status, ["active", "escalated"]),
       ))
       .returning();

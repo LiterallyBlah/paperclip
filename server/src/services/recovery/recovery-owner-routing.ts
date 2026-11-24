@@ -285,6 +285,21 @@ export function isCoordinatorRoutedRecoveryAction(action: {
 }
 
 /**
+ * True when the action was routed to a coordinator that has since been
+ * deleted: `owner_agent_id` is `ON DELETE SET NULL`, so the row keeps
+ * `ownerType: "agent"` and its assigned routing evidence but has no owner
+ * agent. Reconciliation must return it to the board.
+ */
+export function isOrphanedCoordinatorRoutedRecoveryAction(action: {
+  ownerType: string;
+  ownerAgentId: string | null;
+  evidence: Record<string, unknown> | null | undefined;
+}) {
+  const routing = readRecoveryOwnerRouting(action.evidence);
+  return action.ownerType === "agent" && action.ownerAgentId === null && routing?.coordinator === "assigned";
+}
+
+/**
  * True for an action held for an operator decision: board-owned, or owned by
  * the recovery coordinator through routing. Automatic repair flows that act
  * only on operator-held actions use this instead of `ownerType === "board"`,

@@ -512,6 +512,52 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
     expect(attention).toContain(action.id);
   });
 
+  it.each([
+    [null, "coordinator_not_configured"],
+    ["other", null],
+  ] as const)("handles a routed action whose coordinator row was deleted (configured=%s)", async (configured, reason) => {
+    const fixture = await seed();
+    const action = await boardUpsert(fixture);
+    expect(action).toMatchObject({ ownerType: "agent", ownerAgentId: fixture.ceoId });
+    if (configured === "other") {
+      await db.update(companies).set({ recoveryCoordinatorAgentId: fixture.otherId }).where(eq(companies.id, fixture.companyId));
+    }
+    // owner_agent_id is ON DELETE SET NULL: the row keeps ownerType "agent"
+    // and its assigned routing evidence, with no owner agent.
+    await db.delete(agents).where(eq(agents.id, fixture.ceoId));
+    const orphaned = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)).then((rows) => rows[0]!);
+    expect(orphaned).toMatchObject({ ownerType: "agent", ownerAgentId: null });
+    expect(orphaned.evidence.recoveryOwnerRouting).toMatchObject({ coordinator: "assigned", agentId: fixture.ceoId });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+    const after = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)).then((rows) => rows[0]!);
+    const attention = (await attentionService(db).list(fixture.companyId, { userId: "board-user" })).items
+      .filter((item) => item.sourceKind === "recovery_action")
+      .map((item) => item.subject.id);
+    expect(after).toMatchObject({
+      status: action.status,
+      previousOwnerAgentId: fixture.workerId,
+      returnOwnerAgentId: fixture.workerId,
+      attemptCount: action.attemptCount,
+    });
+    if (configured === "other") {
+      expect(after).toMatchObject({ ownerType: "agent", ownerAgentId: fixture.otherId });
+      expect(after.evidence.recoveryOwnerRouting).toMatchObject({ coordinator: "assigned", agentId: fixture.otherId });
+      expect(enqueueWakeup.mock.calls.filter(([agentId]) => agentId === fixture.otherId)).toHaveLength(1);
+      expect(attention).not.toContain(action.id);
+    } else {
+      expect(after).toMatchObject({ ownerType: "board", ownerAgentId: null, ownerUserId: null });
+      expect(after.evidence.recoveryOwnerRouting).toMatchObject({
+        coordinator: "unavailable",
+        reason,
+        previousCoordinatorAgentId: fixture.ceoId,
+      });
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      expect(attention).toContain(action.id);
+    }
+  });
+
   it("re-routes to the configured coordinator when the original one becomes unavailable", async () => {
     const fixture = await seed();
     const action = await boardUpsert(fixture);
