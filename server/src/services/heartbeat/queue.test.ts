@@ -1076,10 +1076,12 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     });
 
     it("waits out the grace period before releasing a fresh content-less wake", async () => {
+      // Upstream 1117 (#20180) releases dependency-resolved wakes at once, so the
+      // grace window is shown on a wake that is not a dependency wake.
       const { company, agent, issue } = await heldThenGone();
       const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
         source: "automation", reason: "issue_execution_deferred", status: "deferred_issue_execution",
-        payload: { issueId: issue.id, _paperclipWakeContext: { issueId: issue.id, wakeReason: "issue_children_completed" } },
+        payload: { issueId: issue.id, _paperclipWakeContext: { issueId: issue.id, wakeReason: "issue_assigned" } },
       }).returning();
       const deps = callbacks(db);
       await createHeartbeatQueue(db, deps).resumeQueuedRuns();
