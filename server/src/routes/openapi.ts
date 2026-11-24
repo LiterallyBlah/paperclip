@@ -7042,6 +7042,20 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/instance/heartbeat-runs/{runId}/administrative-stop-reconciliation",
+  tags: ["instance"],
+  summary: "Record an administrative stop reconciliation for one historical cancelled legacy run",
+  description:
+    "Instance admins only. Writes resultJson.administrativeStopReconciliation once, only when the run is a cancelled legacy run with no process, session, exit, retained execution event, coordinator, provider handoff or unsettled lease, its controller boot is not the current one, and no live server-uid process was born near the run. It never writes executor receipts. 409 reports the refusal code.",
+  request: {
+    params: z.object({ runId: z.string().uuid() }),
+    body: jsonBody(z.object({ companyId: z.string().uuid(), decisionRef: z.string().min(1).max(200), reason: z.string().min(1).max(2000) }).strict()),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/instance/lifecycle",
   tags: ["instance"],
