@@ -408,8 +408,20 @@ describeEmbeddedPostgres("review stage participant behind the executor's handed-
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     const executorRuns = await runsFor(s, s.executorId);
     const newRuns = executorRuns.filter(run => run.id !== s.executorRunId);
-    expect(newRuns.filter(run => !run.retryOfRunId)).toHaveLength(1);
-    expect(newRuns.filter(run => run.retryOfRunId === s.executorRunId)).toEqual([]);
+    // Exactly one run answers the new comment. Later runs may be platform
+    // follow-ups of that new run (for example disposition repair, because the
+    // mocked adapter records no disposition); those are not replays.
+    const commentRuns = newRuns.filter(run =>
+      (run.contextSnapshot as Record<string, unknown>).wakeReason === "issue_commented");
+    expect(commentRuns).toHaveLength(1);
+    expect(commentRuns[0]!.retryOfRunId).toBeNull();
+    // No run retries or continues the stopped run, by column or by context.
+    const lostRunRefs = (run: (typeof newRuns)[number]) => {
+      const ctx = run.contextSnapshot as Record<string, unknown>;
+      return [run.retryOfRunId, ctx.retryOfRunId, ctx.failedRunId, ctx.previousRunId,
+        ctx.dispositionRepairSourceRunId].includes(s.executorRunId);
+    };
+    expect(newRuns.filter(lostRunRefs)).toEqual([]);
     expect(executorRuns.find(run => run.id === s.executorRunId)).toMatchObject({ status: "cancelled" });
     // The executor's hold itself is untouched.
     expect((await holdsFor(s)).filter(hold => hold.id === holdBefore[0]!.id)).toEqual(holdBefore);
