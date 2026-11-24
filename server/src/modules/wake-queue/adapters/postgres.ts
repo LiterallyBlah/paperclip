@@ -907,8 +907,8 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             // A continuation parked behind a recovery hold may never run. New
             // input must not join it, or the hold would keep that input too.
             sql`not (coalesce(${agentWakeupRequests.payload} -> 'executionWait' ->> 'reason', '') = 'execution_recovery'
-              and (${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ?| array['previousRunId', 'retryOfRunId', 'failedRunId', 'sourceRunId']
-                or ${agentWakeupRequests.payload} ?| array['previousRunId', 'retryOfRunId', 'failedRunId', 'sourceRunId']))`,
+              and (${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ?| array['previousRunId', 'retryOfRunId', 'failedRunId']
+                or ${agentWakeupRequests.payload} ?| array['previousRunId', 'retryOfRunId', 'failedRunId']))`,
             ...(chatConversationId
               ? [
                   sql`coalesce(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ->> ${CHAT_CONVERSATION_ID_KEY}::text, ${chatConversationId}) = ${chatConversationId}`,

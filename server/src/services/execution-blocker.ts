@@ -125,7 +125,8 @@ export function readReplayOnlyHold(
   return { recoveryActionId: action.id, runId: runId.data };
 }
 
-const REPLAY_SOURCE_RUN_KEYS = ["retryOfRunId", "failedRunId", "previousRunId", "sourceRunId"] as const;
+// A top-level `sourceRunId` names the run that raised a card or comment, not a retried run.
+const REPLAY_SOURCE_RUN_KEYS = ["retryOfRunId", "failedRunId", "previousRunId"] as const;
 
 /** Run ids a wake or run continues, retries or replays. */
 export function replaySourceRunIds(...records: Array<Record<string, unknown> | null | undefined>): string[] {
