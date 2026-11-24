@@ -22,10 +22,10 @@ vi.mock("@/context/SidebarContext", () => ({ useSidebar: () => ({ collapsed: fix
 vi.mock("@/api/attention", () => ({ attentionApi: { list: fixture.attention, summary: fixture.summary } }));
 vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: async () => ({ enableCases: fixture.enableCases, enableStatusCards: fixture.enableStatusCards, enableGoalsSidebarLink: fixture.enableGoalsSidebarLink }) } }));
 vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: "company", selectedCompany: { id: "company", issuePrefix: "COO" } }) }));
-vi.mock("@/plugins/slots", () => ({ PluginSlotOutlet: ({ slotTypes, context }: { slotTypes: string[]; context: Record<string, unknown> }) =>
-  <div data-testid="plugin-slot-outlet" data-slot-types={slotTypes.join(",")} data-context={JSON.stringify(context)} /> }));
-vi.mock("@/plugins/launchers", () => ({ PluginLauncherOutlet: ({ placementZones, context }: { placementZones: string[]; context: Record<string, unknown> }) =>
-  <div data-testid="plugin-launcher-outlet" data-placement-zones={placementZones.join(",")} data-context={JSON.stringify(context)} /> }));
+vi.mock("@/plugins/slots", () => ({ PluginSlotOutlet: ({ slotTypes, context, itemClassName }: { slotTypes: string[]; context: Record<string, unknown>; itemClassName?: string }) =>
+  <div data-testid="plugin-slot-outlet" data-slot-types={slotTypes.join(",")} data-context={JSON.stringify(context)}><div data-testid="plugin-slot-item" className={itemClassName} /></div> }));
+vi.mock("@/plugins/launchers", () => ({ PluginLauncherOutlet: ({ placementZones, context, itemClassName }: { placementZones: string[]; context: Record<string, unknown>; itemClassName?: string }) =>
+  <div data-testid="plugin-launcher-outlet" data-placement-zones={placementZones.join(",")} data-context={JSON.stringify(context)}><div data-testid="plugin-launcher-item" className={itemClassName} /></div> }));
 vi.mock("@/api/projects", () => ({ projectsApi: { list: async () => fixture.projects } }));
 vi.mock("./SidebarCompanyMenu", () => ({ SidebarCompanyMenu: () => null }));
 vi.mock("@/lib/router", () => ({
@@ -136,6 +136,19 @@ describe("Coordinator pinned pages", () => {
     const launchers = navigation().querySelector('[data-testid="plugin-launcher-outlet"]');
     expect(launchers?.getAttribute("data-placement-zones")).toBe("sidebar");
     expect(JSON.parse(launchers!.getAttribute("data-context")!)).toEqual({ companyId: "company", companyPrefix: "COO" });
+  });
+  it("insets plugin sidebar rows once, like native rows", async () => {
+    await renderSidebar();
+    // Plugin sidebar pages render their own SidebarNavItem-style link (`mx-2 px-2`), so the
+    // slot wrapper must not add the row inset again. Launchers render a full-width button with
+    // its own padding, so their wrapper supplies only the outer margin.
+    const slotItem = navigation().querySelector('[data-testid="plugin-slot-item"]')!;
+    expect(slotItem.classList.contains("design-sidebar-item")).toBe(false);
+    expect(slotItem.classList.contains("design-sidebar-plugin-item")).toBe(true);
+    expect([...slotItem.classList].some(name => /^-?(m|p)[xlrse]?-/.test(name))).toBe(false);
+    const launcherItem = navigation().querySelector('[data-testid="plugin-launcher-item"]')!;
+    expect(launcherItem.classList.contains("design-sidebar-item")).toBe(false);
+    expect([...launcherItem.classList].filter(name => /^-?(m|p)[xlrse]?-/.test(name))).toEqual(["mx-2"]);
   });
   it.each([false, true])("shows Status and Goals only when their flags are enabled (%s)", async enabled => {
     fixture.enableStatusCards = enabled;
