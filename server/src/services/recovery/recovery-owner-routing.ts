@@ -158,7 +158,34 @@ export type RecoveryOwnerRoutingEvidence =
     wakeQueuedAt?: string;
     wakeRunId?: string | null;
   }
-  | { coordinator: "unavailable"; reason: string; routedAt: string };
+  | {
+    coordinator: "unavailable";
+    reason: string;
+    routedAt: string;
+    /** Set when an already routed action went back to the board. */
+    previousCoordinatorAgentId?: string;
+  };
+
+/**
+ * Keep the coordinator wake history when the same action is re-routed to the
+ * same coordinator (an ordinary refresh or escalation). Without this the
+ * hourly re-wake throttle would be reset by every refresh.
+ */
+export function carryRecoveryCoordinatorDelivery(
+  previousEvidence: Record<string, unknown> | null | undefined,
+  routing: RecoveryOwnerRoutingEvidence,
+): RecoveryOwnerRoutingEvidence {
+  if (routing.coordinator !== "assigned") return routing;
+  const previous = readRecoveryOwnerRouting(previousEvidence);
+  if (previous?.coordinator !== "assigned" || previous.agentId !== routing.agentId) return routing;
+  return {
+    ...routing,
+    routedAt: previous.routedAt ?? routing.routedAt,
+    ...(previous.backfilledAt ? { backfilledAt: previous.backfilledAt } : {}),
+    ...(previous.wakeQueuedAt ? { wakeQueuedAt: previous.wakeQueuedAt } : {}),
+    ...(previous.wakeRunId !== undefined ? { wakeRunId: previous.wakeRunId } : {}),
+  };
+}
 
 export type ResolvedRecoveryOwner = {
   ownerType: IssueRecoveryActionOwnerType;

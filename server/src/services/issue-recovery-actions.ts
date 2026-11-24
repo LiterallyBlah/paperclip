@@ -14,6 +14,7 @@ import type {
 
 import { isNativeWorkspaceFinalizationOperationActive } from "./workspace-operations.js";
 import {
+  carryRecoveryCoordinatorDelivery,
   isCoordinatorRoutedRecoveryAction,
   RECOVERY_OWNER_ROUTING_EVIDENCE_KEY,
   resolveRecoveryOwner,
@@ -281,8 +282,13 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     return upsertSourceScopedUnlocked(input, retryCount + 1);
   }
 
-  function routingEvidence(owner: ResolvedRecoveryOwner) {
-    return owner.routing ? { [RECOVERY_OWNER_ROUTING_EVIDENCE_KEY]: owner.routing } : {};
+  function routingEvidence(
+    owner: ResolvedRecoveryOwner,
+    previousEvidence?: Record<string, unknown> | null,
+  ) {
+    return owner.routing
+      ? { [RECOVERY_OWNER_ROUTING_EVIDENCE_KEY]: carryRecoveryCoordinatorDelivery(previousEvidence, owner.routing) }
+      : {};
   }
 
   // The single routing point for every source-scoped creation, in-place
@@ -477,7 +483,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
             evidence: {
               ...(existing.evidence ?? {}),
               ...(input.evidence ?? {}),
-              ...routingEvidence(exhaustedOwner),
+              ...routingEvidence(exhaustedOwner, existing.evidence),
               recoveryBudget: {
                 state: "exhausted",
                 attemptsUsed,
@@ -544,7 +550,10 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
               ...(input.evidence ?? {}),
             }
             : updatedOwner?.routing
-              ? { ...(input.evidence ?? existing.evidence ?? {}), ...routingEvidence(updatedOwner) }
+              ? {
+                ...(input.evidence ?? existing.evidence ?? {}),
+                ...routingEvidence(updatedOwner, existing.evidence),
+              }
               : input.evidence ?? existing.evidence,
           nextAction: input.preserveExistingOwner ? existing.nextAction : input.nextAction,
           wakePolicy: input.preserveExistingOwner

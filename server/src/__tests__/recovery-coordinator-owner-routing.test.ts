@@ -437,6 +437,131 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
     expect(rerun.companies[0]).toMatchObject({ candidateActionIds: [], movedActionIds: [] });
   });
 
+  it("keeps the coordinator wake throttle when the same action is refreshed", async () => {
+    const fixture = await seed();
+    const action = await boardUpsert(fixture);
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    await recovery.reconcileStrandedAssignedIssues();
+    expect(enqueueWakeup.mock.calls.filter(([agentId]) => agentId === fixture.ceoId)).toHaveLength(1);
+    const routedOnce = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)).then((rows) => rows[0]!);
+    const firstRouting = routedOnce.evidence.recoveryOwnerRouting as Record<string, unknown>;
+
+    // The coordinator's wake ran and finished.
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: fixture.companyId,
+      agentId: fixture.ceoId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: {
+        issueId: fixture.sourceIssueId,
+        taskId: fixture.sourceIssueId,
+        wakeReason: "source_scoped_recovery_action",
+        recoveryActionId: action.id,
+      },
+    });
+    // The same incident refreshes the same action.
+    const refreshed = await boardUpsert(fixture);
+    expect(refreshed.id).toBe(action.id);
+    expect(refreshed.evidence.recoveryOwnerRouting).toMatchObject({
+      coordinator: "assigned",
+      agentId: fixture.ceoId,
+      routedAt: firstRouting.routedAt,
+      wakeQueuedAt: firstRouting.wakeQueuedAt,
+    });
+
+    await recovery.reconcileStrandedAssignedIssues();
+    expect(enqueueWakeup.mock.calls.filter(([agentId]) => agentId === fixture.ceoId)).toHaveLength(1);
+  });
+
+  it.each([
+    ["paused", "root_ceo_paused"],
+    ["terminated", "coordinator_not_configured"],
+  ])("returns a routed action to the board when its coordinator is later %s", async (status, reason) => {
+    const fixture = await seed();
+    const action = await boardUpsert(fixture);
+    expect(action).toMatchObject({ ownerType: "agent", ownerAgentId: fixture.ceoId });
+    await db.update(agents).set({ status }).where(eq(agents.id, fixture.ceoId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+    expect(enqueueWakeup.mock.calls.some(([agentId]) => agentId === fixture.ceoId)).toBe(false);
+
+    const after = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)).then((rows) => rows[0]!);
+    expect(after).toMatchObject({
+      status: action.status,
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+      previousOwnerAgentId: fixture.workerId,
+      returnOwnerAgentId: fixture.workerId,
+      attemptCount: action.attemptCount,
+    });
+    expect(after.evidence.recoveryOwnerRouting).toMatchObject({
+      coordinator: "unavailable",
+      reason,
+      previousCoordinatorAgentId: fixture.ceoId,
+    });
+    const source = await db.select().from(issues).where(eq(issues.id, fixture.sourceIssueId)).then((rows) => rows[0]!);
+    expect(source.assigneeAgentId).toBe(fixture.workerId);
+    const attention = (await attentionService(db).list(fixture.companyId, { userId: "board-user" })).items
+      .filter((item) => item.sourceKind === "recovery_action")
+      .map((item) => item.subject.id);
+    expect(attention).toContain(action.id);
+  });
+
+  it("re-routes to the configured coordinator when the original one becomes unavailable", async () => {
+    const fixture = await seed();
+    const action = await boardUpsert(fixture);
+    expect(action.ownerAgentId).toBe(fixture.ceoId);
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, fixture.ceoId));
+    await db.update(companies).set({ recoveryCoordinatorAgentId: fixture.otherId }).where(eq(companies.id, fixture.companyId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+    const after = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)).then((rows) => rows[0]!);
+    expect(after).toMatchObject({ ownerType: "agent", ownerAgentId: fixture.otherId, returnOwnerAgentId: fixture.workerId });
+    expect(after.evidence.recoveryOwnerRouting).toMatchObject({ coordinator: "assigned", agentId: fixture.otherId, source: "configured" });
+    expect(enqueueWakeup.mock.calls.filter(([agentId]) => agentId === fixture.otherId)).toHaveLength(1);
+    expect(enqueueWakeup.mock.calls.some(([agentId]) => agentId === fixture.ceoId)).toBe(false);
+  });
+
+  it("keeps board actions for a paused source agent on the board in backfill dry run and apply", async () => {
+    const fixture = await seed();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, fixture.workerId));
+    const [held] = await db.insert(issueRecoveryActions).values({
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "board",
+      previousOwnerAgentId: fixture.workerId,
+      returnOwnerAgentId: fixture.workerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "backfill:paused-source",
+      evidence: {},
+      nextAction: "Inspect.",
+    }).returning();
+    const resolved = await resolveRecoveryOwner(db, {
+      companyId: fixture.companyId,
+      kind: held!.kind,
+      cause: held!.cause,
+      requestedOwnerType: "board",
+      sourceAgentId: fixture.workerId,
+    });
+    expect(resolved.ownerType).toBe("board");
+
+    const dry = await backfillRecoveryCoordinatorOwners(db, { companyId: fixture.companyId, dryRun: true });
+    expect(dry.companies[0]).toMatchObject({ candidateActionIds: [], heldActionIds: [held!.id], movedActionIds: [] });
+    const applied = await backfillRecoveryCoordinatorOwners(db, { companyId: fixture.companyId, dryRun: false });
+    expect(applied.companies[0]).toMatchObject({ candidateActionIds: [], heldActionIds: [held!.id], movedActionIds: [] });
+    const after = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, held!.id)).then((rows) => rows[0]!);
+    expect(after).toMatchObject({ ownerType: "board", ownerAgentId: null });
+    expect(after.evidence).not.toHaveProperty("recoveryOwnerRouting");
+  });
+
   it("leaves board actions alone during backfill when no coordinator is available", async () => {
     const fixture = await seed({ rootCeoStatus: null });
     await db.insert(issueRecoveryActions).values({
@@ -455,5 +580,8 @@ describeEmbeddedPostgres("recovery coordinator owner routing", () => {
       coordinator: { status: "unavailable", reason: "coordinator_not_configured" },
       movedActionIds: [],
     });
+    const [kept] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, fixture.companyId));
+    expect(kept).toMatchObject({ ownerType: "board", ownerAgentId: null });
+    expect(kept!.evidence.recoveryOwnerRouting).toMatchObject({ coordinator: "unavailable", reason: "coordinator_not_configured" });
   });
 });
