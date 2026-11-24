@@ -313,10 +313,76 @@ export async function withoutDeferredWakesBehindHold<
   return behind.size === 0 ? wakes : wakes.filter((wake) => !(wake.id && behind.has(wake.id)));
 }
 
+/** A settled hold whose only remaining obligation is never replaying one lost run. */
+export type ReplayOnlyHold = {
+  recoveryActionId: string;
+  runId: string;
+  /** The wake that started the lost run, once known. */
+  originalWakeId?: string | null;
+};
+
+/**
+ * A resolved `preserve_without_replay_v1` hold forbids replaying its lost run.
+ * It is not a task-wide stop: a comment, card, assignment or monitor wake that
+ * does not continue that run is new work, for any agent. Open incidents and
+ * workspace repair or reconstruction holds keep gating everything, because no
+ * agent can safely work without their outcome.
+ */
+export function readReplayOnlyHold(
+  action: Pick<typeof issueRecoveryActions.$inferSelect, "id" | "status" | "cause" | "evidence">,
+): ReplayOnlyHold | null {
+  const evidence = action.evidence ?? {};
+  const automatic = evidence.automaticRecovery as { policy?: unknown; replay?: unknown; runId?: unknown } | undefined;
+  if (action.status !== "resolved" || automatic?.policy !== "preserve_without_replay_v1" || automatic.replay !== "blocked") return null;
+  if (!(EXECUTION_RECONCILIATION_CAUSES as readonly string[]).includes(action.cause)) return null;
+  if (hasWorkspaceRestoreFailure(evidence) || hasRequiredWorkspaceRecovery(evidence) ||
+      evidence.workspaceRestoreFailure !== undefined || evidence.workspaceRestoreRecovery !== undefined ||
+      (evidence.executionReconciliation as { workspaceReconstruction?: unknown } | undefined)?.workspaceReconstruction !== undefined) return null;
+  const runId = z.string().guid().safeParse(automatic.runId ?? evidence.runId ?? evidence.sourceRunId);
+  if (!runId.success) return null;
+  return { recoveryActionId: action.id, runId: runId.data };
+}
+
+// A top-level `sourceRunId` names the run that raised a card or comment, not a retried run.
+const REPLAY_SOURCE_RUN_KEYS = ["retryOfRunId", "failedRunId", "previousRunId"] as const;
+
+/** Run ids a wake or run continues, retries or replays. */
+export function replaySourceRunIds(...records: Array<Record<string, unknown> | null | undefined>): string[] {
+  const ids = new Set<string>();
+  for (const record of records) {
+    if (!record) continue;
+    for (const key of REPLAY_SOURCE_RUN_KEYS) {
+      if (typeof record[key] === "string") ids.add(record[key] as string);
+    }
+    const explicit = record.explicitUserContinuation as Record<string, unknown> | undefined;
+    if (explicit && typeof explicit.previousRunId === "string") ids.add(explicit.previousRunId);
+  }
+  return [...ids];
+}
+
+/** The wake or run being admitted, as far as replay is concerned. */
+export type ReplayWakeScope = { wakeId?: string | null; sourceRunIds: readonly string[] };
+
+/**
+ * A replay-only hold still holds the lost run's own original wake and any wake
+ * or run that retries or continues the lost run. Everything else clears it.
+ */
+export function wakeClearsReplayOnlyHold(hold: ReplayOnlyHold, wake: ReplayWakeScope): boolean {
+  if (wake.sourceRunIds.includes(hold.runId)) return false;
+  return !(wake.wakeId && hold.originalWakeId && wake.wakeId === hold.originalWakeId);
+}
+
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: {
   conversationResetCommentId?: string | null;
   /** The agent being admitted; scopes holds that belong to another agent's continuation. */
   admittingAgentId?: string | null;
+  /**
+   * The wake or run being admitted. A replay-only hold does not gate it
+   * unless it is the lost run's own wake or retries or continues that run.
+   */
+  wake?: ReplayWakeScope;
+  /** Lets a caller that admits several wakes skip replay-only holds and judge each wake itself. */
+  onReplayOnlyHold?: (hold: ReplayOnlyHold) => boolean;
 }): Promise<ExecutionBlocker | null> {
   const [conversation] = await db.select({ agentId: issues.conversationAgentId,
     boundaryId: issues.conversationBoundaryCommentId, status: issues.status,
@@ -361,9 +427,19 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     executionBlockerPredicate(),
     not(restoreHoldReleasedForCurrentOwnerPredicate()),
     boundary ? or(gt(issueRecoveryActions.createdAt, boundary.createdAt), nativeExecutionRecoveryActionPredicate()) : undefined,
-  )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(options?.admittingAgentId ? 100 : 1);
+  )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id))
+    .limit(options?.admittingAgentId || options?.wake || options?.onReplayOnlyHold ? 100 : 1);
   let action: (typeof candidates)[number] | undefined;
   for (const candidate of candidates) {
+    const replayOnly = !restoreHold && (options?.wake || options?.onReplayOnlyHold) ? readReplayOnlyHold(candidate) : null;
+    if (replayOnly) {
+      const [lost] = await db.select({ wakeupRequestId: heartbeatRuns.wakeupRequestId }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, replayOnly.runId),
+      )).limit(1);
+      replayOnly.originalWakeId = lost?.wakeupRequestId ?? null;
+      if (options?.wake && wakeClearsReplayOnlyHold(replayOnly, options.wake)) continue;
+      if (options?.onReplayOnlyHold?.(replayOnly)) continue;
+    }
     if (!restoreHold && options?.admittingAgentId) {
       const candidateRunId = z.string().guid().safeParse(candidate.evidence.runId ?? candidate.evidence.sourceRunId);
       const [candidateRun] = candidateRunId.success ? await db.select().from(heartbeatRuns).where(and(

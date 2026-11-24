@@ -182,6 +182,11 @@ async function runReleaseDrain(
       preservedWakeIds.push(candidate.id);
       continue;
     }
+    // A no-replay hold keeps its lost run's own input and retries in place.
+    if (locked.replayHeldWake?.(candidate)) {
+      preservedWakeIds.push(candidate.id);
+      continue;
+    }
 
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
@@ -337,6 +342,9 @@ async function runReleaseDrain(
 
   // A stopped run never plans recovery for itself, including after a handoff.
   if (locked.handoffAssigneeAgentId) return { outcome: { kind: "released" }, postCommitEffects };
+  // Automatic recovery of the finishing run stays off while a no-replay hold
+  // exists, exactly as before newer wakes could drain past it.
+  if (locked.replayHeldWake) return { outcome: { kind: "released" }, postCommitEffects };
 
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
