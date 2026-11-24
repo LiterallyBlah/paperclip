@@ -938,6 +938,185 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     expect(deps.executeRun).not.toHaveBeenCalled();
   });
 
+  describe("stranded deferred wakes after the holder is gone", () => {
+    const LONG_AGO = new Date(Date.now() - 10 * 60 * 1000);
+    function realRelease(deps: ReturnType<typeof callbacks>) {
+      const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+        resolveResponsibleUserId: async () => "responsible-user",
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+      }), recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined } });
+      deps.releaseIssueExecutionAndPromote.mockImplementation(async (run, options) => {
+        await release({ companyId: run.companyId, runId: run.id, now: new Date(), ...options });
+      });
+      // Leave promoted runs queued; dispatch is outside this boundary.
+      deps.getAgent.mockResolvedValue(null as never); // runtime returns null for a missing agent; the inferred type omits it
+    }
+    // The holder ended, then lost its lock without draining the queue: a
+    // status change cleared it mid-run, or a sweep terminalized it.
+    async function heldThenGone(holderStatus: "succeeded" | "failed" | "interrupted" = "succeeded", errorCode: string | null = null,
+      runtimeMode: "legacy" | "native" = "legacy") {
+      const seeded = await fixture(holderStatus);
+      await db.update(heartbeatRuns).set({ runtimeMode, nativeIssueId: runtimeMode === "native" ? seeded.issue.id : null,
+        finishedAt: new Date(), errorCode }).where(eq(heartbeatRuns.id, seeded.run.id));
+      if (runtimeMode === "native") await db.insert(nativeRunFinalizations).values({ runId: seeded.run.id, companyId: seeded.company.id,
+        issueId: seeded.issue.id, phase: "committed" });
+      await db.update(issues).set({ status: "in_review", executionRunId: null, checkoutRunId: null }).where(eq(issues.id, seeded.issue.id));
+      const [other] = await db.insert(agents).values({ companyId: seeded.company.id, name: "Card addressee", role: "general", status: "idle", adapterType: "process", adapterConfig: {} }).returning();
+      return { ...seeded, other };
+    }
+    async function addressedCardWake(input: { companyId: string; issueId: string; agentId: string; createdByAgentId: string }) {
+      const [card] = await db.insert(issueThreadInteractions).values({ companyId: input.companyId, issueId: input.issueId,
+        kind: "ask_user_questions", status: "pending", addresseeAgentId: input.agentId, createdByAgentId: input.createdByAgentId,
+        payload: { version: 1, questions: [{ id: "q1", prompt: "Pick one", selectionMode: "single", options: [{ id: "a", label: "A" }] }] } as never,
+      }).returning();
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: input.companyId, agentId: input.agentId,
+        source: "automation", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+        requestedByActorType: "agent", requestedByActorId: input.createdByAgentId,
+        payload: { issueId: input.issueId, mutation: "interaction", interactionId: card.id, interactionKind: card.kind,
+          _paperclipWakeContext: { issueId: input.issueId, taskId: input.issueId, wakeReason: "interaction_pending",
+            source: "issue.interaction.created", interactionId: card.id } },
+      }).returning();
+      return { card, wake };
+    }
+    const runsFor = async (agentId: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const wakeRow = async (id: string) => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, id)))[0];
+
+    it("releases a non-assignee card addressee into exactly one run", async () => {
+      const { company, agent, issue, other } = await heldThenGone();
+      const { wake } = await addressedCardWake({ companyId: company.id, issueId: issue.id, agentId: other.id, createdByAgentId: agent.id });
+      const deps = callbacks(db);
+      realRelease(deps);
+      for (let pass = 0; pass < 3; pass++) await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+      const promoted = await runsFor(other.id);
+      expect(promoted).toHaveLength(1);
+      expect(promoted[0]).toMatchObject({ status: "queued" });
+      expect(promoted[0].contextSnapshot).toMatchObject({ issueId: issue.id, wakeReason: "interaction_pending" });
+      expect((await wakeRow(wake.id)).status).not.toBe("deferred_issue_execution");
+    });
+
+    it("leaves a resolved card's stale wake alone", async () => {
+      const { company, agent, issue, other } = await heldThenGone();
+      const { card, wake } = await addressedCardWake({ companyId: company.id, issueId: issue.id, agentId: other.id, createdByAgentId: agent.id });
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, card.id));
+      const deps = callbacks(db);
+      realRelease(deps);
+      await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+      expect(deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+      expect(await runsFor(other.id)).toHaveLength(0);
+      expect((await wakeRow(wake.id)).status).toBe("deferred_issue_execution");
+    });
+
+    it("starts one run for two deferred wakes of the same agent", async () => {
+      const { company, agent, issue } = await heldThenGone();
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issue.id));
+      const ids: string[] = [];
+      for (const body of ["First note", "Second note"]) {
+        const [comment] = await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id, body, authorUserId: "board-user" }).returning();
+        const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+          source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
+          requestedByActorType: "user", requestedByActorId: "board-user",
+          payload: { issueId: issue.id, mutation: "comment", commentId: comment.id,
+            _paperclipWakeContext: { issueId: issue.id, taskId: issue.id, wakeReason: "issue_commented", wakeCommentId: comment.id, wakeCommentIds: [comment.id] } },
+        }).returning();
+        ids.push(wake.id);
+      }
+      const deps = callbacks(db);
+      realRelease(deps);
+      for (let pass = 0; pass < 3; pass++) await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+      const live = (await runsFor(agent.id)).filter(run => ["queued", "running", "scheduled_retry"].includes(run.status));
+      expect(live).toHaveLength(1);
+    });
+
+    it.each([["failed", "process_lost"], ["failed", "adapter_failed"]] as const)(
+      "releases the assignee's wakes after another agent's native holder ended %s (%s)", async (holderStatus, errorCode) => {
+        const { company, agent, issue, run, other } = await heldThenGone(holderStatus, errorCode, "native");
+        await db.update(heartbeatRuns).set({ agentId: other.id }).where(eq(heartbeatRuns.id, run.id));
+        await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issue.id));
+        const { wake: card } = await addressedCardWake({ companyId: company.id, issueId: issue.id, agentId: agent.id, createdByAgentId: other.id });
+        const [later] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+          source: "automation", reason: "issue_execution_deferred", status: "deferred_issue_execution", requestedAt: LONG_AGO,
+          requestedByActorType: "system", requestedByActorId: "test",
+          payload: { issueId: issue.id, _paperclipWakeContext: { issueId: issue.id, taskId: issue.id, wakeReason: "issue_children_completed" } },
+        }).returning();
+        const deps = callbacks(db);
+        realRelease(deps);
+        for (let pass = 0; pass < 3; pass++) await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+        const promoted = (await runsFor(agent.id)).filter(row => row.status === "queued");
+        expect(promoted).toHaveLength(1);
+        // One run per agent: the other wake waits behind it, not beside it.
+        const states = [(await wakeRow(card.id)).status, (await wakeRow(later.id)).status];
+        expect(states.filter(state => state === "deferred_issue_execution")).toHaveLength(1);
+      });
+
+    it("keeps the no-replay hold after a legacy holder was lost mid-action", async () => {
+      const { company, agent, issue, other } = await heldThenGone("failed", "process_lost", "legacy");
+      const { wake } = await addressedCardWake({ companyId: company.id, issueId: issue.id, agentId: other.id, createdByAgentId: agent.id });
+      const deps = callbacks(db);
+      realRelease(deps);
+      for (let pass = 0; pass < 2; pass++) await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+      expect(deps.releaseIssueExecutionAndPromote).toHaveBeenCalled();
+      expect((await wakeRow(wake.id)).status).toBe("deferred_issue_execution");
+      expect(await runsFor(other.id)).toHaveLength(0);
+    });
+
+    it("releases a content-less assignee wake after its holder is gone", async () => {
+      const { company, agent, issue } = await heldThenGone();
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issue.id));
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+        source: "automation", reason: "issue_execution_deferred", status: "deferred_issue_execution", requestedAt: LONG_AGO,
+        requestedByActorType: "system", requestedByActorId: "test",
+        payload: { issueId: issue.id, _paperclipWakeContext: { issueId: issue.id, taskId: issue.id, wakeReason: "issue_children_completed" } },
+      }).returning();
+      const deps = callbacks(db);
+      realRelease(deps);
+      for (let pass = 0; pass < 2; pass++) await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+      expect((await wakeRow(wake.id)).status).not.toBe("deferred_issue_execution");
+      expect((await runsFor(agent.id)).filter(run => run.status === "queued")).toHaveLength(1);
+    });
+
+    it("waits out the grace period before releasing a fresh content-less wake", async () => {
+      const { company, agent, issue } = await heldThenGone();
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+        source: "automation", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+        payload: { issueId: issue.id, _paperclipWakeContext: { issueId: issue.id, wakeReason: "issue_children_completed" } },
+      }).returning();
+      const deps = callbacks(db);
+      await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+      expect(deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+      expect((await wakeRow(wake.id)).status).toBe("deferred_issue_execution");
+    });
+
+    it("cancels a content-less assignee wake on a terminal task with a recorded reason", async () => {
+      const { company, agent, issue } = await heldThenGone();
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issue.id));
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+        source: "automation", reason: "issue_execution_deferred", status: "deferred_issue_execution", requestedAt: LONG_AGO,
+        payload: { issueId: issue.id, _paperclipWakeContext: { issueId: issue.id, wakeReason: "issue_children_completed" } },
+      }).returning();
+      const deps = callbacks(db);
+      realRelease(deps);
+      await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+      expect(await wakeRow(wake.id)).toMatchObject({ status: "cancelled", error: "Deferred execution wake no longer applies to a terminal task" });
+      expect((await runsFor(agent.id)).filter(run => run.status === "queued")).toHaveLength(0);
+    });
+
+    it("keeps a content-less wake for a paused agent", async () => {
+      const { company, agent, issue } = await heldThenGone();
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issue.id));
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agent.id));
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+        source: "automation", reason: "issue_execution_deferred", status: "deferred_issue_execution", requestedAt: LONG_AGO,
+        payload: { issueId: issue.id, _paperclipWakeContext: { issueId: issue.id, wakeReason: "issue_children_completed" } },
+      }).returning();
+      const deps = callbacks(db);
+      realRelease(deps);
+      for (let pass = 0; pass < 2; pass++) await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+      expect(await wakeRow(wake.id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect((await runsFor(agent.id)).filter(run => run.status === "queued")).toHaveLength(0);
+    });
+  });
+
   it.each(["queued", "running", "scheduled_retry"])("does not replay a finishing owner while another agent has a %s turn", async status => {
     const { company, issue, recipient } = await strandedMention();
     await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: recipient.id, status, invocationSource: "assignment", contextSnapshot: { issueId: issue.id } });
