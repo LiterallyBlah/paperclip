@@ -4,7 +4,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agents,
   agentWakeupRequests,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issueRecoveryActions,
@@ -19,6 +21,17 @@ import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { resolveRecoveryOwner } from "../services/recovery/recovery-owner-routing.js";
 import { backfillRecoveryCoordinatorOwners } from "../services/recovery/recovery-owner-backfill.js";
+
+async function seedCompanyUser(
+  db: ReturnType<typeof createDb>,
+  companyId: string,
+  membershipRole: string,
+  userId = `user-${randomUUID()}`,
+) {
+  await db.insert(authUsers).values({ id: userId, name: "Synthetic user", email: `${randomUUID()}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+  await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, membershipRole, status: "active" });
+  return userId;
+}
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -39,7 +52,9 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
+    await db.delete(authUsers);
   });
 
   afterAll(async () => {
@@ -66,7 +81,7 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
   async function insertIssue(
     companyId: string,
     prefix: string,
-    input: { assigneeAgentId: string | null; visibility?: "open" | "private"; responsibleUserId?: string | null; status?: string },
+    input: { assigneeAgentId: string | null; visibility?: "open" | "private"; responsibleUserId?: string | null; status?: string; parentId?: string | null },
   ) {
     const id = randomUUID();
     issueCounter += 1;
@@ -80,6 +95,7 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
       visibility: input.visibility ?? "open",
       privacyRootIssueId: input.visibility === "private" ? id : null,
       responsibleUserId: input.responsibleUserId ?? null,
+      parentId: input.parentId ?? null,
       issueNumber: issueCounter,
       identifier: `${prefix}-${issueCounter}`,
     });
@@ -97,6 +113,9 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
       issuePrefix: prefix,
       requireBoardApprovalForNewAgents: false,
     });
+    // Dispatch acts on behalf of a responsible user; with no direct one it
+    // falls back to the company owner, so every synthetic company has one.
+    const ownerUserId = await seedCompanyUser(db, companyId, "owner");
     await db.insert(agents).values([
       agentRow(ceoId, companyId, "Chief", "ceo"),
       agentRow(workerId, companyId, "Worker", "engineer", ceoId),
@@ -104,9 +123,13 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
     const sourceIssueId = await insertIssue(companyId, prefix, {
       assigneeAgentId: workerId,
       visibility: input.visibility,
-      responsibleUserId: input.responsibleUserId,
+      // A private task carries the user it runs for; that user is one of
+      // its implicit principals.
+      responsibleUserId: input.responsibleUserId !== undefined
+        ? input.responsibleUserId
+        : input.visibility === "private" ? ownerUserId : null,
     });
-    return { companyId, ceoId, workerId, prefix, sourceIssueId };
+    return { companyId, ceoId, workerId, prefix, sourceIssueId, ownerUserId };
   }
 
   type Fixture = Awaited<ReturnType<typeof seed>>;
@@ -219,6 +242,51 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
       });
     });
 
+    it("checks the inherited dispatch identity when the source has no direct responsible user", async () => {
+      const fixture = await seed();
+      // The parent's responsible user is a removed member: dispatch would run
+      // on that user's behalf, so neither agent can actually read the task.
+      const removedUserId = await seedCompanyUser(db, fixture.companyId, "member");
+      await db.update(companyMemberships).set({ status: "suspended" })
+        .where(eq(companyMemberships.principalId, removedUserId));
+      const deniedParentId = await insertIssue(fixture.companyId, fixture.prefix, {
+        assigneeAgentId: null, responsibleUserId: removedUserId,
+      });
+      const deniedSourceId = await insertIssue(fixture.companyId, fixture.prefix, {
+        assigneeAgentId: fixture.workerId, parentId: deniedParentId,
+      });
+      const denied = await boardUpsert(fixture, { sourceIssueId: deniedSourceId });
+      expect(denied).toMatchObject({ ownerType: "board", ownerAgentId: null });
+      expect(denied.evidence.recoveryOwnerRouting).toMatchObject({
+        coordinator: "unavailable",
+        reason: "coordinator_no_access",
+        coordinatorAgentId: fixture.ceoId,
+      });
+      const enqueueWakeup = vi.fn(async () => null);
+      await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+      expect(enqueueWakeup.mock.calls.some(([, opts]) =>
+        (opts as { payload?: { recoveryActionId?: string } }).payload?.recoveryActionId === denied.id)).toBe(false);
+
+      // The same shape with an active inherited user stays with the coordinator.
+      const activeUserId = await seedCompanyUser(db, fixture.companyId, "member");
+      const readableParentId = await insertIssue(fixture.companyId, fixture.prefix, {
+        assigneeAgentId: null, responsibleUserId: activeUserId,
+      });
+      const readableSourceId = await insertIssue(fixture.companyId, fixture.prefix, {
+        assigneeAgentId: fixture.workerId, parentId: readableParentId,
+      });
+      const readable = await boardUpsert(fixture, { sourceIssueId: readableSourceId });
+      expect(readable).toMatchObject({ ownerType: "agent", ownerAgentId: fixture.ceoId });
+    });
+
+    it("keeps the board when no dispatch identity can be resolved", async () => {
+      const fixture = await seed();
+      await db.delete(companyMemberships).where(eq(companyMemberships.companyId, fixture.companyId));
+      const action = await boardUpsert(fixture);
+      expect(action).toMatchObject({ ownerType: "board", ownerAgentId: null });
+      expect(action.evidence.recoveryOwnerRouting).toMatchObject({ reason: "coordinator_no_access" });
+    });
+
     it("falls back to the board when the source issue has no assignee agent", async () => {
       const fixture = await seed();
       const privateIssueId = await insertIssue(fixture.companyId, fixture.prefix, { assigneeAgentId: null, visibility: "private" });
@@ -269,7 +337,7 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
       const action = await boardUpsert(fixture);
       expect(action).toMatchObject({ ownerType: "agent", ownerAgentId: fixture.ceoId });
       // The issue became private after routing.
-      await db.update(issues).set({ visibility: "private", privacyRootIssueId: fixture.sourceIssueId })
+      await db.update(issues).set({ visibility: "private", privacyRootIssueId: fixture.sourceIssueId, responsibleUserId: fixture.ownerUserId })
         .where(eq(issues.id, fixture.sourceIssueId));
 
       const enqueueWakeup = vi.fn(async () => null);
@@ -300,7 +368,7 @@ describeEmbeddedPostgres("recovery actions: terminal source closure and readable
     // B: open, coordinator-routed, source private -> re-routed to the assignee.
     const privateIssueId = await insertIssue(fixture.companyId, fixture.prefix, { assigneeAgentId: fixture.workerId });
     const noAccess = await boardUpsert(fixture, { sourceIssueId: privateIssueId });
-    await db.update(issues).set({ visibility: "private", privacyRootIssueId: privateIssueId }).where(eq(issues.id, privateIssueId));
+    await db.update(issues).set({ visibility: "private", privacyRootIssueId: privateIssueId, responsibleUserId: fixture.ownerUserId }).where(eq(issues.id, privateIssueId));
     // C: open, coordinator-routed, readable open source -> untouched.
     const healthy = await boardUpsert(fixture);
     // D: open, reserved board action on a readable source -> untouched.

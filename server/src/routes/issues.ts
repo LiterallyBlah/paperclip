@@ -9682,6 +9682,22 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+        // Cancellation closes only the recovery action unless it explicitly
+        // moves the source to done or in_review. It never changes the
+        // source status, assignee or run state, and never queues a wake.
+        const actionOnlyCancellation =
+          outcome === "cancelled" && sourceIssueStatus === lockedIssue.status;
+        if (
+          outcome === "cancelled" &&
+          !actionOnlyCancellation &&
+          sourceIssueStatus !== "done" &&
+          sourceIssueStatus !== "in_review"
+        ) {
+          throw conflict(
+            "Cancel the recovery action with the source issue's current status, or move the source to done or in_review.",
+            { code: "recovery_cancel_status_mismatch" },
+          );
+        }
 
         // Retained files are a source-scoped obligation, independent of the
         // current task owner/generation and any newer active recovery incident.
@@ -9907,6 +9923,7 @@ export function issueRoutes(
 
         if (
           sourceIssueStatus === "todo" &&
+          !actionOnlyCancellation &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
           assertBoard(req);

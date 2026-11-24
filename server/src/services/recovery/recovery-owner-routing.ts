@@ -309,22 +309,39 @@ export async function resolveRecoveryOwner(
 /**
  * The existing `issue:read` access decision for an agent acting on the
  * source issue, the same decision the woken run meets when it reads the
- * task. The actor is built the way a run builds it: on behalf of the
- * issue's responsible user. A missing issue is unreadable.
+ * task. The actor is built the way dispatch builds it for a recovery wake:
+ * on behalf of the responsible user that run preparation selects (direct,
+ * routine, parent or company default). A missing issue, or one whose
+ * dispatch identity cannot be resolved, is unreadable: dispatch would fail
+ * the run, so it must not be queued.
  */
 export async function canRecoveryOwnerReadIssue(
   db: DbOrTransaction,
   input: { companyId: string; agentId: string; issueId: string },
 ): Promise<boolean> {
-  const issue = await db
-    .select({ id: issues.id, responsibleUserId: issues.responsibleUserId })
-    .from(issues)
-    .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
-    .then((rows) => rows[0] ?? null);
-  if (!issue) return false;
-  const responsibleUserId = issue.responsibleUserId && issue.responsibleUserId !== "local-board"
-    ? issue.responsibleUserId
-    : null;
+  // Loaded lazily: run preparation depends on the heartbeat graph, which
+  // itself creates recovery actions through this module.
+  const { createHeartbeatRunPreparation } = await import("../heartbeat/run-preparation.js");
+  const preparation = createHeartbeatRunPreparation(db as Db);
+  const issueContext = await preparation.getIssueExecutionContext(input.companyId, input.issueId);
+  if (!issueContext) return false;
+  const dispatchedUserId = await preparation.resolveResponsibleUserIdForRunSeed({
+    companyId: input.companyId,
+    contextSnapshot: {
+      issueId: issueContext.id,
+      taskId: issueContext.id,
+      wakeReason: "source_scoped_recovery_action",
+    },
+    issueContext,
+    routineEnvContext: await preparation.getRoutineEnvForExecutionIssue(input.companyId, issueContext),
+    requestedByActorType: "system",
+    requestedByActorId: null,
+    source: "automation",
+    triggerDetail: "system",
+    existingRunResponsibleUserId: null,
+  });
+  if (!dispatchedUserId) return false;
+  const responsibleUserId = dispatchedUserId !== "local-board" ? dispatchedUserId : null;
   const decision = await authorizationService(db).decide({
     actor: {
       type: "agent",
@@ -334,7 +351,7 @@ export async function canRecoveryOwnerReadIssue(
       onBehalfOfUserId: responsibleUserId,
     },
     action: "issue:read",
-    resource: { type: "issue", companyId: input.companyId, issueId: issue.id },
+    resource: { type: "issue", companyId: input.companyId, issueId: issueContext.id },
   });
   return decision.allowed;
 }
