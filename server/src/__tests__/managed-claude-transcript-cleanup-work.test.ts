@@ -6,6 +6,7 @@ import { installDatabaseWorkSignals } from "../../../packages/db/src/work-signal
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import {
   registerManagedClaudeTranscriptCleanupWork,
+  registerManagedClaudeTranscriptCleanupWorkIfEnabled,
   retainManagedClaudeTranscripts,
   type ManagedClaudeTranscriptExpirationResult,
 } from "../services/managed-claude-transcripts.js";
@@ -147,5 +148,55 @@ describe("registerManagedClaudeTranscriptCleanupWork", () => {
       vi.unstubAllEnvs();
       await fs.rm(guestDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("registerManagedClaudeTranscriptCleanupWorkIfEnabled", () => {
+  it("registers nothing and builds no sweep when the opt-in is off", async () => {
+    vi.useFakeTimers();
+    const tick = vi.fn(async () => result());
+    const createService = vi.fn(() => ({ tick }));
+    const c = coordinator();
+    expect(registerManagedClaudeTranscriptCleanupWorkIfEnabled(false, c, createService, vi.fn())).toBeNull();
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
+    expect(createService).not.toHaveBeenCalled();
+    expect(tick).not.toHaveBeenCalled();
+    expect(c.nextWakeAt()).toBeNull();
+  });
+
+  it("does not wake a sweep when a run retains a scope with the opt-in off", async () => {
+    vi.useFakeTimers();
+    const guestDir = await fs.mkdtemp(path.join(os.tmpdir(), "pap-ai-cleanup-off-"));
+    vi.stubEnv("PAPERCLIP_HOME", await fs.mkdtemp(path.join(guestDir, "home-")));
+    vi.stubEnv("PAPERCLIP_MANAGED_CLAUDE_TRANSCRIPT_RETENTION_ENABLED", "true");
+    try {
+      const runtime = await fs.mkdtemp(path.join(guestDir, "run-home-"));
+      await fs.mkdir(path.join(runtime, "provider"), { mode: 0o700 });
+      const tick = vi.fn(async () => result());
+      const c = coordinator();
+      registerManagedClaudeTranscriptCleanupWorkIfEnabled(false, c, () => ({ tick }), vi.fn());
+      await retainManagedClaudeTranscripts({
+        runtime: { home: runtime, sessionIdentity: "grant-1:user-1:secret-1:0" },
+        adapterType: "claude_local",
+        companyId: "company-1",
+        agentId: "agent-1",
+        taskKey: "task-off",
+        target: { kind: "local" } as never,
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(tick).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(guestDir, { recursive: true, force: true });
+    }
+  });
+
+  it("registers the same sweep when the opt-in is on", async () => {
+    vi.useFakeTimers();
+    const tick = vi.fn(async () => result());
+    const c = coordinator();
+    expect(registerManagedClaudeTranscriptCleanupWorkIfEnabled(true, c, () => ({ tick }), vi.fn())).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(tick).toHaveBeenCalledTimes(1);
   });
 });

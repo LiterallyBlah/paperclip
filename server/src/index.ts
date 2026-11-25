@@ -60,7 +60,7 @@ import {
 import { markGitRestorePointExpired } from "./services/git-restore-point-storage.js";
 import {
   managedClaudeTranscriptExpirationService,
-  registerManagedClaudeTranscriptCleanupWork,
+  registerManagedClaudeTranscriptCleanupWorkIfEnabled,
 } from "./services/managed-claude-transcripts.js";
 import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { DELIVERY_QUEUES } from "./services/delivery-work-notifications.js";
@@ -1432,9 +1432,10 @@ async function startServerWithDatabaseTeardown(
   server.on("close", () => { void budgetEnforcementWorker.stop(); });
   const accountingWorker = registerCostAccountingWork(db, deliveryWork, accountingHeartbeat.reconcileCostAccounting);
   server.on("close", accountingWorker.stop);
-  registerManagedClaudeTranscriptCleanupWork(
+  registerManagedClaudeTranscriptCleanupWorkIfEnabled(
+    config.managedClaudeTranscriptExpirationEnabled,
     deliveryWork,
-    managedClaudeTranscriptExpirationService(db as any, { retentionDays: config.managedClaudeTranscriptRetentionDays }),
+    () => managedClaudeTranscriptExpirationService(db as any, { retentionDays: config.managedClaudeTranscriptRetentionDays }),
     (result) => {
       if (result.expired > 0 || result.failed > 0) logger.info({ ...result }, "managed Claude transcript expiration");
     },
