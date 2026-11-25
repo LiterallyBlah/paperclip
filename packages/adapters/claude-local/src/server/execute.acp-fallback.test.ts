@@ -1,4 +1,9 @@
+import { execFileSync, spawnSync } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { buildLocalProcessSandboxSpawnTarget, type LocalProcessSandboxOptions } from "@paperclipai/adapter-utils/local-process-sandbox";
 
 const {
   ensureAdapterExecutionTargetCommandResolvable,
@@ -62,6 +67,26 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 
 import { execute } from "./execute.js";
 
+async function filesystemConfinementRuns(): Promise<boolean> {
+  if (process.platform !== "linux") return false;
+  const workspace = os.tmpdir();
+  try {
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", ""],
+      cwd: workspace,
+      options: { workspaceDir: workspace, filesystemScope: "workspace" },
+    });
+    const status = spawnSync(target.command, target.args, { cwd: target.cwd }).status;
+    await target.cleanup?.();
+    return status === 0;
+  } catch {
+    return false;
+  }
+}
+
+const confinementRuns = await filesystemConfinementRuns();
+
 function buildContext(config: Record<string, unknown> = {}) {
   return {
     runId: "run-1",
@@ -120,6 +145,145 @@ describe("claude_local ACP startup fallback", () => {
         }),
       }),
     );
+  });
+
+  it("resumes a legacy CLI session from a fresh managed home linked to the retained transcripts", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "claude-cli-retained-resume-"));
+    try {
+      const durable = path.join(root, "companies", "company-1", "agents", "agent-1", "claude-transcripts", "scope", "projects");
+      await fs.mkdir(durable, { recursive: true });
+      // Simulates the Claude CLI: transcripts live under $CLAUDE_CONFIG_DIR/projects/<cwd>/<session>.jsonl.
+      let created = 0;
+      runAdapterExecutionTargetProcess.mockImplementation((async (
+        _runId: string, _target: unknown, _command: string, args: string[], options: { env: Record<string, string>; cwd: string },
+      ) => {
+        const projectDir = path.join(options.env.CLAUDE_CONFIG_DIR, "projects", options.cwd.replace(/[^a-zA-Z0-9-]/g, "-"));
+        const resumeAt = args.indexOf("--resume");
+        const resumeId = resumeAt >= 0 ? args[resumeAt + 1] : null;
+        const base = { signal: null, timedOut: false, stderr: "", pid: 1, startedAt: new Date().toISOString() };
+        if (resumeId && !(await fs.stat(path.join(projectDir, `${resumeId}.jsonl`)).catch(() => null))) {
+          return { ...base, exitCode: 1, stdout: JSON.stringify({
+            type: "result", session_id: resumeId, is_error: true, subtype: "error_during_execution",
+            result: `No conversation found with session ID: ${resumeId}`,
+          }) };
+        }
+        const sessionId = resumeId ?? `00000000-0000-4000-8000-00000000000${++created}`;
+        await fs.mkdir(projectDir, { recursive: true });
+        await fs.appendFile(path.join(projectDir, `${sessionId}.jsonl`), "{}\n");
+        return { ...base, exitCode: 0, stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: "claude-sonnet" }),
+          JSON.stringify({ type: "result", session_id: sessionId, subtype: "success", is_error: false, result: "ok" }),
+        ].join("\n") };
+      }) as never);
+      const runWithFreshHome = async (name: string, linked: boolean, runtime: Record<string, unknown>) => {
+        const providerHome = path.join(root, name, "provider");
+        await fs.mkdir(providerHome, { recursive: true });
+        if (linked) await fs.symlink(durable, path.join(providerHome, "projects"));
+        const ctx = buildContext({
+          engine: "cli",
+          managedAiConnection: { provider: "anthropic", method: "subscription" },
+          env: { CLAUDE_CONFIG_DIR: providerHome },
+        });
+        const result = await execute({ ...ctx, runtime: { ...ctx.runtime, ...runtime } } as never);
+        await fs.rm(path.join(root, name), { recursive: true, force: true });
+        return result as { sessionId?: string | null; sessionParams?: Record<string, unknown> | null };
+      };
+      const resumeFrom = (first: { sessionId?: string | null; sessionParams?: Record<string, unknown> | null }) => ({
+        sessionId: first.sessionId, sessionParams: first.sessionParams, sessionDisplayId: first.sessionId,
+      });
+
+      const first = await runWithFreshHome("home-1", true, {});
+      expect(first.sessionId).toBe("00000000-0000-4000-8000-000000000001");
+      runAdapterExecutionTargetProcess.mockClear();
+      const second = await runWithFreshHome("home-2", true, resumeFrom(first));
+      expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(1);
+      expect((runAdapterExecutionTargetProcess.mock.calls[0] as unknown[])[3]).toEqual(expect.arrayContaining(["--resume", first.sessionId]));
+      expect(second.sessionId).toBe(first.sessionId);
+
+      // Without the link a fresh home has no transcript, so the CLI starts over.
+      runAdapterExecutionTargetProcess.mockClear();
+      const unlinked = await runWithFreshHome("home-3", false, resumeFrom(second));
+      expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(2);
+      expect(unlinked.sessionId).not.toBe(first.sessionId);
+    } finally {
+      runAdapterExecutionTargetProcess.mockReset();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("mounts the durable transcript directory a managed connection links into the Claude config dir", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "claude-confined-transcripts-"));
+    try {
+      const providerHome = path.join(root, "home", "provider");
+      const durableTranscripts = path.join(root, "companies", "company-1", "agents", "agent-1", "claude-transcripts", "scope");
+      await fs.mkdir(providerHome, { recursive: true });
+      await fs.mkdir(durableTranscripts, { recursive: true });
+      await fs.symlink(durableTranscripts, path.join(providerHome, "projects"));
+      const managedConfig = {
+        engine: "cli",
+        managedAiConnection: { provider: "anthropic", method: "subscription" },
+        env: { CLAUDE_CONFIG_DIR: providerHome },
+      };
+      const transcriptMount = { path: await fs.realpath(durableTranscripts), access: "rw" };
+      const sandboxPaths = () => runAdapterExecutionTargetProcess.mock.calls
+        .map((call) => (call as unknown[])[4] as { localProcessSandbox?: { managedPaths: unknown[] } })
+        .find((options) => options?.localProcessSandbox)?.localProcessSandbox?.managedPaths;
+
+      await execute(buildContext({ ...managedConfig, filesystemScope: "workspace" }) as never);
+      expect(sandboxPaths()).toContainEqual(transcriptMount);
+      const siblingTranscripts = path.join(path.dirname(await fs.realpath(durableTranscripts)), "other-task");
+      for (const mount of sandboxPaths() as Array<{ path: string }>) {
+        expect(siblingTranscripts.startsWith(`${mount.path}${path.sep}`)).toBe(false);
+      }
+
+      vi.clearAllMocks();
+      await execute(buildContext({ ...managedConfig, networkScope: "allowlist" }) as never);
+      expect(sandboxPaths()).not.toContainEqual(transcriptMount);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(confinementRuns)("lets a confined run read its own transcripts but not another task's or agent's", async () => {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "claude-transcript-isolation-")));
+    try {
+      const providerHome = path.join(root, "home", "provider");
+      const transcriptsDir = path.join(root, "companies", "company-1", "agents", "agent-1", "claude-transcripts");
+      const own = path.join(transcriptsDir, "own", "projects");
+      const other = path.join(transcriptsDir, "other", "projects");
+      const otherAgent = path.join(root, "companies", "company-1", "agents", "agent-2", "claude-transcripts", "own", "projects");
+      for (const dir of [providerHome, own, other, otherAgent]) await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(own, "session.jsonl"), "own");
+      await fs.writeFile(path.join(other, "session.jsonl"), "other");
+      await fs.writeFile(path.join(otherAgent, "session.jsonl"), "other agent");
+      await fs.symlink(own, path.join(providerHome, "projects"));
+
+      await execute(buildContext({
+        engine: "cli",
+        managedAiConnection: { provider: "anthropic", method: "subscription" },
+        env: { CLAUDE_CONFIG_DIR: providerHome },
+        filesystemScope: "workspace",
+      }) as never);
+      const sandbox = runAdapterExecutionTargetProcess.mock.calls
+        .map((call) => (call as unknown[])[4] as { localProcessSandbox?: LocalProcessSandboxOptions })
+        .find((options) => options?.localProcessSandbox)!.localProcessSandbox!;
+      const read = (file: string) =>
+        `try{process.stdout.write(require("fs").readFileSync(${JSON.stringify(file)},"utf8"))}catch(e){process.stdout.write(e.code)}`;
+      const target = await buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: ["-e", `${read(path.join(providerHome, "projects", "session.jsonl"))};process.stdout.write("|");${read(path.join(other, "session.jsonl"))};process.stdout.write("|");${read(path.join(otherAgent, "session.jsonl"))}`],
+        cwd: sandbox.workspaceDir,
+        options: sandbox,
+      });
+      try {
+        const output = execFileSync(target.command, target.args, { cwd: target.cwd, env: { ...process.env, ...target.env }, encoding: "utf8" });
+        expect(output).toBe("own|ENOENT|ENOENT");
+      } finally {
+        await target.cleanup?.();
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("keeps explicit ACP strict when startup fails", async () => {
