@@ -9,7 +9,13 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { MANAGED_CLAUDE_TRANSCRIPT_CLEANUP_RETRY_MS, managedClaudeTranscriptExpirationService } from "../services/managed-claude-transcripts.ts";
+import { installDatabaseWorkSignals } from "../../../packages/db/src/work-signals.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import {
+  MANAGED_CLAUDE_TRANSCRIPT_CLEANUP_RETRY_MS,
+  managedClaudeTranscriptExpirationService,
+  registerManagedClaudeTranscriptCleanupWorkIfEnabled,
+} from "../services/managed-claude-transcripts.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -340,5 +346,54 @@ describeEmbeddedPostgres("managed Claude transcript expiration", () => {
 
     expect(await sweep.tick()).toMatchObject({ checked: 1, expired: 1, truncated: true });
     expect(await sweep.tick()).toMatchObject({ checked: 1, expired: 1, truncated: false });
+  });
+
+  describe("server wiring (fork-only expiration opt-in)", () => {
+    const coordinators: ReturnType<typeof createDeliveryWorkCoordinator>[] = [];
+    afterEach(async () => {
+      for (const c of coordinators.splice(0)) await c.stop();
+    });
+
+    function coordinator() {
+      const execute = vi.fn(async () => [{ xid: "42" }]);
+      const owner = installDatabaseWorkSignals({ execute, async transaction(fn: (tx: any) => Promise<any>): Promise<any> {
+        return fn({ execute, transaction: owner.transaction });
+      } });
+      const c = createDeliveryWorkCoordinator({ owner, canRun: () => true, canReconcile: () => true, onError: vi.fn() });
+      coordinators.push(c);
+      return c;
+    }
+
+    it("keeps an expired scope and its task session when the opt-in is off", async () => {
+      const seeded = await seed({ closedDaysAgo: 30, lastUsedDaysAgo: 30 });
+      const createService = vi.fn(service);
+      const onResult = vi.fn();
+      const c = coordinator();
+
+      const worker = registerManagedClaudeTranscriptCleanupWorkIfEnabled(false, c, createService, onResult);
+      // Give the coordinator the same startup opportunity the enabled case gets.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      expect(worker).toBeNull();
+      expect(createService).not.toHaveBeenCalled();
+      expect(onResult).not.toHaveBeenCalled();
+      expect(c.nextWakeAt()).toBeNull();
+      expect(await exists(path.join(seeded.scopeDir, "projects", "-workspace", "session.jsonl"))).toBe(true);
+      expect(await taskSessionCount()).toBe(1);
+    });
+
+    it("registers the sweep exactly as before when the opt-in is on", async () => {
+      const seeded = await seed({ closedDaysAgo: 30, lastUsedDaysAgo: 30 });
+      const onResult = vi.fn();
+      const c = coordinator();
+
+      const worker = registerManagedClaudeTranscriptCleanupWorkIfEnabled(true, c, service, onResult);
+
+      expect(worker).not.toBeNull();
+      await vi.waitFor(() => expect(onResult).toHaveBeenCalled(), { timeout: 5_000 });
+      expect(onResult.mock.calls[0]![0]).toMatchObject({ expired: 1, clearedTaskSessions: 1 });
+      expect(await exists(seeded.scopeDir)).toBe(false);
+      expect(await taskSessionCount()).toBe(0);
+    });
   });
 });

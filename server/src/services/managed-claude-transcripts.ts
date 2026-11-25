@@ -345,3 +345,18 @@ export function registerManagedClaudeTranscriptCleanupWork(
   onScopeRetained = () => worker.wake();
   return worker;
 }
+
+// Fork-only: the expiration sweep deletes transcript directories and clears
+// their task sessions, so it runs only when the operator opts in with
+// `PAPERCLIP_MANAGED_CLAUDE_TRANSCRIPT_EXPIRATION_ENABLED=true`. When it is
+// off, nothing in this module deletes or clears anything; the transcript link
+// still works and `onScopeRetained` stays null.
+export function registerManagedClaudeTranscriptCleanupWorkIfEnabled(
+  enabled: boolean,
+  coordinator: ReturnType<typeof createDeliveryWorkCoordinator>,
+  createService: () => ReturnType<typeof managedClaudeTranscriptExpirationService>,
+  onResult: (result: ManagedClaudeTranscriptExpirationResult) => void,
+) {
+  if (!enabled) return null;
+  return registerManagedClaudeTranscriptCleanupWork(coordinator, createService(), onResult);
+}

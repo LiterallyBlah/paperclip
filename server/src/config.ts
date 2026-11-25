@@ -112,6 +112,7 @@ export interface Config extends StorageConfig {
   taskDirectoryRetentionEnabled: boolean;
   taskDirectoryRetentionDryRun: boolean;
   taskDirectoryOrphanGraceDays: number;
+  managedClaudeTranscriptExpirationEnabled: boolean;
   managedClaudeTranscriptRetentionDays: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
@@ -423,6 +424,8 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
     taskDirectoryRetentionEnabled: process.env.PAPERCLIP_TASK_DIRECTORY_RETENTION_ENABLED === "true",
     taskDirectoryRetentionDryRun: process.env.PAPERCLIP_TASK_DIRECTORY_RETENTION_DRY_RUN !== "false",
     taskDirectoryOrphanGraceDays,
+    // Fork-only: the transcript expiration sweep deletes, so it is opt-in.
+    managedClaudeTranscriptExpirationEnabled: process.env.PAPERCLIP_MANAGED_CLAUDE_TRANSCRIPT_EXPIRATION_ENABLED === "true",
     managedClaudeTranscriptRetentionDays,
     serveUi:
       process.env.SERVE_UI !== undefined

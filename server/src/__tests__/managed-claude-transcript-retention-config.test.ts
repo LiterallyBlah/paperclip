@@ -25,4 +25,20 @@ describe("managed Claude transcript retention config parsing", () => {
     vi.stubEnv("PAPERCLIP_MANAGED_CLAUDE_TRANSCRIPT_RETENTION_DAYS", "0");
     expect(loadConfig()).toMatchObject({ managedClaudeTranscriptRetentionDays: 1 });
   });
+
+  it("leaves the expiration sweep off unless it is explicitly enabled", () => {
+    vi.stubEnv("PAPERCLIP_MANAGED_CLAUDE_TRANSCRIPT_RETENTION_ENABLED", "true");
+    vi.stubEnv("PAPERCLIP_MANAGED_CLAUDE_TRANSCRIPT_EXPIRATION_ENABLED", undefined);
+    expect(loadConfig()).toMatchObject({ managedClaudeTranscriptExpirationEnabled: false });
+  });
+
+  it.each(["", "false", "1", "yes"])("keeps the expiration sweep off for %j", (value) => {
+    vi.stubEnv("PAPERCLIP_MANAGED_CLAUDE_TRANSCRIPT_EXPIRATION_ENABLED", value);
+    expect(loadConfig()).toMatchObject({ managedClaudeTranscriptExpirationEnabled: false });
+  });
+
+  it("turns the expiration sweep on only for \"true\"", () => {
+    vi.stubEnv("PAPERCLIP_MANAGED_CLAUDE_TRANSCRIPT_EXPIRATION_ENABLED", "true");
+    expect(loadConfig()).toMatchObject({ managedClaudeTranscriptExpirationEnabled: true });
+  });
 });
