@@ -4,10 +4,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRunEvents, heartbeatRuns, issues } from "@paperclipai/db";
+import { agentConfigRevisions, agents, authUsers, companies, companyMemberships, createDb, heartbeatRunEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createProviderLimitWait } from "../services/heartbeat/provider-limit-wait.js";
+import { agentProviderLimitCooldown } from "../services/native-runtime/native-startup-retry.js";
 import { executionProjectionsForRuns } from "../services/execution-projection.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 
@@ -175,6 +176,36 @@ describePostgres("heartbeat provider usage limit wait", () => {
     expect(runs.find(run => run.id !== lost.id)).toMatchObject({ status: "scheduled_retry", retryOfRunId: lost.id });
     const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     expect(issue).toMatchObject({ status: "in_progress", executionRunId: null });
+  }, 60_000);
+
+  async function switchAccount(f: Awaited<ReturnType<typeof seed>>, minutesAgo: number) {
+    const binding = (grantId: string) => ({ adapterType, adapterConfig: {},
+      runtimeConfig: { aiConnection: { mode: "shared", provider: "anthropic", grantId } } });
+    await db.insert(agentConfigRevisions).values({ companyId: f.companyId, agentId: f.agentId, source: "patch",
+      changedKeys: ["runtimeConfig"], beforeConfig: binding("first-subscription"), afterConfig: binding("second-subscription"),
+      createdAt: new Date(Date.now() - minutesAgo * 60_000) });
+  }
+
+  it("starts work after the agent moves to another provider account, ignoring the old account's limit", async () => {
+    const f = await seed([rateLimited(16)]);
+    await switchAccount(f, 5);
+    expect(await agentProviderLimitCooldown(db, { companyId: f.companyId, agentId: f.agentId, now: new Date() })).toBeNull();
+    const finished = await wake(f);
+    expect(finished.errorCode).not.toBe("provider_limit_wait");
+    expect(dispatched.has(finished.id)).toBe(true);
+  }, 60_000);
+
+  it("still defers work when the limit was reported after the account move", async () => {
+    const f = await seed([rateLimited(16)]);
+    await switchAccount(f, 30);
+    // A revision that leaves the account unchanged does not clear the limit.
+    await db.insert(agentConfigRevisions).values({ companyId: f.companyId, agentId: f.agentId, source: "patch",
+      changedKeys: ["title"], beforeConfig: { title: "Old" }, afterConfig: { title: "New" }, createdAt: new Date(Date.now() - 60_000) });
+    expect(await agentProviderLimitCooldown(db, { companyId: f.companyId, agentId: f.agentId, now: new Date() }))
+      .toMatchObject({ category: "rate_limit" });
+    const finished = await wake(f);
+    expect(finished).toMatchObject({ status: "cancelled", errorCode: "provider_limit_wait" });
+    expect(dispatched.has(finished.id)).toBe(false);
   }, 60_000);
 
   it("still dispatches a manual run, and work after a later success or an expired reset", async () => {
