@@ -1,4 +1,5 @@
 import { environmentTaskResultSchema } from "@paperclipai/plugin-sdk";
+import { claudeSessionMinRemainingMs } from "./claude-oauth-session.js";
 import type { PluginTaskCredentialWritebackBinding } from "./plugin-task-credential-writeback.js";
 import { OPENROUTER_ATTRIBUTION_HEADERS, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import { createHash } from "node:crypto";
@@ -328,7 +329,8 @@ export async function prepareManagedAiRuntime(
       // against a concurrent reconnect or explicit rotation.
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const before = await readFreshness();
-        const value = await service.runtimeCredential(selection);
+        // A Claude session's access token must outlast this run's timeout.
+        const value = await service.runtimeCredential(selection, { minRemainingMs: claudeSessionMinRemainingMs(input.config.timeoutSec) });
         const after = await readFreshness();
         if (before && after && before.version === after.version && before.epoch === after.epoch) {
           return { value, freshness: after };

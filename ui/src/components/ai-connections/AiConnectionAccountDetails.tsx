@@ -34,6 +34,10 @@ export function AiConnectionAccountDetails({ account, grant }: {
         </>}
         <dt className="text-muted-foreground">Sign-in method</dt>
         <dd>{aiMethodLabel(account.provider, account.method)}</dd>
+        {account.credentialKind && <>
+          <dt className="text-muted-foreground">Credential</dt>
+          <dd>{account.credentialKind === "oauth_session" ? "Short-lived session" : "Long-lived setup token"}</dd>
+        </>}
         <dt className="text-muted-foreground">Access</dt>
         <dd>{account.ownership === "shared" ? "Company shared" : `Personal · ${account.ownerName ?? "Account owner"}`}</dd>
       </dl>

@@ -137,3 +137,12 @@ it("reuses recent identity observations and invalidates them after reconnect", a
   expect(host.textContent).toContain("new-account@example.test");
   expect(host.textContent).not.toContain("avery@example.test");
 });
+
+it("shows whether a Claude subscription holds a short-lived session or a long-lived setup token", async () => {
+  await render({ ...account, credentialKind: "oauth_session" });
+  expect(host.textContent).toContain("Short-lived session");
+  await render({ ...account, credentialKind: "setup_token" });
+  expect(host.textContent).toContain("Long-lived setup token");
+  await render();
+  expect(host.textContent).not.toContain("Credential");
+});

@@ -198,6 +198,11 @@ export interface AiManagedConnectionSummary {
   status: "connected" | "needs_attention" | "expired" | "revoked";
   unavailableReason?: string;
   usageProbeSupported?: boolean;
+  /**
+   * Claude subscriptions only: a long-lived `claude setup-token` token, or a
+   * `claude auth login` session whose runs receive short-lived access tokens.
+   */
+  credentialKind?: "setup_token" | "oauth_session";
 }
 /** Safe provider account details for one authorized saved credential. */
 export interface AiConnectionAccountIdentity {
