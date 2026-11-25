@@ -175,6 +175,10 @@ const TRAILING_PUNCTUATION_RE = /[)\].,;:!]+$/;
 // from the login context cannot bind.
 const URL_PREAMBLE_RE = /the url below to sign in/i;
 
+// The line that introduces the URL in `claude auth login` (2.1.317). The URL
+// follows on the same line, so the same bounded window applies.
+const AUTH_LOGIN_URL_PREAMBLE_RE = /if the browser didn['’]t open, visit:/i;
+
 // The browser-code prompt on a dedicated line. The line starts with the exact
 // prompt phrase. The line can end with the input caret `>` and masked echo `*`
 // characters and spaces. The pattern rejects the phrase when other prose shares
@@ -402,9 +406,22 @@ function findBrowserCodePrompt(lines: string[], endLine: number, url: string): s
  * any input byte into a log or an error. This phase returns no token.
  */
 export function parseSetupTokenPrompt(text: string): SetupTokenPrompt | null {
+  return parseLoginPrompt(text, URL_PREAMBLE_RE);
+}
+
+/**
+ * Parses `claude auth login` output with the same URL and prompt validation as
+ * {@link parseSetupTokenPrompt}. Only the preamble line differs. This login
+ * prints no token; Claude Code saves the session in its own config directory.
+ */
+export function parseClaudeAuthLoginPrompt(text: string): SetupTokenPrompt | null {
+  return parseLoginPrompt(text, AUTH_LOGIN_URL_PREAMBLE_RE);
+}
+
+function parseLoginPrompt(text: string, preambleRe: RegExp): SetupTokenPrompt | null {
   if (typeof text !== "string" || text.length === 0) return null;
   const clean = stripTerminalControls(text);
-  const preamble = URL_PREAMBLE_RE.exec(clean);
+  const preamble = preambleRe.exec(clean);
   if (!preamble) return null;
   const afterPreamble = preamble.index + preamble[0].length;
   // The region after the preamble. The URL must start inside the start window.

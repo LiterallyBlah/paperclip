@@ -53,6 +53,11 @@ import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { aiConnectionUsageCache, aiConnectionUsageCacheKey, probeAiConnectionUsage, probeAiConnectionUsageDetailed } from "./ai-connection-usage.js";
 import { probeAiAccountIdentity } from "./ai-account-identity.js";
+import {
+  CLAUDE_CREDENTIAL_KIND_CONFIG_KEY, CLAUDE_ISSUED_TOKEN_MAX_LIFETIME_MS, CLAUDE_SESSION_DEFAULT_MIN_REMAINING_MS,
+  claudeCredentialKind, parseClaudeOAuthSession, refreshClaudeOAuthSessionWithCli, serializeClaudeOAuthSession,
+  type ClaudeOAuthSession,
+} from "./claude-oauth-session.js";
 
 /** Same human audience displayed by the existing Connections identity controls. */
 function canUseCredential(
@@ -76,6 +81,22 @@ export type AiAuthenticationFailureOutcome =
   | "stale_generation"
   | "recovered"
   | "not_applicable";
+
+/**
+ * One Claude session refresh at a time per grant, shared by every service
+ * instance in this server. Concurrent runs wait for and reuse the result.
+ */
+const claudeSessionRefreshes = new Map<string, Promise<string>>();
+/** Tests replace the Claude Code refresh with a double. */
+let claudeSessionRefresher: (session: ClaudeOAuthSession) => Promise<ClaudeOAuthSession> = (session) => refreshClaudeOAuthSessionWithCli(session);
+export function setClaudeSessionRefresherForTests(refresher?: (session: ClaudeOAuthSession) => Promise<ClaudeOAuthSession>) {
+  claudeSessionRefresher = refresher ?? ((session) => refreshClaudeOAuthSessionWithCli(session));
+}
+type CredentialAudit = { responsibleUserId: string | null; actorType: "user" | "agent" | "system"; actorId: string; issueId?: string | null; heartbeatRunId?: string | null };
+export type CredentialOptions = {
+  /** Claude sessions: the issued access token must have at least this much life left. */
+  minRemainingMs?: number;
+};
 
 export function aiConnectionService(db: Db) {
   const secrets = secretService(db);
@@ -164,6 +185,8 @@ export function aiConnectionService(db: Db) {
           companyId,
           ...metadata.data,
           usageProbeSupported: supportsAiConnectionUsage(metadata.data.provider, metadata.data.method),
+          ...(metadata.data.provider === "anthropic" && metadata.data.method === "subscription" && !metadata.data.routing
+            ? { credentialKind: claudeCredentialKind(connection.config) } : {}),
           name: connection.name,
           accountLabel: grant.providerTenant?.name,
           ...(needsReconnect ? { unavailableReason: "Reconnect with a separate sign-in to protect your existing terminal login." } : {}),
@@ -593,9 +616,73 @@ export function aiConnectionService(db: Db) {
     }
     return { ...row, provider };
   }
-  async function credential(row: Pick<Awaited<ReturnType<typeof select>>, "connection" | "grant">, retry = 0, audit?: { responsibleUserId: string | null; actorType: "user" | "agent" | "system"; actorId: string; issueId?: string | null; heartbeatRunId?: string | null }): Promise<string> {
+  /**
+   * The credential a consumer may use. For a Claude OAuth session this is only
+   * a short-lived access token, refreshed first when it has too little life
+   * left; the saved refresh token never leaves the server.
+   */
+  async function credential(row: Pick<Awaited<ReturnType<typeof select>>, "connection" | "grant">, retry = 0, audit?: CredentialAudit, options: CredentialOptions = {}): Promise<string> {
+    const stored = await storedCredential(row, retry, audit);
     const metadata = aiConnectionMetadataSchema.parse(row.connection.config.ai);
-    if (metadata.routing?.auth === "none") return "";
+    if (metadata.provider !== "anthropic" || metadata.method !== "subscription" || metadata.routing) return stored.value;
+    const session = parseClaudeOAuthSession(stored.value);
+    if (!session) return stored.value;
+    return issueClaudeAccessToken(row, session, audit, options.minRemainingMs ?? CLAUDE_SESSION_DEFAULT_MIN_REMAINING_MS);
+  }
+  function shortLivedAccessToken(session: ClaudeOAuthSession, minRemainingMs: number, now: number) {
+    const remaining = session.claudeAiOauth.expiresAt - now;
+    // Fail closed rather than hand a run a token that is not short-lived.
+    if (remaining > CLAUDE_ISSUED_TOKEN_MAX_LIFETIME_MS)
+      throw unprocessable("Reconnect this AI account", { code: "ai_connection_credential_not_short_lived" });
+    return remaining >= minRemainingMs ? session.claudeAiOauth.accessToken : null;
+  }
+  async function issueClaudeAccessToken(row: Parameters<typeof credential>[0], session: ClaudeOAuthSession, audit: CredentialAudit | undefined, minRemainingMs: number) {
+    const current = shortLivedAccessToken(session, minRemainingMs, Date.now());
+    if (current) return current;
+    const key = `${row.connection.companyId}:${row.grant.id}`;
+    let refresh = claudeSessionRefreshes.get(key);
+    if (!refresh) {
+      refresh = refreshClaudeSession(row, audit, minRemainingMs).finally(() => claudeSessionRefreshes.delete(key));
+      claudeSessionRefreshes.set(key, refresh);
+    }
+    return refresh;
+  }
+  async function refreshClaudeSession(row: Parameters<typeof credential>[0], audit: CredentialAudit | undefined, minRemainingMs: number): Promise<string> {
+    const reconnect = () => unprocessable("Reconnect this AI account", { code: "ai_connection_session_refresh_failed" });
+    // Another server path may have refreshed while this caller waited.
+    const latest = await storedCredential(row, 0, audit);
+    const session = parseClaudeOAuthSession(latest.value);
+    if (!session || !latest.secretId || latest.version === undefined) throw reconnect();
+    const fresh = shortLivedAccessToken(session, minRemainingMs, Date.now());
+    if (fresh) return fresh;
+    let rotated: ClaudeOAuthSession;
+    try { rotated = await claudeSessionRefresher(session); }
+    catch {
+      // Claude Code errors can carry account details; never forward them.
+      logger.warn({ connectionId: row.connection.id, grantId: row.grant.id }, "Claude session refresh failed");
+      throw reconnect();
+    }
+    try {
+      await secretService(db).rotate(latest.secretId,
+        { value: serializeClaudeOAuthSession(rotated), preserveAiSessionEpoch: true, expectedLatestVersion: latest.version },
+        { userId: row.grant.subjectUserId });
+    } catch {
+      // A reconnect or rotation won the race. Use what it saved if it is usable.
+      const winner = parseClaudeOAuthSession((await storedCredential(row, 0, audit)).value);
+      const token = winner && shortLivedAccessToken(winner, 0, Date.now());
+      if (token) return token;
+      throw reconnect();
+    }
+    await logActivity(db, { companyId: row.connection.companyId, actorType: "system", actorId: "claude_session_refresh",
+      action: "ai_connection.credential_refreshed", entityType: "tool_connection", entityId: row.connection.id,
+      details: { provider: "anthropic", grantId: row.grant.id, credentialKind: "oauth_session" } });
+    const token = shortLivedAccessToken(rotated, 0, Date.now());
+    if (!token) throw reconnect();
+    return token;
+  }
+  async function storedCredential(row: Pick<Awaited<ReturnType<typeof select>>, "connection" | "grant">, retry = 0, audit?: CredentialAudit): Promise<{ value: string; secretId?: string; version?: number }> {
+    const metadata = aiConnectionMetadataSchema.parse(row.connection.config.ai);
+    if (metadata.routing?.auth === "none") return { value: "" };
     const ref = row.grant.credentialSecretRefs.find(
       (r) => r.configPath === "ai.credential",
     );
@@ -657,9 +744,9 @@ export function aiConnectionService(db: Db) {
     if (!latest || latest.status !== "active") throw unprocessable("Reconnect this AI account");
     if (latest.latestVersion !== secret.latestVersion) {
       if (retry >= 2) throw unprocessable("AI credentials are changing. Retry this execution.", { code: "ai_connection_busy" });
-      return credential(row, retry + 1, audit);
+      return storedCredential(row, retry + 1, audit);
     }
-    return value;
+    return { value, secretId: secret.id, version: latest.latestVersion };
   }
   async function save(
     companyId: string,
@@ -708,6 +795,11 @@ export function aiConnectionService(db: Db) {
       );
     const id = reconnect?.connection.id ?? randomUUID();
     const grantId = reconnect?.grant.id ?? randomUUID();
+    // Record which Claude credential this is so the inventory can tell a
+    // short-lived session from a long-lived setup token without reading it.
+    const claudeKindConfig = input.provider === "anthropic" && input.method === "subscription" && !routing
+      ? { [CLAUDE_CREDENTIAL_KIND_CONFIG_KEY]: parseClaudeOAuthSession(verifiedCredential) ? "oauth_session" : "setup_token" }
+      : {};
     const persist = () => withAccountHomeSecretMutationLock(undefined, companyId, () => db.transaction(async (tx) => {
       await managementContext?.reauthorize();
       const secrets = secretService(tx);
@@ -868,7 +960,7 @@ export function aiConnectionService(db: Db) {
             status: "active",
             healthStatus: "ok",
             healthMessage: null,
-            config: { ...reconnect.connection.config, aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic" },
+            config: { ...reconnect.connection.config, aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic", ...claudeKindConfig },
             updatedAt: new Date(),
           })
           .where(eq(toolConnections.id, id));
@@ -893,6 +985,7 @@ export function aiConnectionService(db: Db) {
               sourceTemplateKey: source,
               ai: { provider: input.provider, method: input.method, ...(routing ? { routing } : {}) },
               aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic",
+              ...claudeKindConfig,
             },
             createdByUserId: userId,
           });
@@ -1061,9 +1154,9 @@ export function aiConnectionService(db: Db) {
     return pending.value;
   }
 
-  async function runtimeCredential(row: Parameters<typeof credential>[0]) {
+  async function runtimeCredential(row: Parameters<typeof credential>[0], options: CredentialOptions = {}) {
     const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config.ai);
-    if (!metadata.success || !["openai", "google"].includes(metadata.data.provider) || metadata.data.method !== "subscription") return credential(row);
+    if (!metadata.success || !["openai", "google"].includes(metadata.data.provider) || metadata.data.method !== "subscription") return credential(row, 0, undefined, options);
     if (!(await quotaCredentialRecovery(row.connection.companyId, row.grant.id).read())) return credential(row);
     let savingReplacement = false;
     return withAccountHomeSecretMutationLock(undefined, row.connection.companyId, async () => {

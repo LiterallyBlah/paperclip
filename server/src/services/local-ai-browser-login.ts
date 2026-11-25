@@ -1,6 +1,4 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { open } from "node:fs/promises";
-import { constants } from "node:fs";
 import path from "node:path";
 import { runSetupTokenLogin } from "@paperclipai/adapter-claude-local/server";
 import { runDeviceLogin } from "@paperclipai/adapter-codex-local/server";
@@ -54,7 +52,10 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "googl
   if (provider === "google") return startAntigravityBrowserLogin(home);
   const controller = new AbortController();
   const state: LocalBrowserLoginState = { abort: () => controller.abort() };
-  const args = provider === "anthropic" ? ["setup-token"] : provider === "muse" ? ["login"] : ["login", "--device-auth"];
+  // Claude uses its normal subscription login (BLA-5403): it saves a
+  // refreshable session in this private CLAUDE_CONFIG_DIR, never a long-lived
+  // setup token. Existing setup-token connections keep working unchanged.
+  const args = provider === "anthropic" ? ["auth", "login", "--claudeai"] : provider === "muse" ? ["login"] : ["login", "--device-auth"];
   let child: ChildProcessWithoutNullStreams | null = null;
   const driver = {
     async start(_command: string, onData: (chunk: string) => void): Promise<{ exitCode: number | null }> {
@@ -122,6 +123,7 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "googl
     const codeReady = new Promise<string>((resolve) => { deliverCode = resolve; });
     state.submitCode = (code) => { deliverCode?.(code); deliverCode = undefined; };
     void runSetupTokenLogin(driver, {
+      mode: "auth_login",
       timeoutMs: 300_000, signal: controller.signal,
       onPrompt: (prompt) => { state.authorizationUrl = prompt.url; },
       provideCode: (signal) => new Promise<string>((resolve, reject) => {
@@ -130,15 +132,8 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "googl
         signal.addEventListener("abort", abort, { once: true });
         codeReady.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
       }),
-      onCredential: async (bytes) => {
-        const file = await open(path.join(home, ".credentials.json"),
-          constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-        try {
-          await file.writeFile(JSON.stringify({ claudeAiOauth: { accessToken: bytes.toString("utf8") } }));
-        } finally {
-          await file.close();
-        }
-      },
+      // Claude Code writes the session to <home>/.credentials.json itself.
+      // Connect reads and verifies it there; nothing is parsed from output.
     }).then((result) => { state.outcome = result.outcome === "success" ? "success" : "failure"; })
       .catch(() => { state.outcome = "failure"; });
   } else if (provider === "muse") {

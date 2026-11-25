@@ -35,6 +35,7 @@ export {
 // input byte out of each log and each thrown error.
 export {
   parseSetupTokenPrompt,
+  parseClaudeAuthLoginPrompt,
   parseSetupTokenCredential,
   SETUP_TOKEN_PROMPT,
   SETUP_TOKEN_AUTH_URLS,
@@ -51,6 +52,7 @@ export type { SetupTokenPrompt } from "./setup-token-parse.js";
 export {
   runSetupTokenLogin,
   CLAUDE_SETUP_TOKEN_COMMAND,
+  CLAUDE_AUTH_LOGIN_COMMAND,
   CODE_SUBMISSION_TERMINATOR,
   CLAUDE_SETUP_TOKEN_MAX_BUFFER_CHARS,
 } from "./setup-token-runner.js";

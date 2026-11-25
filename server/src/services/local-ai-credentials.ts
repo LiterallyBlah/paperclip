@@ -6,6 +6,7 @@ import { readCodexAuthInfo, fetchCodexQuota } from "@paperclipai/adapter-codex-l
 import { parseGrokAuthPayload, hasUsableGrokAuthValue } from "@paperclipai/adapter-grok-local/server";
 import type { AiProvider } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
+import { parseClaudeOAuthSession, serializeClaudeOAuthSession } from "./claude-oauth-session.js";
 import { verifyAntigravityCredential } from "../vendor/paperclip-runner/index.js";
 
 export async function readVerifiedLocalAiCredentialDetails(provider: AiProvider, loginHome: string) {
@@ -37,6 +38,10 @@ export async function readVerifiedLocalAiCredential(provider: AiProvider, loginH
         if (!raw) continue;
         let parsed;
         try { parsed = JSON.parse(raw); } catch { continue; }
+        // `claude auth login` saves a refreshable session. Keep all of it in
+        // the connection secret; runs are issued only its access token.
+        const session = parseClaudeOAuthSession(raw);
+        if (session) return serializeClaudeOAuthSession(session);
         const value = parsed?.claudeAiOauth?.accessToken;
         if (typeof value === "string" && value.length) { token = value; break; }
       }

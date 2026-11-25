@@ -6,6 +6,7 @@ import {
   type LoginRunnerResult,
 } from "@paperclipai/adapter-utils";
 import {
+  parseClaudeAuthLoginPrompt,
   parseSetupTokenCredential,
   parseSetupTokenPrompt,
   type SetupTokenPrompt,
@@ -40,6 +41,13 @@ import {
 
 /** The fixed Claude setup-token command. The login flow needs a PTY. */
 export const CLAUDE_SETUP_TOKEN_COMMAND = "claude setup-token";
+
+/**
+ * The fixed Claude Code subscription login command. Unlike setup-token it
+ * prints no token: Claude Code saves a refreshable OAuth session (short-lived
+ * access token plus refresh token) in its CLAUDE_CONFIG_DIR.
+ */
+export const CLAUDE_AUTH_LOGIN_COMMAND = "claude auth login --claudeai";
 
 /**
  * The submission terminator for the browser code. The interactive login UI reads
@@ -129,7 +137,15 @@ export interface SetupTokenLoginResult extends LoginRunnerResult {
 }
 
 export interface RunSetupTokenLoginOptions extends LoginRunnerLifecycleOptions {
-  /** The login command. Defaults to {@link CLAUDE_SETUP_TOKEN_COMMAND}. */
+  /**
+   * `setup_token` (default) binds the printed token and delivers it through
+   * `onCredential`. `auth_login` runs {@link CLAUDE_AUTH_LOGIN_COMMAND}; it
+   * succeeds on a clean exit after the code was sent, and the caller verifies
+   * the session Claude Code saved in its config directory. No terminal output
+   * is scanned for a credential in that mode.
+   */
+  mode?: "setup_token" | "auth_login";
+  /** The login command. Defaults to the command for the selected mode. */
   command?: string;
   /** Receives the parsed prompt one time in memory. The caller displays it. */
   onPrompt: SetupTokenPromptSink;
@@ -201,8 +217,12 @@ export async function runSetupTokenLogin(
   driver: SetupTokenPtyDriver,
   options: RunSetupTokenLoginOptions,
 ): Promise<SetupTokenLoginResult> {
-  const { onPrompt, provideCode, onCredential, timeoutMs, signal } = options;
-  const command = options.command ?? CLAUDE_SETUP_TOKEN_COMMAND;
+  const { onPrompt, provideCode, timeoutMs, signal } = options;
+  const authLogin = options.mode === "auth_login";
+  // Never scan auth-login output for a token; it has none to deliver.
+  const onCredential = authLogin ? undefined : options.onCredential;
+  const parsePrompt = authLogin ? parseClaudeAuthLoginPrompt : parseSetupTokenPrompt;
+  const command = options.command ?? (authLogin ? CLAUDE_AUTH_LOGIN_COMMAND : CLAUDE_SETUP_TOKEN_COMMAND);
   const codeSubmitSettleMs = options.codeSubmitSettleMs ?? CODE_SUBMIT_SETTLE_MS;
   const log = options.log ?? (() => {});
 
@@ -312,7 +332,7 @@ export async function runSetupTokenLogin(
       // Parse the full buffer before any truncation. This order finds an early
       // prompt inside one large chunk, so the runner never drops it.
       buffer += chunk;
-      const prompt = parseSetupTokenPrompt(buffer);
+      const prompt = parsePrompt(buffer);
       if (prompt) {
         promptSurfaced = true;
         buffer = "";
@@ -374,6 +394,17 @@ export async function runSetupTokenLogin(
     if (exitCode !== 0) {
       log("[paperclip] Setup-token login command ended with a non-zero exit code.");
       return result("failure", exitCode);
+    }
+
+    if (authLogin) {
+      // Claude Code saved the session itself. A clean exit without a submitted
+      // code is not a sign-in; the caller still verifies the saved session.
+      if (!codeSubmitted) {
+        log("[paperclip] Claude login ended before a browser code was sent; treating the run as a failure.");
+        return result("failure", exitCode);
+      }
+      log("[paperclip] Claude login command ended successfully.");
+      return result("success", exitCode);
     }
 
     // The command exited cleanly. Deliver the bound token through the mandatory
