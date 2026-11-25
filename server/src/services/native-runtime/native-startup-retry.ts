@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { and, desc, eq, gte, inArray, ne, or, sql } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { agentConfigRevisions, heartbeatRuns, type Db } from "@paperclipai/db";
 import { readProviderFailure, type ProviderFailure } from "@paperclipai/shared";
 import { logger } from "../../middleware/logger.js";
 import { infrastructureRetryDelayMs, PROVIDER_LIMIT_DEFAULT_COOLDOWN_MS } from "../system-recovery-state.js";
@@ -38,8 +38,30 @@ export type AgentProviderLimitCooldown = {
 };
 
 /**
+ * When the agent last moved to another provider account: a new adapter, AI
+ * connection binding, or adapter environment (where credential bindings live).
+ * Limit evidence from before that move describes the previous account.
+ */
+async function latestProviderAccountChangeAt(db: Db, companyId: string, agentId: string, since: Date): Promise<number | null> {
+  const changed = (path: string) => sql`${agentConfigRevisions.beforeConfig} #> ${path}::text[] is distinct from ${agentConfigRevisions.afterConfig} #> ${path}::text[]`;
+  const [row] = await db
+    .select({ createdAt: agentConfigRevisions.createdAt })
+    .from(agentConfigRevisions)
+    .where(and(
+      eq(agentConfigRevisions.companyId, companyId),
+      eq(agentConfigRevisions.agentId, agentId),
+      gte(agentConfigRevisions.createdAt, since),
+      or(changed("{adapterType}"), changed("{runtimeConfig,aiConnection}"), changed("{adapterConfig,env}")),
+    ))
+    .orderBy(desc(agentConfigRevisions.createdAt))
+    .limit(1);
+  return row ? row.createdAt.getTime() : null;
+}
+
+/**
  * The latest known provider limit for this agent, from the current failure or
- * from the agent's recent runs. A later successful run clears older evidence.
+ * from the agent's recent runs. A later successful run, or a later move to
+ * another provider account, clears older evidence.
  */
 export async function agentProviderLimitCooldown(db: Db, input: {
   companyId: string;
@@ -51,10 +73,13 @@ export async function agentProviderLimitCooldown(db: Db, input: {
 }): Promise<AgentProviderLimitCooldown | null> {
   const now = input.now.getTime();
   let latest = limitEvidence(input.failure ?? null, input.now, input.runId ?? null);
+  const windowStart = new Date(now - NATIVE_PROVIDER_LIMIT_WINDOW_MS);
+  const accountChangedAt = await latestProviderAccountChangeAt(db, input.companyId, input.agentId, windowStart);
   const rows = await db
     .select({
       id: heartbeatRuns.id,
       status: heartbeatRuns.status,
+      startedAt: heartbeatRuns.startedAt,
       errorCode: heartbeatRuns.errorCode,
       observedAt: sql<Date>`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt})`.mapWith(heartbeatRuns.updatedAt),
       providerFailure: sql<unknown>`${heartbeatRuns.resultJson} -> 'providerFailure'`,
@@ -64,7 +89,7 @@ export async function agentProviderLimitCooldown(db: Db, input: {
     .where(and(
       eq(heartbeatRuns.companyId, input.companyId),
       eq(heartbeatRuns.agentId, input.agentId),
-      gte(heartbeatRuns.startedAt, new Date(now - NATIVE_PROVIDER_LIMIT_WINDOW_MS)),
+      gte(heartbeatRuns.startedAt, windowStart),
       ...(input.runId ? [ne(heartbeatRuns.id, input.runId)] : []),
       or(
         eq(heartbeatRuns.status, "succeeded"),
@@ -77,6 +102,8 @@ export async function agentProviderLimitCooldown(db: Db, input: {
   for (const row of rows) {
     // The provider accepted work after this point, so its allowance was restored.
     if (row.status === "succeeded") break;
+    // A run that started before the move used the previous account.
+    if (accountChangedAt !== null && (row.startedAt ?? row.observedAt).getTime() < accountChangedAt) continue;
     let recorded = limitEvidence(readProviderFailure(row.providerFailure), row.observedAt, row.id);
     if (recorded === null && PROVIDER_LIMIT_ERROR_CODES.includes(row.errorCode ?? "")) {
       const reset = row.retryNotBefore ? Date.parse(row.retryNotBefore) : Number.NaN;
