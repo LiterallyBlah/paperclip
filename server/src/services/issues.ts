@@ -28,6 +28,7 @@ import { assertOnboardingFirstTaskCreationAllowed, assertOnboardingFirstTaskDepe
 import { readPersistedConfirmationDecision } from "./confirmation-decision.js";
 import { resolveConnectionIntentContinuationSource, resolveItemVerdictContinuationWake } from "./chat-interaction-continuation.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
+import { closeRecoveryActionsForTerminalSourceIssue } from "./issue-recovery-actions.js";
 import { measureRunTransaction } from "./execution-transaction-timing.js";
 import { readNativeMonitorSource } from "./native-runtime/native-monitor-delivery.js";
 import { readNativeContinuationSource } from "./native-runtime/native-continuation-delivery.js";
@@ -11380,7 +11381,14 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
-      options: { bindRuntimeSharedWorkspace?: boolean } = {},
+      options: {
+        bindRuntimeSharedWorkspace?: boolean;
+        /**
+         * A recovery action the caller resolves itself, with its own outcome,
+         * in this same transaction. Terminal closure leaves it to the caller.
+         */
+        callerResolvedRecoveryActionId?: string | null;
+      } = {},
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
@@ -12080,6 +12088,14 @@ export function issueService(db: Db) {
           }
           if (updated.status === "done" || updated.status === "cancelled") {
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
+            // Open recovery actions end with their source issue, in this
+            // transaction, so no later recovery wake targets a closed task.
+            await closeRecoveryActionsForTerminalSourceIssue(tx, {
+              companyId: updated.companyId,
+              sourceIssueId: updated.id,
+              sourceStatus: updated.status,
+              exceptActionId: options.callerResolvedRecoveryActionId ?? null,
+            });
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, status cards)
             // that never touch the HTTP routes. Governed cards expire; ordinary

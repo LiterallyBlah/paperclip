@@ -41,7 +41,8 @@ import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions, markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
-import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { issueRecoveryActionService, survivesTerminalSourceIssue } from "../services/issue-recovery-actions.js";
+import { OWNER_UNPROVABLE_CAUSE } from "../services/recovery/owner-gone-attestation.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { issueService } from "../services/issues.js";
 import { setPluginEventBus } from "../services/activity-log.js";
@@ -91,6 +92,26 @@ function makeRecoveryActionRow(overrides: Record<string, unknown> = {}) {
 
 // Stranded-run fixtures began before anything the test later records.
 const LATEST_RUN_TIMES = { startedAt: new Date(), createdAt: new Date() };
+
+describe("survivesTerminalSourceIssue", () => {
+  it.each([
+    OWNER_UNPROVABLE_CAUSE,
+    "native_workspace_finalization_owner_unverified",
+    "native_workspace_sync_out_unsafe_archive",
+    "native_workspace_sync_out_unrecoverable",
+    "native_workspace_sync_out_retry_exhausted",
+  ])("keeps %s open past a terminal source", cause => {
+    expect(cause).toEqual(expect.any(String));
+    expect(survivesTerminalSourceIssue({ cause })).toBe(true);
+  });
+  it("keeps in-flight system recovery open and closes everything else", () => {
+    for (const state of ["scheduled", "running", "awaiting_evidence"]) {
+      expect(survivesTerminalSourceIssue({ cause: "saved-debt", evidence: { systemRecovery: { state } } })).toBe(true);
+    }
+    expect(survivesTerminalSourceIssue({ cause: "saved-debt", evidence: { systemRecovery: { state: "completed" } } })).toBe(false);
+    expect(survivesTerminalSourceIssue({ cause: "saved-debt" })).toBe(false);
+  });
+});
 
 describe("issueRecoveryActionService", () => {
   it.each(["unrelated unique constraint", "other SQLSTATE", "cyclic cause"])("does not retry %s errors", async kind => {
@@ -3664,6 +3685,70 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       outcome: "false_positive",
       resolutionNote: "Recovery signal was stale; return to review.",
     });
+  });
+
+  it("cancels only the recovery action on a blocked source issue without changing or replaying the source (BLA-4683)", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: coderId }).where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:action-only-cancel",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const runsBefore = await db.select().from(heartbeatRuns);
+    const wakesBefore = await db.select().from(agentWakeupRequests);
+
+    // An agent, even the recovery owner, cannot cancel; the action stays open.
+    const denied = await request(createApp({
+      type: "agent", agentId: managerId, companyId, runId: randomUUID(), source: "agent_jwt",
+    }))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({ actionId: action.id, outcome: "cancelled", sourceIssueStatus: "blocked" });
+    expect(denied.status).toBeGreaterThanOrEqual(400);
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({ id: action.id });
+
+    const app = createApp();
+    // A different non-terminal status is not an action-only cancellation.
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({ actionId: action.id, outcome: "cancelled", sourceIssueStatus: "todo" })
+      .expect(409);
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({ id: action.id });
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "cancelled",
+        sourceIssueStatus: "blocked",
+        resolutionNote: "Superseded; the source task stays blocked.",
+      })
+      .expect(200);
+
+    expect(resolved.body.recoveryAction).toMatchObject({ id: action.id, status: "cancelled", outcome: "cancelled" });
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue).toMatchObject({ status: "blocked", assigneeAgentId: coderId });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(runsBefore.length);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(wakesBefore.length);
+    const activityRows = await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId));
+    expect(activityRows.map((row) => row.action)).not.toContain("issue.updated");
+
+    // Replaying the settled cancellation is idempotent and still changes nothing.
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({ actionId: action.id, outcome: "cancelled", sourceIssueStatus: "blocked" })
+      .expect(200);
+    const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(after).toMatchObject({ status: "blocked", assigneeAgentId: coderId });
   });
 
   it("enforces company scope when resolving recovery actions", async () => {
