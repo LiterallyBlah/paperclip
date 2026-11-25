@@ -147,6 +147,70 @@ describe("claude_local ACP startup fallback", () => {
     );
   });
 
+  it("resumes a legacy CLI session from a fresh managed home linked to the retained transcripts", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "claude-cli-retained-resume-"));
+    try {
+      const durable = path.join(root, "companies", "company-1", "agents", "agent-1", "claude-transcripts", "scope", "projects");
+      await fs.mkdir(durable, { recursive: true });
+      // Simulates the Claude CLI: transcripts live under $CLAUDE_CONFIG_DIR/projects/<cwd>/<session>.jsonl.
+      let created = 0;
+      runAdapterExecutionTargetProcess.mockImplementation((async (
+        _runId: string, _target: unknown, _command: string, args: string[], options: { env: Record<string, string>; cwd: string },
+      ) => {
+        const projectDir = path.join(options.env.CLAUDE_CONFIG_DIR, "projects", options.cwd.replace(/[^a-zA-Z0-9-]/g, "-"));
+        const resumeAt = args.indexOf("--resume");
+        const resumeId = resumeAt >= 0 ? args[resumeAt + 1] : null;
+        const base = { signal: null, timedOut: false, stderr: "", pid: 1, startedAt: new Date().toISOString() };
+        if (resumeId && !(await fs.stat(path.join(projectDir, `${resumeId}.jsonl`)).catch(() => null))) {
+          return { ...base, exitCode: 1, stdout: JSON.stringify({
+            type: "result", session_id: resumeId, is_error: true, subtype: "error_during_execution",
+            result: `No conversation found with session ID: ${resumeId}`,
+          }) };
+        }
+        const sessionId = resumeId ?? `00000000-0000-4000-8000-00000000000${++created}`;
+        await fs.mkdir(projectDir, { recursive: true });
+        await fs.appendFile(path.join(projectDir, `${sessionId}.jsonl`), "{}\n");
+        return { ...base, exitCode: 0, stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: "claude-sonnet" }),
+          JSON.stringify({ type: "result", session_id: sessionId, subtype: "success", is_error: false, result: "ok" }),
+        ].join("\n") };
+      }) as never);
+      const runWithFreshHome = async (name: string, linked: boolean, runtime: Record<string, unknown>) => {
+        const providerHome = path.join(root, name, "provider");
+        await fs.mkdir(providerHome, { recursive: true });
+        if (linked) await fs.symlink(durable, path.join(providerHome, "projects"));
+        const ctx = buildContext({
+          engine: "cli",
+          managedAiConnection: { provider: "anthropic", method: "subscription" },
+          env: { CLAUDE_CONFIG_DIR: providerHome },
+        });
+        const result = await execute({ ...ctx, runtime: { ...ctx.runtime, ...runtime } } as never);
+        await fs.rm(path.join(root, name), { recursive: true, force: true });
+        return result as { sessionId?: string | null; sessionParams?: Record<string, unknown> | null };
+      };
+      const resumeFrom = (first: { sessionId?: string | null; sessionParams?: Record<string, unknown> | null }) => ({
+        sessionId: first.sessionId, sessionParams: first.sessionParams, sessionDisplayId: first.sessionId,
+      });
+
+      const first = await runWithFreshHome("home-1", true, {});
+      expect(first.sessionId).toBe("00000000-0000-4000-8000-000000000001");
+      runAdapterExecutionTargetProcess.mockClear();
+      const second = await runWithFreshHome("home-2", true, resumeFrom(first));
+      expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(1);
+      expect((runAdapterExecutionTargetProcess.mock.calls[0] as unknown[])[3]).toEqual(expect.arrayContaining(["--resume", first.sessionId]));
+      expect(second.sessionId).toBe(first.sessionId);
+
+      // Without the link a fresh home has no transcript, so the CLI starts over.
+      runAdapterExecutionTargetProcess.mockClear();
+      const unlinked = await runWithFreshHome("home-3", false, resumeFrom(second));
+      expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(2);
+      expect(unlinked.sessionId).not.toBe(first.sessionId);
+    } finally {
+      runAdapterExecutionTargetProcess.mockReset();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("mounts the durable transcript directory a managed connection links into the Claude config dir", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "claude-confined-transcripts-"));
     try {
