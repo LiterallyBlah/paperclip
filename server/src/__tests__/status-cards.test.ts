@@ -1613,6 +1613,63 @@ describeEmbeddedPostgres("status card routes", () => {
     });
   }
 
+  // ------------------------------------------- open generation with no live run (BLA-5065)
+
+  // Live stuck shape (platform card, 24 Nov 07:01): the Summarizer's only run
+  // for the generation task failed after ~1 s with no tokens, the task stayed
+  // open, nothing was queued, and the ledger row stayed `running` with no runId.
+  async function seedStuckGeneration(options: { runStatus?: string; idleMs?: number } = {}) {
+    const { company, summarizer, card } = await seedRecoveryCard();
+    const generation = await tickEnqueuesGeneration(card.id, new Date());
+    const idleSince = new Date(Date.now() - (options.idleMs ?? 31 * MINUTE));
+    await db.update(issues).set({ status: "in_progress", updatedAt: idleSince }).where(eq(issues.id, generation.id));
+    await db.update(statusCardUpdates).set({ startedAt: idleSince }).where(eq(statusCardUpdates.generationIssueId, generation.id));
+    const runStatus = options.runStatus ?? "failed";
+    const finished = runStatus === "failed";
+    await db.insert(heartbeatRuns).values({
+      companyId: company.id, agentId: summarizer.id, status: runStatus, invocationSource: "assignment",
+      contextSnapshot: { issueId: generation.id }, startedAt: idleSince, finishedAt: finished ? idleSince : null,
+    });
+    return { card, generation };
+  }
+
+  it("reclaims a generation whose only run failed and left the task open", async () => {
+    const { card, generation } = await seedStuckGeneration();
+    expect(await readCard(card.id)).toMatchObject({ generatingIssueId: generation.id, state: "active" });
+
+    const release = await statusCardService(db).tickDueStatusCards(new Date());
+    expect(release).toMatchObject({ evaluated: 0, enqueued: [] });
+    const released = await readCard(card.id);
+    const [failedRow] = await ledger(card.id);
+    expect(failedRow).toMatchObject({ status: "failed", finishedAt: expect.any(Date), generationIssueId: generation.id });
+    expect(released).toMatchObject({ generatingIssueId: null, state: "error", failureReason: expect.any(String) });
+    expect((await db.select().from(issues).where(eq(issues.id, generation.id)))[0]?.status).toBe("cancelled");
+    expect(released.nextEvalAt).toEqual(new Date(failedRow!.finishedAt!.getTime() + 15 * MINUTE));
+
+    const retry = await tickEnqueuesGeneration(card.id, new Date(released.nextEvalAt!.getTime() + 1000));
+    expect(await readCard(card.id)).toMatchObject({ generatingIssueId: retry.id, state: "active", failureReason: null });
+    expect((await ledger(card.id)).map((row) => row.status)).toEqual(["failed", "running"]);
+  });
+
+  it("leaves an open generation alone while its run is live or it is inside the stale window", async () => {
+    for (const options of [{ runStatus: "running" }, { runStatus: "queued" }, { idleMs: 5 * MINUTE }]) {
+      const { card, generation } = await seedStuckGeneration(options);
+      await statusCardService(db).tickDueStatusCards(new Date());
+      expect(await readCard(card.id)).toMatchObject({ generatingIssueId: generation.id, state: "active" });
+      expect((await ledger(card.id)).map((row) => row.status)).toEqual(["running"]);
+      expect((await db.select().from(issues).where(eq(issues.id, generation.id)))[0]?.status).toBe("in_progress");
+    }
+  });
+
+  it("closes a ledger row left running after its generation task is gone", async () => {
+    const { card } = await seedRecoveryCard();
+    const old = new Date(Date.now() - 31 * MINUTE);
+    await db.insert(statusCardUpdates).values({ cardId: card.id, kind: "incremental", trigger: "reactive", status: "running", startedAt: old });
+    await statusCardService(db).tickDueStatusCards(new Date());
+    const rows = await ledger(card.id);
+    expect(rows[0]).toMatchObject({ status: "failed", finishedAt: expect.any(Date) });
+  });
+
   it("backs off repeated abandoned generations and stops after a finite cap", async () => {
     const { card } = await seedRecoveryCard();
     const service = statusCardService(db);

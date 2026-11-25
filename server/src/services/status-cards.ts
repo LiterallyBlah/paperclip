@@ -4,11 +4,13 @@ import { createHash } from "node:crypto";
 import { and, desc, eq, gt, gte, inArray, isNotNull, isNull, lte, ne, or, sql, type SQL } from "drizzle-orm";
 import {
   agents,
+  agentWakeupRequests,
   companies,
   companyMemberships,
   costEvents,
   documentRevisions,
   documents,
+  heartbeatRuns,
   issues,
   issueComments,
   statusCards,
@@ -69,6 +71,14 @@ const STALLED_GENERATION_ISSUE_STATUSES = ["done", "cancelled", "blocked"] as co
 const STATUS_CARD_ABANDONED_RETRY_LIMIT = 3;
 const STATUS_CARD_ABANDONED_BACKOFF_MIN_MS = 60 * 1000;
 const STATUS_CARD_ABANDONED_BACKOFF_CAP_MS = 2 * 60 * 60 * 1000;
+// BLA-5065: a generation whose only run failed leaves its task open (todo or
+// in_progress) with nothing queued, so the status-keyed release above never
+// fires and the card stays claimed for ever. A claim with no live run and no
+// pending wake for this long is treated as abandoned. Generations normally
+// finish in 1-3 min; the window also lets the heartbeat's own retry settle.
+const STATUS_CARD_GENERATION_STALE_MS = 30 * 60 * 1000;
+const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "scheduled_retry", "running"] as const;
+const LIVE_WAKEUP_REQUEST_STATUSES = ["queued", "deferred_issue_execution", "claimed"] as const;
 
 function isReopenableGenerationStatus(status: string) {
   return TERMINAL_ISSUE_STATUSES.has(status) || status === "blocked";
@@ -1203,6 +1213,8 @@ export function statusCardService(
       await db.transaction(tx => finalizeStatusCardsForStalledGeneration(tx, issue as Parameters<typeof finalizeStatusCardsForStalledGeneration>[1]));
     }
 
+    const reclaimed = await reclaimOrphanedGenerations();
+
     const parked = await db.select().from(statusCards).where(and(
       isNull(statusCards.archivedAt),
       isNull(statusCards.generatingIssueId),
@@ -1234,7 +1246,111 @@ export function statusCardService(
         .returning({ id: statusCards.id }));
       if (updated) rearmed += 1;
     }
-    return { released: stalled.length, rearmed };
+    return { released: stalled.length + reclaimed, rearmed };
+  }
+
+  /**
+   * BLA-5065. Release generations that stopped without reaching a status the
+   * transition hook sees:
+   *  - a card claimed by an open (non-terminal, non-blocked) generation task
+   *    with no queued/running run and no pending wake, idle past
+   *    STATUS_CARD_GENERATION_STALE_MS. The task is cancelled through the issue
+   *    service, so the existing transition hook releases the card (`error`) and
+   *    closes the ledger row `failed`; the re-arm below then retries it.
+   *  - a ledger row left `running` whose generation is no longer the card's
+   *    claim (task gone, card released or re-claimed elsewhere). It is closed
+   *    `failed` so the ledger never shows a generation running for ever.
+   */
+  async function reclaimOrphanedGenerations() {
+    // Judge idleness on the database clock that wrote these timestamps, not the
+    // tick's `now` (callers and tests may pass a scheduled or simulated time).
+    const staleBefore = sql`now() - make_interval(secs => ${STATUS_CARD_GENERATION_STALE_MS / 1000})`;
+    const claimed = await db.select({ card: statusCards, issue: issues })
+      .from(statusCards)
+      .innerJoin(issues, and(eq(issues.id, statusCards.generatingIssueId), eq(issues.companyId, statusCards.companyId)))
+      .where(and(
+        isNull(statusCards.archivedAt),
+        sql`${issues.status} not in ('done', 'cancelled', 'blocked')`,
+        sql`${issues.updatedAt} <= ${staleBefore}`,
+      ));
+    let reclaimed = 0;
+    for (const { card, issue } of claimed) {
+      if (await generationIsLive(card, issue.id, staleBefore)) continue;
+      const postCommitActions: IssuePostCommitAction[] = [];
+      const publications: ActivityPublication[] = [];
+      const cancelled = await db.transaction(async tx => {
+        const [current] = await tx.select({ status: issues.status }).from(issues)
+          .where(and(
+            eq(issues.id, issue.id),
+            eq(issues.companyId, card.companyId),
+            eq(statusCards.generatingIssueId, issue.id),
+            sql`${issues.updatedAt} <= ${staleBefore}`,
+          ))
+          .innerJoin(statusCards, eq(statusCards.id, card.id))
+          .for("update", { of: issues });
+        if (!current || STALLED_GENERATION_ISSUE_STATUSES.includes(current.status as never)) return false;
+        await issueService(tx as unknown as Db).update(issue.id,
+          { status: "cancelled", companyGuard: card.companyId }, tx, publications, postCommitActions);
+        return true;
+      });
+      for (const publication of publications) publishActivity(publication);
+      await executeIssuePostCommitActions(db, postCommitActions);
+      if (cancelled) {
+        reclaimed += 1;
+        logger.warn({ cardId: card.id, generationIssueId: issue.id, issueStatus: issue.status },
+          "status card generation had no live run; cancelled and released for retry");
+      }
+    }
+
+    // Ledger rows still `running` that no card claim can ever finish.
+    const orphanRows = await db.select({ id: statusCardUpdates.id, cardId: statusCardUpdates.cardId })
+      .from(statusCardUpdates)
+      .innerJoin(statusCards, eq(statusCards.id, statusCardUpdates.cardId))
+      .where(and(
+        eq(statusCardUpdates.status, "running"),
+        isNull(statusCardUpdates.finishedAt),
+        sql`${statusCardUpdates.startedAt} <= ${staleBefore}`,
+        or(
+          isNull(statusCardUpdates.generationIssueId),
+          isNull(statusCards.generatingIssueId),
+          ne(statusCards.generatingIssueId, statusCardUpdates.generationIssueId),
+        ),
+      ));
+    for (const row of orphanRows) {
+      await db.update(statusCardUpdates).set({
+        status: "failed",
+        error: "Status-card generation ended without writing a summary (its task or run is gone).",
+        finishedAt: new Date(),
+      }).where(and(eq(statusCardUpdates.id, row.id), eq(statusCardUpdates.status, "running"), isNull(statusCardUpdates.finishedAt)));
+    }
+    return reclaimed;
+  }
+
+  async function generationIsLive(card: StatusCardRow, issueId: string, staleBefore: SQL) {
+    const [run] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, card.companyId),
+        or(eq(heartbeatRuns.issueId, issueId), sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`),
+        or(
+          inArray(heartbeatRuns.status, [...LIVE_HEARTBEAT_RUN_STATUSES]),
+          sql`${heartbeatRuns.finishedAt} > ${staleBefore}`,
+        ),
+      ))
+      .limit(1);
+    if (run) return true;
+    const [wake] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, card.companyId),
+        inArray(agentWakeupRequests.status, [...LIVE_WAKEUP_REQUEST_STATUSES]),
+        sql`(
+          ${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}
+          or ${agentWakeupRequests.payload} ->> 'taskId' = ${issueId}
+          or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId' = ${issueId}
+          or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId' = ${issueId}
+        )`,
+      ))
+      .limit(1);
+    return Boolean(wake);
   }
 
   async function tickDueStatusCards(now = new Date(), reactiveCompanies?: ReadonlySet<string> | "changed", reconstruct = false) {
