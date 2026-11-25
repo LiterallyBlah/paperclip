@@ -7,13 +7,14 @@ import { isCodexLocalKnownModel, codexLocalReasoningEffortsForModel } from "@pap
 import { models as claudeModels, claudeLocalReasoningEffortsForModel } from "@paperclipai/adapter-claude-local";
 import { models as grokModels, grokLocalReasoningEffortsForModel } from "@paperclipai/adapter-grok-local";
 import { aiConnectionService } from "./ai-connections.js";
+import { aiConnectionRoutedRuntimeKeys } from "./ai-connection-session.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { logActivity } from "./activity-log.js";
 import { forbidden, notFound, conflict, unprocessable } from "../errors.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { resolvePaperclipRunnerProviderProfile, resolvePaperclipRunnerNativeProviderInput } from "./native-runtime/provider-profile.js";
 
-const routedRuntimeKeys = new Set(["provider", "acpxAgent", "model", "modelReasoningEffort", "reasoningEffort", "effort", "variant"]);
+const routedRuntimeKeys = new Set<string>(aiConnectionRoutedRuntimeKeys);
 export function applyAiConnectionRouterTaskSettings(config: Record<string, unknown>, selection: AiConnectionRouterSelection) {
   return { ...Object.fromEntries(Object.entries(config).filter(([key]) => !routedRuntimeKeys.has(key))), ...selection.runtimeConfig };
 }
