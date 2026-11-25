@@ -134,3 +134,12 @@ The live-only migration `0375_peaceful_arachne` is renumbered `0453_peaceful_ara
 #76's live `0375_recovery_coordinator_agent` is renumbered `0454_recovery_coordinator_agent` under the same byte-identical rule (it is also `ADD COLUMN IF NOT EXISTS`).
 
 The disposition of each live file, and each hand-resolved hunk, is the `patch-table` document on BLA-4425.
+
+## Carried open upstream PRs
+
+Ported from open upstream PRs ahead of an upstream release. Retire a row when upstream merges the PR and a release that contains it becomes our base; then drop the local commits in favour of the upstream ones.
+
+| Upstream PR | Upstream head carried | Local commits | Required behaviour / retirement condition | Port notes |
+| --- | --- | --- | --- | --- |
+| [#21098](https://github.com/paperclipai/paperclip/pull/21098) bounded subscription usage checks | `1b6a38b83233` | `fix(ai-connections): share one bounded usage cache…`, `fix(ai-connections): fence timed-out usage checks…` (`cherry-pick -x`) | One shared, bounded usage cache for the router and the usage panel; a 429 backs off the check by its `Retry-After` and never marks the account limited; a timed-out check is fenced from the provider. Retire when upstream releases #21098. | One hand-resolved hunk in `ai-connection-usage.ts`: kept the local 403 HTML edge-page → `provider_unavailable` rule and the local `muse` unsupported case beside upstream's 429 branch and new return shape. Not carried: `1b6a38b83` (pin update for `tests/runner-e2e/source-sdk-public-inputs.json`, which this base does not have). |
+| [#21188](https://github.com/paperclipai/paperclip/pull/21188) resume a direct-binding session when a pool selects the same account | `f8bf312c2ff0` | `fix(router): resume a direct-binding session when a pool selects the same account` (`cherry-pick -x`) | Moving an agent from a direct binding to a pool that selects the same account, model and effort resumes the saved session; any other change still starts a new one. Retire when upstream releases #21188. | Applied on top of #21098: the router hunk keeps #21098's removal of the local usage maps. Test imports: only `agentService` added (upstream's other imports are not used by the carried tests). `heartbeat.ts` and `session-preparation.ts` applied cleanly. |

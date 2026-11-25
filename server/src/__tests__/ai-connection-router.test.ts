@@ -27,6 +27,7 @@ import { legacyExecutionNeedsReconciliation } from "../services/legacy-execution
 import { getServerAdapter, registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { waitForPendingRunFailureReports } from "../services/run-failure-report.js";
 import { dotRunnerBroker } from "../services/dot-runner-broker.js";
+import { agentService } from "../services/agents.js";
 
 const captureRunFailure = vi.hoisted(() => vi.fn());
 vi.mock("../sentry.js", async (importOriginal) => ({
@@ -303,6 +304,42 @@ describe("durable, authorized connection routing", () => {
     try { const pool = await makePool({ mode: "usage_aware", members: [members[1]!] }); const start = Date.now(); expect((await resolve(pool.id, "slow-probe")).memberId).toBe(members[1]!.id); expect(Date.now() - start).toBeLessThan(20_000); expect(proposal.mock.calls.at(-1)?.[2].candidates[0]?.usage).toBeUndefined(); }
     finally { spy.mockRestore(); }
   }, 25_000);
+  it("shares one cached usage check between the usage route and pool routing", async () => {
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, members[1]!.binding.grantId));
+    const ref = grant!.credentialSecretRefs.find(ref => ref.configPath === "ai.credential")!;
+    await secretService(db).rotate(ref.secretId, { value: "fixture-route-shared", preserveAiSessionEpoch: true }, { userId: "alice" });
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", userId: "alice", source: "session", companyIds: [companyId], memberships: [{ companyId, status: "active", membershipRole: "member" }] } as unknown as typeof req.actor; next(); });
+    app.use("/api", aiConnectionRoutes(db)); app.use(errorHandler);
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({ five_hour: { utilization: 12 } })));
+    try {
+      const url = `/api/companies/${companyId}/ai-connections/${members[1]!.binding.connectionId}/usage?grantId=${members[1]!.binding.grantId}`;
+      const direct = await request(app).get(url);
+      expect(direct.status).toBe(200); expect(direct.body.status).toBe("ok"); expect(spy).toHaveBeenCalledTimes(1);
+      expect((await request(app).get(url)).body.checkedAt).toBe(direct.body.checkedAt);
+      const pool = await makePool({ mode: "usage_aware", members: [members[1]!] }); await resolve(pool.id, "route-shared");
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(proposal.mock.calls.at(-1)?.[2].candidates[0]?.usage?.checkedAt).toBe(direct.body.checkedAt);
+      expect((await service().inspect(companyId, pool.id, "alice"))[members[1]!.id]?.checkedAt).toBe(direct.body.checkedAt);
+    } finally { spy.mockRestore(); }
+  });
+  it("keeps a throttled usage check unknown to the policy and backs it off", async () => {
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, members[1]!.binding.grantId));
+    const ref = grant!.credentialSecretRefs.find(ref => ref.configPath === "ai.credential")!;
+    await secretService(db).rotate(ref.secretId, { value: "fixture-throttled", preserveAiSessionEpoch: true }, { userId: "alice" });
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("{}", { status: 429, headers: { "Retry-After": "120" } }));
+    try {
+      const pool = await makePool({ mode: "usage_aware", members: [members[1]!] });
+      const before = Date.now();
+      expect((await resolve(pool.id, "throttled-1")).memberId).toBe(members[1]!.id);
+      const usage = proposal.mock.calls.at(-1)?.[2].candidates[0]?.usage;
+      // A throttled check is neither zero usage nor exhaustion: no limits, an explicit retry time.
+      expect(usage).toMatchObject({ status: "error", errorCode: "rate_limited", limits: [], overage: null });
+      expect(Date.parse(usage!.retryAt!)).toBeGreaterThanOrEqual(before + 120_000);
+      expect((await resolve(pool.id, "throttled-2")).memberId).toBe(members[1]!.id);
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally { spy.mockRestore(); }
+  });
   it("persists run-key affinity before policy calls and reuses it across allocation recovery", async () => {
     await instanceSettingsService(db).updateExperimental({ enableAiConnectionRouters: true, enableWorktreeRunExecution: true });
     const pool = await makePool({ members: [members[1]!] });
@@ -495,6 +532,58 @@ describe("durable, authorized connection routing", () => {
     }
   }, 30_000);
 
+  describe("static binding to a pool that selects the same account", () => {
+    const sameAccountCase = async (options: { profile?: Record<string, unknown>; routerPatch?: Record<string, unknown> } = {}) => {
+      await instanceSettingsService(db).updateExperimental({ enableAiConnectionRouters: true });
+      const member = { ...members[1]!, id: randomUUID(), profile: { provider: "acpx", acpxAgent: "claude", model: "claude-sonnet-5", effort: "high", ...options.profile } } as AiConnectionPoolMember;
+      const pool = await makePool({ members: [member] });
+      const workspace = path.join(home, `same-account-${randomUUID()}`); await mkdir(workspace);
+      const [agent] = await db.insert(agents).values({ companyId, name: "Same account fixture", status: "idle", adapterType: "claude_local",
+        adapterConfig: { cwd: workspace, engine: "cli", model: "claude-sonnet-5", effort: "high" },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } } }).returning();
+      const [issue] = await db.insert(issues).values({ companyId, title: "Same account fixture", status: "todo", assigneeAgentId: agent!.id, responsibleUserId: "alice", createdByUserId: "alice" }).returning();
+      const savedSession = randomUUID();
+      const execute = vi.fn(async (input: { runtime: { sessionId: string | null } }) => {
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, issue!.id));
+        return { exitCode: 0, signal: null, timedOut: false, sessionId: input.runtime.sessionId ?? savedSession, sessionParams: { sessionId: input.runtime.sessionId ?? savedSession, cwd: workspace }, resultJson: {} };
+      });
+      registerServerAdapter({ ...getServerAdapter("claude_local"), execute });
+      const heartbeat = heartbeatService(db, { pluginWorkerManager: worker, runtimeEnv: {} });
+      const revise = (patch: Record<string, unknown>) => agentService(db).update(agent!.id, patch, { recordRevision: { createdByUserId: "alice" } });
+      const wake = async () => {
+        await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issue!.id));
+        const run = await heartbeat.wakeup(agent!.id, { source: "on_demand", reason: "manual", triggerDetail: "manual", payload: { issueId: issue!.id }, contextSnapshot: { issueId: issue!.id, responsibleUserId: "alice", wakeReason: "manual" } });
+        await heartbeat.drainActiveRunExecutions();
+        const finished = await heartbeat.getRun(run!.id);
+        expect(finished?.status, finished?.error ?? undefined).toBe("succeeded");
+        return { finished, runtime: execute.mock.calls.at(-1)![0].runtime, freshness: (finished?.resultJson as { configFreshness?: { session?: Record<string, unknown> } })?.configFreshness?.session };
+      };
+      try {
+        const staticBinding = members[1]!.binding;
+        await revise({ runtimeConfig: { ...agent!.runtimeConfig, aiConnection: staticBinding } });
+        const baseline = await wake();
+        expect(baseline.runtime.sessionId).toBeNull();
+        await revise({ ...options.routerPatch, runtimeConfig: { ...agent!.runtimeConfig, aiConnection: { mode: "router", connectionId: pool.id } } });
+        const routed = await wake();
+        expect((routed.finished?.contextSnapshot?.aiRouterSelection as { memberId?: string })?.memberId).toBe(member.id);
+        return { savedSession, routed };
+      } finally { unregisterServerAdapter("claude_local"); await heartbeat.drainActiveRunExecutions(); }
+    };
+    it("resumes the saved session when only the binding changes to a pool member with the same account, model and effort", async () => {
+      const { savedSession, routed } = await sameAccountCase();
+      expect(routed.freshness).toMatchObject({ reset: false, taskSessionReused: true, storedFingerprintPresent: true, changedCategories: [] });
+      expect(routed.runtime.sessionId).toBe(savedSession);
+    }, 60_000);
+    it.each([
+      ["a different model", { profile: { model: "claude-opus-5" } }],
+      ["a different effort", { profile: { effort: "low" } }],
+      ["an unrelated setting in the same revision", { routerPatch: { name: "Renamed fixture" } }],
+    ])("still starts a new session for %s", async (_label, options) => {
+      const { routed } = await sameAccountCase(options);
+      expect(routed.freshness).toMatchObject({ reset: true, taskSessionReused: false });
+      expect(routed.runtime.sessionId).toBeNull();
+    }, 60_000);
+  });
   it("keeps session identity and fingerprints stable on authenticated refresh, but changes them on manual replacement", async () => {
     const input = { companyId, agentId, responsibleUserId: "alice", adapterType: "paperclip_runner", binding: members[0]!.binding, config: { provider: "codex", model: "gpt-5.6-sol" } };
     const first = await prepareManagedAiRuntime(db, input);
