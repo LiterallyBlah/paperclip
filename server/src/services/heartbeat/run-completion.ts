@@ -312,7 +312,8 @@ export function isConfigurationIncompleteFailedRun(
 ) {
   return (
     run?.errorCode === CONFIGURATION_INCOMPLETE_FAILURE_CODE ||
-    run?.errorCode === "model_not_found"
+    run?.errorCode === "model_not_found" ||
+    run?.errorCode === "ai_connection_model_unavailable"
   );
 }
 

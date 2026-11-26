@@ -8,7 +8,7 @@ import { and, eq } from "drizzle-orm";
 import { createDb, closeRegisteredClients, companies, agents, authUsers, companyMemberships, connectionGrants, plugins, aiConnectionRouterCursors, aiConnectionTaskPins, toolConnections, companySecrets, heartbeatRuns, issues, dotAgentBindings, grokBotRoutines } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import type { AiConnectionPoolMember, AiConnectionRouterRequest, AiConnectionRouterResult, PaperclipPluginManifestV1 } from "@paperclipai/shared";
-import { aiConnectionRouterService, AiConnectionPoolExhausted, poolMemberRuntimeConfig, applyAiConnectionRouterTaskSettings } from "../services/ai-connection-router.js";
+import { aiConnectionRouterService, AiConnectionModelUnavailable, AiConnectionPoolExhausted, poolMemberRuntimeConfig, applyAiConnectionRouterTaskSettings } from "../services/ai-connection-router.js";
 import { aiConnectionSessionCompatibilityInputs } from "../services/ai-connection-session.js";
 import { projectPaperclipRunnerTaskConfig, resolvePaperclipRunnerNativeProviderInput } from "../services/native-runtime/provider-profile.js";
 import { aiConnectionService } from "../services/ai-connections.js";
@@ -172,7 +172,7 @@ describe("durable, authorized connection routing", () => {
     const pool = await makePool();
     expect((await resolve(pool.id, "one")).memberId).toBe(members[0]!.id);
     expect((await resolve(pool.id, "two")).memberId).toBe(members[1]!.id);
-    expect((await resolve(pool.id, "one", { overrides: { model: "claude-sonnet-5", modelReasoningEffort: "high" } })).memberId).toBe(members[0]!.id);
+    expect((await resolve(pool.id, "one", { overrides: { modelReasoningEffort: "high" } })).memberId).toBe(members[0]!.id);
     expect((await aiConnectionRouterService(db, worker).resolve({ companyId, poolId: pool.id, agentId, userId: "alice", adapterType: "paperclip_runner", taskKey: "one" })).memberId).toBe(members[0]!.id);
     const [cursor] = await db.select().from(aiConnectionRouterCursors).where(eq(aiConnectionRouterCursors.poolId, pool.id)); expect(cursor?.version).toBe(2);
   });
@@ -201,13 +201,21 @@ describe("durable, authorized connection routing", () => {
     expect((await resolve(pool.id, "existing")).binding).toEqual(old.binding);
     expect((await resolve(pool.id, "future")).memberId).toBe(members[1]!.id);
   });
-  it("keeps account and harness pinned through independent composer fallback", async () => {
+  it("keeps account and harness pinned and fails loudly on a model the pinned member cannot serve", async () => {
     const pool = await makePool();
     const first = await resolve(pool.id, "composer");
-    const changed = await resolve(pool.id, "composer", { overrides: { model: "claude-sonnet-5", modelReasoningEffort: "high" } });
-    expect(changed.binding).toEqual(first.binding); expect(changed.runtimeConfig).toMatchObject({ provider: "codex", model: "gpt-5.6-sol", modelReasoningEffort: "high" }); expect(changed.notes).toHaveLength(1);
-    const claude = poolMemberRuntimeConfig(members[1]!, "paperclip_runner", { model: "gpt-5.6-sol", modelReasoningEffort: "ultra" });
-    expect(claude.config).toMatchObject({ provider: "acpx", acpxAgent: "claude", model: "claude-sonnet-5" }); expect(claude.notes).toHaveLength(2);
+    const rejected = resolve(pool.id, "composer", { overrides: { model: "claude-sonnet-5", modelReasoningEffort: "high" } });
+    await expect(rejected).rejects.toBeInstanceOf(AiConnectionModelUnavailable);
+    await expect(rejected).rejects.toMatchObject({ code: "ai_connection_model_unavailable", requestedModel: "claude-sonnet-5", message: expect.stringContaining("claude-sonnet-5") });
+    const changed = await resolve(pool.id, "composer", { overrides: { modelReasoningEffort: "high" } });
+    expect(changed.binding).toEqual(first.binding); expect(changed.runtimeConfig).toMatchObject({ provider: "codex", model: "gpt-5.6-sol", modelReasoningEffort: "high" }); expect(changed.notes).toEqual([]);
+    expect(() => poolMemberRuntimeConfig(members[1]!, "paperclip_runner", { model: "gpt-5.6-sol", modelReasoningEffort: "ultra" })).toThrow(AiConnectionModelUnavailable);
+    expect(() => poolMemberRuntimeConfig(members[1]!, "paperclip_runner", { model: "claude-unknown-9" })).toThrow(expect.objectContaining({ code: "ai_connection_model_unavailable", requestedModel: "claude-unknown-9" }));
+    const claude = poolMemberRuntimeConfig(members[1]!, "paperclip_runner", { modelReasoningEffort: "ultra" });
+    expect(claude.config).toMatchObject({ provider: "acpx", acpxAgent: "claude", model: "claude-sonnet-5" }); expect(claude.notes).toHaveLength(1);
+    const fable = poolMemberRuntimeConfig(members[1]!, "paperclip_runner", { model: "claude-fable-5-2", modelReasoningEffort: "high" });
+    expect(fable.config).toMatchObject({ provider: "acpx", acpxAgent: "claude", model: "claude-fable-5-2", modelReasoningEffort: "high" });
+    expect(fable.notes).toEqual([]);
     const claudeEffort = poolMemberRuntimeConfig(members[1]!, "paperclip_runner", { modelReasoningEffort: "xhigh" });
     expect(claudeEffort.config).toMatchObject({ provider: "acpx", acpxAgent: "claude", modelReasoningEffort: "xhigh" });
     expect(claudeEffort.notes).toEqual([]);
@@ -215,6 +223,14 @@ describe("durable, authorized connection routing", () => {
     const native = resolvePaperclipRunnerNativeProviderInput({ backend: "codex_app_server", adapterConfig: projectPaperclipRunnerTaskConfig("codex_app_server", changed.runtimeConfig, overrides) });
     expect(native).toMatchObject({ provider: "codex", model: "gpt-5.6-sol", codexReasoningEffort: "high" });
     expect(overrides).toMatchObject({ cwd: "/fixture" }); expect(overrides).not.toHaveProperty("effort");
+  });
+  it("routes an unpinned model override to a member that serves it and fails loudly when none can", async () => {
+    const pool = await makePool();
+    const fable = await resolve(pool.id, "fable-override", { overrides: { model: "claude-fable-5-2", effort: "high" } });
+    expect(fable.memberId).toBe(members[1]!.id);
+    expect(fable.runtimeConfig).toMatchObject({ model: "claude-fable-5-2", modelReasoningEffort: "high" });
+    await expect(resolve(pool.id, "unknown-override", { overrides: { model: "claude-unknown-9" } })).rejects.toMatchObject({ code: "ai_connection_model_unavailable", requestedModel: "claude-unknown-9" });
+    expect(await db.select().from(aiConnectionTaskPins).where(and(eq(aiConnectionTaskPins.poolId, pool.id), eq(aiConnectionTaskPins.taskKey, "unknown-override")))).toHaveLength(0);
   });
   it("retries a changed config proposal without advancing the abandoned selection", async () => {
     const pool = await makePool();
@@ -425,6 +441,29 @@ describe("durable, authorized connection routing", () => {
       await expect.poll(() => captureRunFailure.mock.calls.filter(([report]) => report.runId === run!.id)).toHaveLength(1);
       expect(captureRunFailure).toHaveBeenCalledWith(expect.objectContaining({ runId: run!.id, runStatus: "failed", errorCode: "configuration_incomplete" }));
     } finally { proposal.mockReset(); proposal.mockImplementation(defaultProposal); unregisterServerAdapter("claude_local"); await heartbeat.drainActiveRunExecutions(); }
+  }, 30_000);
+  it("fails a run loudly, without retry, when its issue model override is unavailable on the pool", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableAiConnectionRouters: true, enableWorktreeRunExecution: true });
+    const pool = await makePool({ members: [members[1]!] });
+    const [agent] = await db.insert(agents).values({ companyId, name: "Unavailable model override", adapterType: "claude_local", adapterConfig: { cwd: home, engine: "cli" }, runtimeConfig: { aiConnection: { mode: "router", connectionId: pool.id }, heartbeat: { enabled: false } } }).returning();
+    const [issue] = await db.insert(issues).values({ companyId, title: "Unavailable model fixture", status: "todo", assigneeAgentId: agent!.id, assigneeAdapterOverrides: { adapterConfig: { model: "claude-unknown-9", effort: "high", engine: "cli" } }, responsibleUserId: "alice", createdByUserId: "alice" }).returning();
+    const execute = vi.fn(); registerServerAdapter({ ...getServerAdapter("claude_local"), execute });
+    const heartbeat = heartbeatService(db, { pluginWorkerManager: worker, runtimeEnv: {} });
+    try {
+      const run = await heartbeat.wakeup(agent!.id, { source: "assignment", reason: "issue_assigned", payload: { issueId: issue!.id }, contextSnapshot: { issueId: issue!.id, wakeReason: "issue_assigned", responsibleUserId: "alice" }, triggerDetail: "system" });
+      expect(run).not.toBeNull();
+      await expect.poll(async () => (await heartbeat.getRun(run!.id))?.status, { timeout: 20_000 }).toBe("failed");
+      const failed = await heartbeat.getRun(run!.id);
+      expect(failed?.errorCode).toBe("ai_connection_model_unavailable");
+      expect(failed?.error).toContain("claude-unknown-9");
+      expect(failed?.resultJson).toMatchObject({ configurationIncomplete: { reason: "ai_connection_model_unavailable", requestedModel: "claude-unknown-9" } });
+      expect(execute).not.toHaveBeenCalled();
+      await heartbeat.drainActiveRunExecutions();
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agent!.id));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.scheduledRetryAt ?? null).toBeNull();
+      await expect.poll(async () => (await db.select().from(issues).where(eq(issues.id, issue!.id)))[0]?.status, { timeout: 10_000 }).toBe("blocked");
+    } finally { unregisterServerAdapter("claude_local"); await heartbeat.drainActiveRunExecutions(); }
   }, 30_000);
   it("repairs the failed pool account without replacing the pool or adopting the configured provider", async () => {
     const pool = await makePool({ members: [members[1]!] });

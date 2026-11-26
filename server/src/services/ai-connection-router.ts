@@ -23,6 +23,16 @@ export class AiConnectionPoolExhausted extends Error {
   constructor(readonly retryAt: string, readonly poolId: string) { super("All eligible pool accounts are over their usage limit. Waiting for usage to reset."); }
 }
 
+export const AI_CONNECTION_MODEL_UNAVAILABLE_CODE = "ai_connection_model_unavailable";
+/** An explicit model override that the pool member cannot serve. Never silently replaced by the member default. */
+export class AiConnectionModelUnavailable extends Error {
+  readonly code = AI_CONNECTION_MODEL_UNAVAILABLE_CODE;
+  constructor(readonly requestedModel: string, readonly memberId: string) {
+    super(`Requested model "${requestedModel}" is unavailable for the selected AI connection pool account. Choose a supported model or remove the model override.`);
+    this.name = "AiConnectionModelUnavailable";
+  }
+}
+
 /** Routing can override provider/model only, never environment, permissions, or instructions. */
 export function poolMemberRuntimeConfig(member: AiConnectionPoolMember, adapterType: string, overrides: Record<string, unknown> = {}) {
   const notes: string[] = [];
@@ -46,10 +56,9 @@ export function poolMemberRuntimeConfig(member: AiConnectionPoolMember, adapterT
   };
   validate();
   if (typeof overrides.model === "string" && overrides.model !== profile.model) {
-    if (supportsModel(overrides.model)) {
-      config.model = overrides.model;
-      try { validate(); } catch { config.model = profile.model; notes.push("Model override is unavailable for this member; using its default."); }
-    } else notes.push("Model override is unavailable for this member; using its default.");
+    if (!supportsModel(overrides.model)) throw new AiConnectionModelUnavailable(overrides.model, member.id);
+    config.model = overrides.model;
+    try { validate(); } catch { throw new AiConnectionModelUnavailable(overrides.model, member.id); }
   }
   const model = String(config.model);
   const efforts = provider === "openai" ? codexLocalReasoningEffortsForModel(model)
@@ -208,14 +217,21 @@ export function aiConnectionRouterService(db: Db, workerManager?: PluginWorkerMa
       const pool: AiConnectionPool = { ...row.config, id: row.id, companyId: row.companyId, pluginKey: row.pluginKey, revision: row.revision };
       const deadline = Date.now() + 15_000;
       const candidates: AiConnectionRouterRequest["candidates"] = [];
+      let modelUnavailable: AiConnectionModelUnavailable | undefined;
       for (const member of pin ? [pin.member] : pool.members) {
         try {
           const effective = poolMemberRuntimeConfig(member, input.adapterType, input.overrides);
           const selection: AiConnectionRouterSelection = { poolId: row.id, memberId: member.id, binding: member.binding, runtimeConfig: effective.config, notes: effective.notes };
           await validateSelection(selection);
           candidates.push({ member, runtimeConfig: effective.config, notes: effective.notes });
-        } catch (error) { if (pin) throw error; }
+        } catch (error) {
+          if (pin) throw error;
+          if (error instanceof AiConnectionModelUnavailable) modelUnavailable ??= error;
+        }
       }
+      // No member can serve the explicit model override: fail loudly instead of
+      // reporting a generic incompatibility or running on a default model.
+      if (!candidates.length && modelUnavailable) throw modelUnavailable;
       if (!pin && input.requireExisting) {
         const existing = candidates.find((candidate) => candidate.member.binding.grantId === input.existingGrantId);
         if (!existing) throw unprocessable("Reset this task session before adopting the connection pool");

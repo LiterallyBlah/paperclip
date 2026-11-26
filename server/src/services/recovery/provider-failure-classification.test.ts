@@ -25,6 +25,12 @@ describe("classifyAdapterFailureForRecovery", () => {
     expect(classifyContinuationFailure(unknown as never).kind).toBe("transient_infra");
     expect(isConfigurationIncompleteFailedRun(unknown)).toBe(false);
   });
+  it("never retries a run whose model override the AI connection pool cannot serve", () => {
+    const run = { errorCode: "ai_connection_model_unavailable", error: "Requested model \"claude-unknown-9\" is unavailable", resultJson: null };
+    expect(classifyAdapterFailureForRecovery(run)).toEqual({ kind: "configuration_incomplete" });
+    expect(classifyContinuationFailure(run as never)).toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
+    expect(isConfigurationIncompleteFailedRun(run)).toBe(true);
+  });
   it("retries a continuation whose host lost the controller lease before dispatch", () => {
     expect(classifyContinuationFailure({ errorCode: "controller_lease_lost", error: "Legacy controller lease lost", resultJson: null } as never))
       .toMatchObject({ kind: "transient_infra", maxAttempts: 3 });

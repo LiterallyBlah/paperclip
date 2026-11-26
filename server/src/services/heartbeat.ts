@@ -305,7 +305,7 @@ import {
 } from "./ai-connection-runtime.js";
 import { retainManagedClaudeTranscripts } from "./managed-claude-transcripts.js";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
-import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
+import { aiConnectionRouterService, AiConnectionModelUnavailable, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
 import {
   getExecutionBlocker,
 } from "./execution-blocker.js";
@@ -2657,6 +2657,11 @@ export function heartbeatService(
               await finalizeAgentStatus(run.agentId, "cancelled");
             }
             return;
+          }
+          if (error instanceof AiConnectionModelUnavailable) {
+            // An explicit model override must never fall back to the pool default.
+            // Fail the run before dispatch; configuration failures are not auto-retried.
+            throw new ConfigurationIncompleteFailure(error.message, { configurationIncomplete: { reason: error.code, requestedModel: error.requestedModel, companyId: agent.companyId, agentId: agent.id, responsibleUserId, actionUrl: `/agents/${agent.id}/runtime`, fingerprint: `ai-router-model:${requestedAiBinding.connectionId}:${error.requestedModel}` } }, error.code);
           }
           throw new ConfigurationIncompleteFailure(error instanceof Error ? error.message : "Configure this connection pool", { configurationIncomplete: { reason: "ai_connection_unavailable", companyId: agent.companyId, agentId: agent.id, responsibleUserId, actionUrl: `/agents/${agent.id}/runtime`, fingerprint: `ai-router:${requestedAiBinding.connectionId}` } });
         }
