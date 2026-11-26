@@ -165,6 +165,15 @@ export function buildConfigurationIncompleteRecoveryNoticeSeed(
       tone: "danger",
     };
   }
+  if (readNonEmptyStringField(configurationIncomplete, "reason") === "ai_connection_model_unavailable") {
+    const requestedModel = readNonEmptyStringField(configurationIncomplete, "requestedModel");
+    return {
+      title: "Requested model unavailable",
+      body: `Paperclip stopped before the agent started because the task's model override${requestedModel ? ` \`${requestedModel}\`` : ""} is not available on the selected AI connection pool account. The run did not fall back to a different model.`,
+      nextAction: "Choose a model this pool supports, or remove the task's model override, then retry the task.",
+      tone: "danger",
+    };
+  }
   if (readNonEmptyStringField(configurationIncomplete, "reason") === "ai_connection_required") {
     if (readNonEmptyStringField(configurationIncomplete, "homeMode") === "preconfigured") {
       return {

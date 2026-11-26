@@ -31,6 +31,14 @@ describe("stranded recovery notice seeds", () => {
     expect(seed.body).not.toContain("Recovery action:");
   });
 
+  it("names the requested model when a pool cannot serve the task's model override", () => {
+    const seed = buildConfigurationIncompleteRecoveryNoticeSeed({ reason: "ai_connection_model_unavailable", requestedModel: "claude-unknown-9" });
+    expect(seed.title).toBe("Requested model unavailable");
+    expect(seed.tone).toBe("danger");
+    expect(seed.body).toContain("`claude-unknown-9`");
+    expect(seed.body).toContain("did not fall back");
+  });
+
   it("names the sandbox provider plugin and its status when that is the configuration gap", () => {
     const seed = buildConfigurationIncompleteRecoveryNoticeSeed({
       reason: "sandbox_provider_plugin_not_ready",

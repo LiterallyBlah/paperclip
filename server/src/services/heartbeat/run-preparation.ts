@@ -156,10 +156,11 @@ export class ConfigurationIncompleteFailure extends Error {
   code = CONFIGURATION_INCOMPLETE_FAILURE_CODE;
   resultJson: Record<string, unknown>;
 
-  constructor(message: string, resultJson: Record<string, unknown>) {
+  constructor(message: string, resultJson: Record<string, unknown>, code?: string) {
     super(message);
     this.name = "ConfigurationIncompleteFailure";
     this.resultJson = resultJson;
+    if (code) this.code = code;
   }
 }
 
